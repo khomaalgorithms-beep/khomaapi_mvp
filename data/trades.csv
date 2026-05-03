@@ -1,0 +1,3 @@
+timestamp_utc,trade_id,client_id,symbol,side,qty,mode,status,latency_ms,message
+2026-04-29T15:13:12.815809+00:00,f965f213,demo_client,MNQ,buy,1,simulation,SIMULATED,3.047,Simulation mode: order logged but NOT sent to broker.
+2026-04-29T15:13:24.867289+00:00,b0dcc522,demo_client,MNQ,buy,1,simulation,SIMULATED,3.738,Simulation mode: order logged but NOT sent to broker.
