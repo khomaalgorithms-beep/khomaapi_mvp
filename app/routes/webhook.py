@@ -4,7 +4,6 @@ import time
 
 router = APIRouter()
 
-# duplicate protection
 recent_requests = {}
 
 WEBHOOK_SECRET = "abd54ccbb9f82904eaec006b90e380480e1fea2f"
@@ -19,7 +18,6 @@ async def webhook_trade(request: Request):
 
         payload = await request.json()
 
-        client_id = payload.get("client_id")
         auth = payload.get("auth")
         symbol = payload.get("symbol")
         side = payload.get("side")
@@ -27,7 +25,7 @@ async def webhook_trade(request: Request):
         request_id = payload.get("request_id")
 
         # -----------------------------
-        # AUTH CHECK
+        # SECRET CHECK
         # -----------------------------
 
         if auth != WEBHOOK_SECRET:
