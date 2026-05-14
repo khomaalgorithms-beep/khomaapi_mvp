@@ -1151,14 +1151,13 @@ def tradovate_connect():
     redirect_uri = "https://web-production-6ad48.up.railway.app/auth/callback"
 
     oauth_url = (
-        "https://trader.tradovate.com/oauth/authorize"
+        "https://trader.tradovateapi.com/oauth/authorize"
         f"?response_type=code"
         f"&client_id={client_id}"
         f"&redirect_uri={redirect_uri}"
     )
 
     return RedirectResponse(oauth_url)
-
 
 @app.get("/auth/callback")
 def tradovate_callback(code: str = ""):
