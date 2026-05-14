@@ -1151,11 +1151,13 @@ def tradovate_connect():
     redirect_uri = "https://web-production-6ad48.up.railway.app/auth/callback"
 
     oauth_url = (
-        "https://trader.tradovateapi.com/oauth/authorize"
-        f"?response_type=code"
-        f"&client_id={client_id}"
+        "https://trader.tradovate.com/oauth/authorize"
+        f"?client_id={client_id}"
         f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&scope=openid"
     )
+
 
     return RedirectResponse(oauth_url)
 
