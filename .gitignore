@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+.khoma_secret_v31
+.env
