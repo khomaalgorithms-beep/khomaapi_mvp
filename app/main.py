@@ -1158,6 +1158,8 @@ def tradovate_connect():
     )
 
     return RedirectResponse(oauth_url)
+
+
 @app.get("/auth/callback")
 def tradovate_callback(code: str = ""):
 
