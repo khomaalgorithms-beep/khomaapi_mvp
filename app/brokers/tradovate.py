@@ -1,105 +1,181 @@
 import requests
-from typing import Dict, Any
-from app.core.config import settings
 
-
-class TradovateError(Exception):
-    pass
+DEMO_URL = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
+LIVE_URL = "https://live.tradovateapi.com/v1/auth/accesstokenrequest"
 
 
 class TradovateClient:
-    def __init__(self):
-        self.base_url = self._base_url()
+
+    def __init__(
+        self,
+        username,
+        password,
+        cid,
+        sec,
+        app_id="KhomaAPI",
+        app_version="1.0",
+        device_id="khomaapi"
+    ):
+
+        self.username = username
+        self.password = password
+        self.cid = cid
+        self.sec = sec
+
+        self.app_id = app_id
+        self.app_version = app_version
+        self.device_id = device_id
+
         self.access_token = None
 
-    def _base_url(self) -> str:
-        if settings.tradovate_env.lower() == "live":
-            return "https://live.tradovateapi.com/v1"
-        return "https://demo.tradovateapi.com/v1"
+    def login(self, environment="demo"):
 
-    def login(self) -> str:
-        if not settings.tradovate_enabled:
-            raise TradovateError("Tradovate is disabled. Set TRADOVATE_ENABLED=true only after demo testing.")
-
-        required = {
-            "TRADOVATE_USERNAME": settings.tradovate_username,
-            "TRADOVATE_PASSWORD": settings.tradovate_password,
-            "TRADOVATE_APP_ID": settings.tradovate_app_id,
-            "TRADOVATE_CID": settings.tradovate_cid,
-            "TRADOVATE_SEC": settings.tradovate_sec,
-        }
-        missing = [k for k, v in required.items() if not v]
-        if missing:
-            raise TradovateError(f"Missing Tradovate settings: {', '.join(missing)}")
+        url = DEMO_URL if environment == "demo" else LIVE_URL
 
         payload = {
-            "name": settings.tradovate_username,
-            "password": settings.tradovate_password,
-            "appId": settings.tradovate_app_id,
-            "appVersion": settings.tradovate_app_version,
-            "cid": settings.tradovate_cid,
-            "sec": settings.tradovate_sec,
-            "deviceId": settings.tradovate_device_id,
+            "name": self.username,
+            "password": self.password,
+            "cid": self.cid,
+            "sec": self.sec,
+            "appId": self.app_id,
+            "appVersion": self.app_version,
+            "deviceId": self.device_id
         }
 
-        response = requests.post(
-            f"{self.base_url}/auth/accesstokenrequest",
-            json=payload,
-            timeout=10,
+        try:
+
+            response = requests.post(url, json=payload)
+            data = response.json()
+
+            if "accessToken" in data:
+
+                self.access_token = data["accessToken"]
+
+                return {
+                    "ok": True,
+                    "token": self.access_token
+                }
+
+            else:
+
+                return {
+                    "ok": False,
+                    "error": data
+                }
+
+        except Exception as e:
+
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+
+    def get_accounts(self, environment="demo"):
+
+        if not self.access_token:
+
+            return {
+                "ok": False,
+                "error": "Not authenticated"
+            }
+
+        base_url = (
+            "https://demo.tradovateapi.com/v1"
+            if environment == "demo"
+            else "https://live.tradovateapi.com/v1"
         )
 
-        if response.status_code >= 400:
-            raise TradovateError(f"Tradovate login failed: {response.status_code} {response.text}")
+        url = f"{base_url}/account/list"
 
-        data = response.json()
-        token = data.get("accessToken")
-        if not token:
-            raise TradovateError(f"No accessToken returned: {data}")
-
-        self.access_token = token
-        return token
-
-    def _headers(self) -> Dict[str, str]:
-        if not self.access_token:
-            self.login()
-        return {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
+        headers = {
+            "Authorization": f"Bearer {self.access_token}"
         }
 
-    def place_market_order(self, symbol: str, side: str, qty: int) -> Dict[str, Any]:
-        # Sends a market order to Tradovate. Test in DEMO first.
-        if not settings.tradovate_account_spec or not settings.tradovate_account_id:
-            raise TradovateError("Missing TRADOVATE_ACCOUNT_SPEC or TRADOVATE_ACCOUNT_ID.")
+        try:
+
+            response = requests.get(url, headers=headers)
+            data = response.json()
+
+            if isinstance(data, list):
+
+                return {
+                    "ok": True,
+                    "accounts": data
+                }
+
+            else:
+
+                return {
+                    "ok": False,
+                    "error": data
+                }
+
+        except Exception as e:
+
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+    def place_order(
+        self,
+        account_id,
+        symbol,
+        side,
+        qty,
+        environment="live"
+    ):
+
+        if not self.access_token:
+
+            return {
+                "ok": False,
+                "error": "Not authenticated"
+            }
+
+        base_url = (
+            "https://demo.tradovateapi.com/v1"
+            if environment == "demo"
+            else "https://live.tradovateapi.com/v1"
+        )
+
+        url = f"{base_url}/order/placeorder"
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}"
+        }
 
         action = "Buy" if side.lower() == "buy" else "Sell"
 
         payload = {
-            "accountSpec": settings.tradovate_account_spec,
-            "accountId": int(settings.tradovate_account_id),
+            "accountSpec": "1047092",
+            "accountId": account_id,
             "action": action,
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "orderQty": qty,
             "orderType": "Market",
             "isAutomated": True,
-            "deviceId": settings.tradovate_device_id,
+            "timeInForce": "Day"
+
         }
 
-        response = requests.post(
-            f"{self.base_url}/order/placeorder",
-            json=payload,
-            headers=self._headers(),
-            timeout=10,
-        )
+        try:
 
-        if response.status_code >= 400:
-            raise TradovateError(f"Order failed: {response.status_code} {response.text}")
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers
+            )
 
-        return response.json()
+            data = response.json()
 
-    def flatten_symbol(self, symbol: str) -> Dict[str, Any]:
-        # Placeholder. Production version should first read open position, then send opposite qty.
-        return {
-            "ok": True,
-            "message": f"Flatten placeholder received for {symbol}. Production flatten needs position lookup first."
-        }
+            return {
+                "ok": True,
+                "response": data
+            }
+
+        except Exception as e:
+
+            return {
+                "ok": False,
+                "error": str(e)
+            }

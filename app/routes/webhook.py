@@ -1,127 +1,120 @@
+from fastapi import APIRouter, Request
+from app.brokers.tradovate import TradovateClient
 import time
-import uuid
-from fastapi import APIRouter
-from app.models.schemas import TradeWebhook, FlattenWebhook, TradeResponse
-from app.core.config import settings
-from app.core.risk import run_trade_risk_checks, run_flatten_risk_checks, RiskError
-from app.core.logger import log_trade
-from app.brokers.tradovate import TradovateClient, TradovateError
 
-router = APIRouter(prefix="/webhook", tags=["webhook"])
+router = APIRouter()
+
+# duplicate protection
+recent_requests = {}
+
+WEBHOOK_SECRET = "abd54ccbb9f82904eaec006b90e380480e1fea2f"
 
 
-@router.post("/trade", response_model=TradeResponse)
-def trade_webhook(payload: TradeWebhook):
-    start = time.perf_counter()
-    trade_id = str(uuid.uuid4())[:8]
-    broker_response = None
+@router.post("/webhook/trade")
+async def webhook_trade(request: Request):
+
+    start_time = time.time()
 
     try:
-        symbol = run_trade_risk_checks(payload.auth, payload.symbol, payload.qty)
 
-        if settings.khoma_execution_mode.lower() == "live":
-            client = TradovateClient()
-            broker_response = client.place_market_order(symbol, payload.side, payload.qty)
-            status = "SENT_TO_BROKER"
-            message = "Order sent to Tradovate."
-        else:
-            status = "SIMULATED"
-            message = "Simulation mode: order logged but NOT sent to broker."
+        payload = await request.json()
 
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
+        client_id = payload.get("client_id")
+        auth = payload.get("auth")
+        symbol = payload.get("symbol")
+        side = payload.get("side")
+        qty = payload.get("qty")
+        request_id = payload.get("request_id")
 
-        log_trade({
-            "trade_id": trade_id,
-            "client_id": payload.client_id,
-            "symbol": symbol,
-            "side": payload.side,
-            "qty": payload.qty,
-            "mode": settings.khoma_execution_mode,
-            "status": status,
+        # -----------------------------
+        # AUTH CHECK
+        # -----------------------------
+
+        if auth != WEBHOOK_SECRET:
+
+            return {
+                "ok": False,
+                "error": "Invalid webhook secret."
+            }
+
+        # -----------------------------
+        # DUPLICATE LOCK
+        # -----------------------------
+
+        now = time.time()
+
+        if request_id in recent_requests:
+
+            if now - recent_requests[request_id] < 8:
+
+                return {
+                    "ok": False,
+                    "error": "Duplicate request blocked."
+                }
+
+        recent_requests[request_id] = now
+
+        # -----------------------------
+        # LOGIN TO TRADOVATE
+        # -----------------------------
+
+        tradovate = TradovateClient(
+            username="DmytriiKhoma",
+            password="Dimaoffkh25112008@",
+            cid="13281",
+            sec="3c7f3c53-0377-45f2-b3f2-04eda8b5a588"
+        )
+
+        login_result = tradovate.login("live")
+
+        if not login_result.get("ok"):
+
+            return {
+                "ok": False,
+                "error": "Tradovate login failed",
+                "details": login_result
+            }
+
+        # -----------------------------
+        # FETCH ACCOUNT
+        # -----------------------------
+
+        accounts_result = tradovate.get_accounts("live")
+
+        if not accounts_result.get("ok"):
+
+            return {
+                "ok": False,
+                "error": "Failed to fetch accounts",
+                "details": accounts_result
+            }
+
+        account_id = accounts_result["accounts"][0]["id"]
+
+        # -----------------------------
+        # PLACE ORDER
+        # -----------------------------
+
+        order_result = tradovate.place_order(
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            environment="live"
+        )
+
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        return {
+            "ok": True,
+            "action": "LIVE_ORDER_EXECUTED",
             "latency_ms": latency_ms,
-            "message": message,
-        })
+            "order_result": order_result
+        }
 
-        return TradeResponse(
-            ok=True,
-            mode=settings.khoma_execution_mode,
-            message=message,
-            trade_id=trade_id,
-            latency_ms=latency_ms,
-            broker_response=broker_response,
-        )
+    except Exception as e:
 
-    except (RiskError, TradovateError, Exception) as e:
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
-        log_trade({
-            "trade_id": trade_id,
-            "client_id": payload.client_id,
-            "symbol": payload.symbol,
-            "side": payload.side,
-            "qty": payload.qty,
-            "mode": settings.khoma_execution_mode,
-            "status": "REJECTED",
-            "latency_ms": latency_ms,
-            "message": str(e),
-        })
-        return TradeResponse(
-            ok=False,
-            mode=settings.khoma_execution_mode,
-            message=str(e),
-            trade_id=trade_id,
-            latency_ms=latency_ms,
-            broker_response=None,
-        )
-
-
-@router.post("/flatten", response_model=TradeResponse)
-def flatten_webhook(payload: FlattenWebhook):
-    start = time.perf_counter()
-    trade_id = str(uuid.uuid4())[:8]
-    broker_response = None
-
-    try:
-        symbol = run_flatten_risk_checks(payload.auth, payload.symbol)
-
-        if settings.khoma_execution_mode.lower() == "live":
-            client = TradovateClient()
-            broker_response = client.flatten_symbol(symbol)
-            status = "FLATTEN_SENT"
-            message = "Flatten request sent."
-        else:
-            status = "FLATTEN_SIMULATED"
-            message = "Simulation mode: flatten logged but NOT sent to broker."
-
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
-
-        log_trade({
-            "trade_id": trade_id,
-            "client_id": payload.client_id,
-            "symbol": symbol,
-            "side": "flatten",
-            "qty": "",
-            "mode": settings.khoma_execution_mode,
-            "status": status,
-            "latency_ms": latency_ms,
-            "message": message,
-        })
-
-        return TradeResponse(
-            ok=True,
-            mode=settings.khoma_execution_mode,
-            message=message,
-            trade_id=trade_id,
-            latency_ms=latency_ms,
-            broker_response=broker_response,
-        )
-
-    except (RiskError, TradovateError, Exception) as e:
-        latency_ms = round((time.perf_counter() - start) * 1000, 3)
-        return TradeResponse(
-            ok=False,
-            mode=settings.khoma_execution_mode,
-            message=str(e),
-            trade_id=trade_id,
-            latency_ms=latency_ms,
-            broker_response=None,
-        )
+        return {
+            "ok": False,
+            "error": str(e)
+        }
