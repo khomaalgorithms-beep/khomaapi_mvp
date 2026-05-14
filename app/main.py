@@ -1143,3 +1143,26 @@ def api_trades(request: Request):
     con.close()
 
     return [dict(row) for row in rows]
+@app.get("/auth/tradovate/connect")
+def tradovate_connect():
+
+    client_id = "13286"
+
+    redirect_uri = "https://web-production-6ad48.up.railway.app/auth/callback"
+
+    oauth_url = (
+        "https://trader.tradovate.com/oauth/authorize"
+        f"?response_type=code"
+        f"&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+    )
+
+    return RedirectResponse(oauth_url)
+@app.get("/auth/callback")
+def tradovate_callback(code: str = ""):
+
+    return {
+        "ok": True,
+        "message": "OAuth callback received.",
+        "code": code
+    }
