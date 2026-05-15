@@ -14,26 +14,11 @@ import time
 import requests
 
 # ============================================================
-# KHOMAAPI v3.1 INSTITUTIONAL
-# Direct Tradovate API execution engine
-# Features:
-# - Client accounts
-# - Encrypted Tradovate credentials
-# - Real Tradovate API login
-# - Real market order routing
-# - Simulation/live mode
-# - Risk engine
-# - Duplicate webhook protection
-# - Position-aware execution
-# - Same-direction skip
-# - Close-and-flip logic
-# - Retry logic
-# - Emergency rejection lock
-# - Execution logs
-# - White/green SaaS dashboard
+# KHOMAAPI v4 DASHBOARD MVP
+# Cloud Tradovate execution + institutional SaaS dashboard
 # ============================================================
 
-app = FastAPI(title="KhomaAPI v3.1 Institutional")
+app = FastAPI(title="KhomaAPI v4")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
@@ -47,7 +32,7 @@ SESSIONS: Dict[str, int] = {}
 
 
 # ============================================================
-# DATABASE + ENCRYPTION
+# DATABASE + SECURITY
 # ============================================================
 
 def db():
@@ -66,14 +51,14 @@ def dec(value: Optional[str]) -> str:
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16).hex()
-    hashed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 160000).hex()
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
     return f"{salt}:{hashed}"
 
 
 def verify_password(password: str, stored: str) -> bool:
     try:
         salt, old_hash = stored.split(":")
-        new_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 160000).hex()
+        new_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
         return secrets.compare_digest(new_hash, old_hash)
     except Exception:
         return False
@@ -96,7 +81,7 @@ def init_db():
         max_orders INTEGER DEFAULT 10,
         duplicate_seconds INTEGER DEFAULT 8,
         max_rejections_per_day INTEGER DEFAULT 3,
-        allowed_symbols TEXT DEFAULT 'MNQ,NQ,MES,ES,MYM,YM',
+        allowed_symbols TEXT DEFAULT 'MNQ,MNQM6,NQ,MES,ES,MYM,YM',
         created_at TEXT
     )
     """)
@@ -175,10 +160,12 @@ def require_user(request: Request):
     return current_user(request)
 
 
-def mask_key(key: str) -> str:
-    if not key:
+def mask_value(value: str, visible: int = 5) -> str:
+    if not value:
         return ""
-    return key[:10] + "••••••••••••••••" + key[-4:]
+    if len(value) <= visible * 2:
+        return "••••••"
+    return value[:visible] + "••••••••" + value[-visible:]
 
 
 # ============================================================
@@ -249,12 +236,6 @@ def tv_headers(token: str) -> Dict[str, str]:
 
 
 def tv_market_order(user_id: int, symbol: str, side: str, qty: int, retries: int = 3) -> Dict[str, Any]:
-    """
-    Institutional market order wrapper.
-    - Retries temporary failures
-    - Validates broker response
-    - Raises exception if order is rejected
-    """
     last_error = None
 
     for attempt in range(1, retries + 1):
@@ -262,13 +243,14 @@ def tv_market_order(user_id: int, symbol: str, side: str, qty: int, retries: int
             token, broker = tradovate_login(user_id)
 
             payload = {
-                "accountSpec": broker["account_spec"],
+                "accountSpec": str(broker["account_spec"]),
                 "accountId": int(broker["account_id"]),
                 "action": "Buy" if side.lower() == "buy" else "Sell",
                 "symbol": symbol.upper(),
                 "orderQty": int(qty),
                 "orderType": "Market",
                 "isAutomated": True,
+                "timeInForce": "Day",
                 "deviceId": broker["device_id"] or "khomaapi-device-001",
             }
 
@@ -301,10 +283,6 @@ def tv_market_order(user_id: int, symbol: str, side: str, qty: int, retries: int
 
 
 def tv_positions(user_id: int):
-    """
-    Best-effort position lookup.
-    Tradovate response shapes may vary by account/platform.
-    """
     token, broker = tradovate_login(user_id)
     base = tradovate_base(broker["env"])
 
@@ -329,13 +307,6 @@ def tv_positions(user_id: int):
 
 
 def get_current_position(user_id: int, symbol: str):
-    """
-    Returns current open position for symbol.
-    Example return:
-    {"size": 1, "side": "long"}
-    {"size": -1, "side": "short"}
-    None if flat.
-    """
     positions = tv_positions(user_id)
     symbol = symbol.upper()
 
@@ -354,12 +325,6 @@ def get_current_position(user_id: int, symbol: str):
 
 
 def handle_trade_logic(user_id: int, symbol: str, side: str, qty: int):
-    """
-    Institutional position-aware execution.
-    Case 1: Flat -> open
-    Case 2: Same direction -> skip
-    Case 3: Opposite direction -> close then open
-    """
     position = get_current_position(user_id, symbol)
 
     if position is None:
@@ -409,7 +374,7 @@ def safe_flatten_symbol(user_id: int, symbol: str):
 
 
 # ============================================================
-# LOGGING + RISK ENGINE
+# LOGGING + METRICS
 # ============================================================
 
 def log_trade(user_id, request_id, symbol, side, qty, mode, status, latency_ms, message, response):
@@ -437,6 +402,90 @@ def log_trade(user_id, request_id, symbol, side, qty, mode, status, latency_ms, 
     con.close()
 
 
+def get_user_trades(user_id: int, limit: int = 200):
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def estimate_trade_pnl(row) -> float:
+    """
+    Current MVP estimate. Real PnL requires fill/exit data.
+    For now, if broker_response includes pnl/realizedPnl later, use it.
+    """
+    try:
+        data = json.loads(row["broker_response"] or "{}")
+        for key in ["pnl", "realizedPnl", "realizedPNL", "profit", "netPnL"]:
+            if key in data:
+                return float(data[key])
+    except Exception:
+        pass
+    return 0.0
+
+
+def dashboard_metrics(user_id: int):
+    rows = list(reversed(get_user_trades(user_id, 500)))
+    executed = [r for r in rows if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT")]
+    rejected = [r for r in rows if r["status"] == "REJECTED"]
+
+    pnl_values = []
+    equity = []
+    running = 0.0
+    peak = 0.0
+    max_dd = 0.0
+
+    for r in executed:
+        pnl = estimate_trade_pnl(r)
+        pnl_values.append(pnl)
+        running += pnl
+        equity.append(round(running, 2))
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+
+    wins = len([p for p in pnl_values if p > 0])
+    losses = len([p for p in pnl_values if p < 0])
+    closed_with_pnl = wins + losses
+    win_rate = round((wins / closed_with_pnl) * 100, 1) if closed_with_pnl else 0.0
+
+    latencies = [float(r["latency_ms"] or 0) for r in rows if r["latency_ms"]]
+    avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else 0
+
+    return {
+        "total_trades": len(executed),
+        "rejected": len(rejected),
+        "win_rate": win_rate,
+        "wins": wins,
+        "losses": losses,
+        "total_pnl": round(running, 2),
+        "max_drawdown": round(abs(max_dd), 2),
+        "avg_latency": avg_latency,
+        "equity": equity[-40:] if equity else [0, 0, 0, 0, 0],
+    }
+
+
+def daily_journal(user_id: int):
+    rows = get_user_trades(user_id, 500)
+    days: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        day = (r["ts"] or "")[:10]
+        if not day:
+            continue
+        days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})
+        days[day]["trades"] += 1
+        if r["status"] == "REJECTED":
+            days[day]["rejected"] += 1
+        if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT"):
+            days[day]["executed"] += 1
+        days[day]["pnl"] += estimate_trade_pnl(r)
+
+    return sorted(days.items(), reverse=True)[:10]
+
+
 def today_order_count(user_id: int) -> int:
     con = db()
     row = con.execute(
@@ -445,7 +494,7 @@ def today_order_count(user_id: int) -> int:
         FROM trades
         WHERE user_id=?
         AND ts LIKE ?
-        AND status IN ('SIMULATED','EXECUTED','SENT_TO_BROKER')
+        AND status IN ('SIMULATED','EXECUTED','SENT_TO_BROKER','FLATTEN_SENT')
         """,
         (user_id, date.today().isoformat() + "%"),
     ).fetchone()
@@ -482,7 +531,7 @@ def broker_connection_check(user_id: int):
     if not broker:
         raise Exception("Broker profile not found.")
     if not broker["connected"]:
-        raise Exception("Broker not connected. Go to Broker Keys and click Test Connection first.")
+        raise Exception("Broker not connected. Go to Broker Connection and click Test Connection first.")
 
 
 def check_duplicate(user, symbol: str, side: str, request_id: str):
@@ -544,85 +593,155 @@ def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: st
 
 
 # ============================================================
-# UI DESIGN
+# UI HELPERS
 # ============================================================
 
-def layout(content, user=None, active="overview"):
+def nav_item(active, key, href, icon, label):
+    cls = "active" if active == key else ""
+    return f'<a class="{cls}" href="{href}"><span>{icon}</span>{label}</a>'
+
+
+def chart_svg(values):
+    if not values:
+        values = [0, 0]
+    if len(values) == 1:
+        values = [0, values[0]]
+
+    width = 720
+    height = 240
+    padding = 18
+    mn = min(values)
+    mx = max(values)
+    span = mx - mn if mx != mn else 1
+
+    points = []
+    for i, v in enumerate(values):
+        x = padding + (i / (len(values) - 1)) * (width - padding * 2)
+        y = height - padding - ((v - mn) / span) * (height - padding * 2)
+        points.append(f"{x:.1f},{y:.1f}")
+
+    polyline = " ".join(points)
+    last = values[-1]
+
+    return f"""
+    <svg viewBox="0 0 {width} {height}" class="equity-svg" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="equityFill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="#16a34a" stop-opacity="0.22"/>
+          <stop offset="100%" stop-color="#16a34a" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <path d="M {points[0]} L {polyline} L {width-padding},{height-padding} L {padding},{height-padding} Z" fill="url(#equityFill)"/>
+      <polyline points="{polyline}" fill="none" stroke="#0f8f45" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="{points[-1].split(',')[0]}" cy="{points[-1].split(',')[1]}" r="6" fill="#0f8f45"/>
+      <text x="{width-160}" y="35" fill="#111827" font-size="22" font-weight="800">${last:.2f}</text>
+    </svg>
+    """
+
+
+def layout(content, user=None, active="dashboard"):
     email = user["email"] if user else "Guest"
     initials = email[:1].upper() if email else "K"
     status = user["automation_status"] if user else "Paused"
+    mode = user["live_mode"].upper() if user else "SIMULATION"
 
     return f"""
 <!DOCTYPE html>
 <html>
 <head>
-<title>KhomaAPI v3.1</title>
+<title>KhomaAPI</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 :root {{
-  --green:#108b3e;
-  --green2:#eaf7ef;
+  --green:#0f8f45;
+  --green-dark:#086b34;
+  --green-soft:#eaf7ef;
+  --green-line:#cdebd8;
   --text:#111827;
   --muted:#6b7280;
   --line:#e5e7eb;
-  --bg:#fbfcfb;
+  --bg:#f8faf9;
+  --card:#ffffff;
   --danger:#dc2626;
   --warning:#ca8a04;
+  --shadow:0 18px 60px rgba(17,24,39,.06);
 }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,-apple-system,BlinkMacSystemFont,Arial,sans-serif; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif; }}
 .shell {{ display:flex; min-height:100vh; }}
-.sidebar {{ width:278px; background:white; border-right:1px solid var(--line); padding:26px 16px; position:fixed; top:0; bottom:0; left:0; }}
-.brand {{ display:flex; align-items:center; gap:12px; padding:4px 10px 42px; }}
-.logo {{ width:38px; height:38px; border-radius:12px; background:linear-gradient(135deg,#10a64a,#0b6c35); color:white; display:flex; align-items:center; justify-content:center; font-weight:900; }}
-.brand h1 {{ font-size:25px; margin:0; letter-spacing:-.8px; }}
-.nav a {{ display:flex; gap:12px; align-items:center; padding:14px 15px; color:#374151; text-decoration:none; border-radius:10px; margin-bottom:8px; font-size:15px; }}
-.nav a.active,.nav a:hover {{ background:var(--green2); color:var(--green); }}
-.help {{ position:absolute; left:16px; right:16px; bottom:24px; background:linear-gradient(135deg,#eefaf2,#fff); border:1px solid #dcefe3; border-radius:14px; padding:18px; }}
-.help b {{ color:var(--green); }} .help p {{ color:var(--muted); font-size:14px; line-height:1.5; }}
-.main {{ margin-left:278px; flex:1; }}
-.topbar {{ height:62px; border-bottom:1px solid var(--line); background:white; display:flex; justify-content:flex-end; align-items:center; padding:0 28px; gap:22px; }}
-.operational {{ color:var(--green); font-weight:700; font-size:14px; }}
-.avatar {{ width:42px; height:42px; border-radius:999px; background:var(--green2); color:var(--green); display:flex; align-items:center; justify-content:center; font-weight:800; }}
-.content {{ padding:32px 40px 50px; }}
-.header h2 {{ margin:0; font-size:30px; letter-spacing:-1px; }} .header p {{ color:var(--muted); margin:8px 0 28px; }}
+.sidebar {{ width:288px; background:#fff; border-right:1px solid var(--line); padding:24px 16px; position:fixed; top:0; bottom:0; left:0; }}
+.brand {{ display:flex; align-items:center; gap:12px; padding:4px 10px 34px; }}
+.logo {{ width:42px; height:42px; border-radius:14px; background:linear-gradient(135deg,#16a34a,#064e2a); color:white; display:flex; align-items:center; justify-content:center; font-weight:950; box-shadow:0 12px 30px rgba(15,143,69,.25); }}
+.brand h1 {{ font-size:26px; margin:0; letter-spacing:-1px; }}
+.brand small {{ display:block; color:var(--muted); font-size:12px; margin-top:2px; }}
+.nav a {{ display:flex; gap:12px; align-items:center; padding:13px 15px; color:#374151; text-decoration:none; border-radius:12px; margin-bottom:7px; font-size:14px; font-weight:700; }}
+.nav a.active,.nav a:hover {{ background:var(--green-soft); color:var(--green-dark); }}
+.sidebar-card {{ position:absolute; left:16px; right:16px; bottom:22px; background:linear-gradient(135deg,#f1fbf5,#fff); border:1px solid var(--green-line); border-radius:18px; padding:18px; }}
+.sidebar-card b {{ color:var(--green-dark); }} .sidebar-card p {{ color:var(--muted); font-size:13px; line-height:1.5; margin:8px 0 0; }}
+.main {{ margin-left:288px; flex:1; }}
+.topbar {{ height:70px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.85); backdrop-filter: blur(10px); display:flex; justify-content:space-between; align-items:center; padding:0 34px; position:sticky; top:0; z-index:10; }}
+.top-left b {{ font-size:14px; }} .top-left span {{ color:var(--muted); font-size:13px; margin-left:8px; }}
+.top-actions {{ display:flex; align-items:center; gap:12px; }}
+.pill {{ display:inline-flex; align-items:center; gap:7px; padding:8px 11px; border-radius:999px; font-size:12px; font-weight:850; background:var(--green-soft); color:var(--green-dark); border:1px solid var(--green-line); }}
+.pill.gray {{ background:#f3f4f6; color:#374151; border-color:#e5e7eb; }}
+.pill.red {{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }}
+.avatar {{ width:42px; height:42px; border-radius:999px; background:#111827; color:white; display:flex; align-items:center; justify-content:center; font-weight:900; }}
+.content {{ padding:34px 42px 60px; }}
+.header {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:24px; }}
+.header h2 {{ margin:0; font-size:34px; letter-spacing:-1.3px; }} .header p {{ color:var(--muted); margin:9px 0 0; line-height:1.55; }}
 .grid {{ display:grid; grid-template-columns:repeat(12,1fr); gap:22px; }}
-.card {{ background:white; border:1px solid var(--line); border-radius:12px; padding:24px; box-shadow:0 8px 30px rgba(17,24,39,.025); }}
-.span4 {{ grid-column:span 4; }} .span5 {{ grid-column:span 5; }} .span6 {{ grid-column:span 6; }} .span7 {{ grid-column:span 7; }} .span12 {{ grid-column:span 12; }}
-.card h3 {{ margin:0 0 10px; font-size:17px; }} .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
-.metric {{ font-size:32px; font-weight:900; margin:16px 0 8px; letter-spacing:-1px; }}
-.good {{ color:var(--green)!important; }} .bad {{ color:var(--danger)!important; }} .warn {{ color:var(--warning)!important; }}
-.pill {{ display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border-radius:8px; font-size:13px; font-weight:700; background:var(--green2); color:var(--green); }}
-.keybox {{ border:1px solid var(--line); border-radius:8px; padding:16px; display:flex; justify-content:space-between; gap:12px; font-family:monospace; overflow:auto; background:#fcfcfd; }}
-.steps {{ display:grid; grid-template-columns:repeat(4,1fr); gap:18px; margin-top:18px; }}
-.stepnum {{ width:28px; height:28px; border-radius:999px; background:var(--green); color:white; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:800; box-shadow:0 0 0 8px var(--green2); }}
-.chart {{ height:150px; display:flex; align-items:end; gap:12px; border-bottom:1px solid var(--line); padding-top:15px; }}
-.bar {{ width:16px; border-radius:4px 4px 0 0; background:linear-gradient(180deg,#12a150,#087135); }}
-input,select {{ width:100%; padding:13px 14px; border:1px solid var(--line); border-radius:10px; margin:8px 0 14px; outline:none; }}
-input:focus,select:focus {{ border-color:var(--green); box-shadow:0 0 0 4px var(--green2); }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:22px; padding:24px; box-shadow:var(--shadow); }}
+.card.tight {{ padding:18px; }}
+.span3 {{ grid-column:span 3; }} .span4 {{ grid-column:span 4; }} .span5 {{ grid-column:span 5; }} .span6 {{ grid-column:span 6; }} .span7 {{ grid-column:span 7; }} .span8 {{ grid-column:span 8; }} .span12 {{ grid-column:span 12; }}
+.card h3 {{ margin:0 0 8px; font-size:16px; letter-spacing:-.2px; }} .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
+.metric {{ font-size:31px; font-weight:950; margin:13px 0 6px; letter-spacing:-1.2px; }}
+.good {{ color:var(--green-dark)!important; }} .bad {{ color:var(--danger)!important; }} .warn {{ color:var(--warning)!important; }}
+.btn,button {{ border:none; background:linear-gradient(135deg,#12a150,#087135); color:white; padding:12px 15px; border-radius:12px; text-decoration:none; font-weight:900; display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; margin:4px 6px 4px 0; box-shadow:0 12px 28px rgba(15,143,69,.18); }}
+.btn.secondary,button.secondary {{ background:white; color:#374151; border:1px solid var(--line); box-shadow:none; }} .btn.danger,button.danger {{ background:var(--danger); }}
+input,select,textarea {{ width:100%; padding:13px 14px; border:1px solid var(--line); border-radius:13px; margin:8px 0 14px; outline:none; background:#fff; font-size:14px; }}
+input:focus,select:focus,textarea:focus {{ border-color:var(--green); box-shadow:0 0 0 4px var(--green-soft); }}
 .formgrid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
-button,.btn {{ border:none; background:var(--green); color:white; padding:12px 15px; border-radius:10px; text-decoration:none; font-weight:800; display:inline-block; cursor:pointer; margin:4px 6px 4px 0; }}
-.btn.secondary,button.secondary {{ background:white; color:#374151; border:1px solid var(--line); }} .btn.danger,button.danger {{ background:var(--danger); }}
-table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; border-bottom:1px solid var(--line); padding:12px 8px; font-size:14px; }} th {{ font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:.06em; }}
-@media(max-width:1050px) {{ .sidebar{{position:relative;width:100%;}} .main{{margin-left:0;}} .shell{{display:block;}} .span4,.span5,.span6,.span7{{grid-column:span 12;}} .steps,.formgrid{{grid-template-columns:1fr;}} }}
+.keybox {{ border:1px solid var(--line); border-radius:14px; padding:16px; display:flex; justify-content:space-between; gap:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:auto; background:#fbfcfd; font-size:13px; }}
+.codebox {{ background:#0b1220; color:#d1fae5; border-radius:18px; padding:20px; overflow:auto; font-size:13px; line-height:1.6; border:1px solid #1f2937; }}
+table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; border-bottom:1px solid var(--line); padding:13px 8px; font-size:14px; vertical-align:top; }} th {{ font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:.08em; }}
+.status-dot {{ width:9px; height:9px; border-radius:999px; display:inline-block; background:var(--green); margin-right:7px; }}
+.equity-wrap {{ height:270px; width:100%; }} .equity-svg {{ width:100%; height:100%; }}
+.journal-day {{ display:flex; justify-content:space-between; align-items:center; padding:14px 0; border-bottom:1px solid var(--line); }}
+.journal-day:last-child {{ border-bottom:none; }} .journal-day b {{ display:block; }} .journal-day small {{ color:var(--muted); }}
+.copy-note {{ background:var(--green-soft); color:var(--green-dark); border:1px solid var(--green-line); padding:12px 14px; border-radius:14px; font-size:14px; font-weight:750; }}
+.google-box {{ border:1px dashed var(--line); border-radius:18px; padding:20px; background:#fbfcfd; }}
+@media(max-width:1100px) {{ .sidebar{{position:relative;width:100%;}} .main{{margin-left:0;}} .shell{{display:block;}} .span3,.span4,.span5,.span6,.span7,.span8{{grid-column:span 12;}} .formgrid{{grid-template-columns:1fr;}} .header{{display:block;}} }}
 </style>
+<script>
+function copyText(id) {{
+  const text = document.getElementById(id).innerText;
+  navigator.clipboard.writeText(text);
+  alert('Copied');
+}}
+</script>
 </head>
 <body>
 <div class="shell">
 <aside class="sidebar">
-<div class="brand"><div class="logo">K</div><h1>Khoma</h1></div>
-<div class="nav">
-<a class="{'active' if active=='overview' else ''}" href="/dashboard">⌂ Overview</a>
-<a class="{'active' if active=='broker' else ''}" href="/broker">⌁ Broker Keys</a>
-<a class="{'active' if active=='risk' else ''}" href="/risk">☰ Risk Engine</a>
-<a class="{'active' if active=='webhooks' else ''}" href="/webhooks">⌘ Webhooks</a>
-<a class="{'active' if active=='logs' else ''}" href="/logs">▥ Usage & Logs</a>
-<a href="/docs">◇ API Docs</a>
-<a href="/logout">↩ Logout</a>
-</div>
-<div class="help"><b>Execution Note</b><p>Use demo mode first. Live mode routes real orders and should only be enabled after broker and risk tests pass.</p></div>
+  <div class="brand"><div class="logo">K</div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
+  <div class="nav">
+    {nav_item(active,'dashboard','/dashboard','⌁','Dashboard')}
+    {nav_item(active,'broker','/broker','◇','Broker Connect')}
+    {nav_item(active,'webhooks','/webhooks','⌘','Webhooks')}
+    {nav_item(active,'logs','/logs','▥','Trade Logs')}
+    {nav_item(active,'journal','/journal','◷','Journal')}
+    {nav_item(active,'risk','/risk','☰','Risk Engine')}
+    {nav_item(active,'settings','/settings','⚙','Settings')}
+  </div>
+  <div class="sidebar-card"><b>Cloud Execution Active</b><p>No VPS. No ngrok. No screen clicking. KhomaAPI routes TradingView signals directly through broker infrastructure.</p></div>
 </aside>
-<main class="main"><div class="topbar"><div class="operational">● {status}</div><div class="avatar">{initials}</div></div><div class="content">{content}</div></main>
+<main class="main">
+  <div class="topbar">
+    <div class="top-left"><b>{email}</b><span>KhomaAlgorithms client workspace</span></div>
+    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span><div class="avatar">{initials}</div></div>
+  </div>
+  <div class="content">{content}</div>
+</main>
 </div>
 </body>
 </html>
@@ -631,14 +750,14 @@ table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; bord
 
 def login_layout(content):
     return f"""
-<!DOCTYPE html><html><head><title>KhomaAPI</title><style>
-body{{margin:0;font-family:Arial;background:#fbfcfb;color:#111827;}}
-.wrap{{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at top left,#dff5e7,transparent 35%),#fbfcfb;}}
-.card{{width:460px;background:white;border:1px solid #e5e7eb;border-radius:16px;padding:30px;box-shadow:0 20px 80px rgba(0,0,0,.08);}}
-.logo{{width:44px;height:44px;border-radius:13px;background:#108b3e;color:white;display:flex;align-items:center;justify-content:center;font-weight:900;margin-bottom:18px;}}
-input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:10px;margin:8px 0 14px;box-sizing:border-box;}}
-button,.btn{{background:#108b3e;color:white;border:none;padding:13px 16px;border-radius:10px;font-weight:800;text-decoration:none;display:inline-block;}}
-p{{color:#6b7280;line-height:1.5;}} a{{color:#108b3e;font-weight:800;}}
+<!DOCTYPE html><html><head><title>KhomaAPI Login</title><style>
+body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#f8faf9;color:#111827;}}
+.wrap{{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 10% 10%,#dff5e7,transparent 30%),radial-gradient(circle at 90% 20%,#eefaf2,transparent 28%),#f8faf9;}}
+.card{{width:470px;background:white;border:1px solid #e5e7eb;border-radius:24px;padding:34px;box-shadow:0 24px 90px rgba(17,24,39,.09);}}
+.logo{{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,#16a34a,#064e2a);color:white;display:flex;align-items:center;justify-content:center;font-weight:950;margin-bottom:20px;}}
+h1{{letter-spacing:-1px;margin:0 0 8px;}} p{{color:#6b7280;line-height:1.55;}} input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:13px;margin:8px 0 14px;box-sizing:border-box;}}
+button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;}} a{{color:#0f8f45;font-weight:850;}}
+.google{{background:white;color:#111827;border:1px solid #e5e7eb;width:100%;margin-bottom:12px;}}
 </style></head><body><div class="wrap"><div class="card">{content}</div></div></body></html>
 """
 
@@ -656,10 +775,11 @@ def root(request: Request):
 def signup_page():
     return login_layout('''
     <div class="logo">K</div>
-    <h1>Create KhomaAPI account</h1>
-    <p>Client account for broker execution, webhook routing, risk limits, and execution logs.</p>
+    <h1>Create your KhomaAPI account</h1>
+    <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
+    <a class="btn google" href="/auth/google">Continue with Google</a>
     <form method="post" action="/signup">
-      <input name="email" placeholder="Client email" required>
+      <input name="email" placeholder="Email" required>
       <input name="password" type="password" placeholder="Password" required>
       <button>Create Account</button>
     </form>
@@ -701,7 +821,8 @@ def login_page():
     return login_layout('''
     <div class="logo">K</div>
     <h1>Welcome back</h1>
-    <p>Login to your KhomaAPI execution dashboard.</p>
+    <p>Login to your KhomaAPI execution workspace.</p>
+    <a class="btn google" href="/auth/google">Continue with Google</a>
     <form method="post" action="/login">
       <input name="email" placeholder="Email" required>
       <input name="password" type="password" placeholder="Password" required>
@@ -736,8 +857,19 @@ def logout(request: Request):
     return response
 
 
+@app.get("/auth/google")
+def google_placeholder():
+    return JSONResponse(
+        status_code=501,
+        content={
+            "ok": False,
+            "message": "Google login UI is ready, but Google OAuth credentials are not configured yet. Next step: add Google Client ID/Secret and callback route."
+        }
+    )
+
+
 # ============================================================
-# UI ROUTES
+# DASHBOARD ROUTES
 # ============================================================
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -748,28 +880,45 @@ def dashboard(request: Request):
 
     con = db()
     broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
-    trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 8", (user["id"],)).fetchall()
+    trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10", (user["id"],)).fetchall()
     con.close()
 
-    rows = "".join([
-        f"<tr><td>{t['ts'][:19]}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['mode']}</td><td>{t['status']}</td><td>{t['latency_ms']}</td></tr>"
+    m = dashboard_metrics(user["id"])
+    journal = daily_journal(user["id"])
+
+    trade_rows = "".join([
+        f"<tr><td>{t['ts'][:19]}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['status']}</td><td>{t['mode']}</td><td>{t['latency_ms']}ms</td></tr>"
         for t in trades
     ]) or "<tr><td colspan='7'>No trades yet.</td></tr>"
 
-    chart = "".join([f"<div class='bar' style='height:{h}px'></div>" for h in [42,55,36,74,28,66,35,44,61,51,82,49,38,56,72,46,64,30,58,43,68,53,77,41]])
+    journal_rows = "".join([
+        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
+        for day, vals in journal
+    ]) or "<p class='muted'>No journal data yet.</p>"
+
+    broker_status = "Connected" if broker and broker["connected"] else "Disconnected"
+    broker_class = "good" if broker and broker["connected"] else "bad"
 
     content = f'''
-    <div class="header"><h2>Overview</h2><p>Execution infrastructure for TradingView webhook routing into Tradovate API.</p></div>
+    <div class="header">
+      <div><h2>Execution Dashboard</h2><p>Equity, live monitoring, journal, and risk visibility for your automated trading infrastructure.</p></div>
+      <div><a class="btn" href="/start">Start Automation</a><a class="btn secondary" href="/pause">Pause</a></div>
+    </div>
+
     <div class="grid">
-      <div class="card span6"><h3>Your API Key</h3><p class="muted">Use this key internally for client-level authentication.</p><div class="keybox"><span>{mask_key(user['api_key'])}</span><span>copy</span></div><p class="muted">Never expose this key publicly.</p></div>
-      <div class="card span6"><h3>System Status <span class="pill">● Online</span></h3><p class="muted">Broker status</p><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Automation: <b>{user['automation_status']}</b> | Mode: <b>{user['live_mode'].upper()}</b></p></div>
-      <div class="card span12"><h3>Institutional Control Center</h3><div class="steps"><div class="step"><div class="stepnum">1</div><h4>Connect Broker</h4><p class="muted">Save and test Tradovate credentials.</p></div><div class="step"><div class="stepnum">2</div><h4>Set Risk</h4><p class="muted">Max contracts, symbols, duplicate lock, rejection lock.</p></div><div class="step"><div class="stepnum">3</div><h4>Start Engine</h4><p class="muted">Enable execution after demo testing.</p></div><div class="step"><div class="stepnum">4</div><h4>Route Orders</h4><p class="muted">TradingView sends JSON into KhomaAPI.</p></div></div></div>
-      <div class="card span7"><h3>API Usage</h3><div class="metric">{today_order_count(user['id'])}</div><p class="muted">Accepted execution requests today</p><div class="chart">{chart}</div></div>
-      <div class="card span5"><h3>Automation</h3><p class="muted">Start only after demo broker connection and risk rules pass.</p><a class="btn" href="/start">Start</a><a class="btn secondary" href="/pause">Pause</a><a class="btn danger" href="/flatten-form">Emergency Flatten</a></div>
-      <div class="card span12"><h3>Recent Execution Logs</h3><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Status</th><th>Latency</th></tr>{rows}</table></div>
+      <div class="card span3"><h3>Total PnL</h3><div class="metric good">${m['total_pnl']}</div><p class="muted">Calculated from available trade data. Fill-based PnL can be added next.</p></div>
+      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses</p></div>
+      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Based on stored PnL series.</p></div>
+      <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
+
+      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
+      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p><a class="btn secondary" href="/broker">Manage Broker</a></div>
+
+      <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
+      <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
     </div>
     '''
-    return layout(content, user, "overview")
+    return layout(content, user, "dashboard")
 
 
 @app.get("/broker", response_class=HTMLResponse)
@@ -783,47 +932,35 @@ def broker_page(request: Request):
     con.close()
 
     content = f'''
-    <div class="header"><h2>Broker Keys</h2><p>Save Tradovate credentials and test direct API connection.</p></div>
-    <div class="card"><h3>Tradovate API Credentials</h3><p class="muted">Use demo first. Credentials are encrypted locally.</p>
-    <form method="post" action="/broker/save"><div class="formgrid">
-      <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-      <div><label>Device ID</label><input name="device_id" value="{broker['device_id'] or 'khomaapi-device-001'}"></div>
-      <div><label>Username</label><input name="username" placeholder="Tradovate username"></div>
-      <div><label>Password</label><input name="password" type="password" placeholder="Tradovate password"></div>
-      <div><label>App ID</label><input name="app_id" value="{broker['app_id'] or ''}"></div>
-      <div><label>App Version</label><input name="app_version" value="{broker['app_version'] or '1.0'}"></div>
-      <div><label>CID</label><input name="cid" value="{broker['cid'] or ''}"></div>
-      <div><label>SEC</label><input name="sec" type="password" placeholder="SEC"></div>
-      <div><label>Account Spec</label><input name="account_spec" value="{broker['account_spec'] or ''}" placeholder="Example: DEMO12345"></div>
-      <div><label>Account ID</label><input name="account_id" value="{broker['account_id'] or ''}" placeholder="Numeric account ID"></div>
-    </div><button>Save Credentials</button><a class="btn secondary" href="/broker/test">Test Connection</a></form>
-    <p class="muted">Status: <b class="{'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</b></p>
-    <p class="muted">Last Error: {broker['last_error'] or 'None'}</p></div>
+    <div class="header"><div><h2>Broker Connection</h2><p>Connect the Tradovate account that KhomaAPI should route orders into.</p></div></div>
+    <div class="grid">
+      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}</p><a class="btn secondary" href="/broker/test">Test Connection</a></div>
+      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">For now, enter API credentials manually. OAuth Connect Tradovate flow can replace this after vendor approval.</p>
+      <form method="post" action="/broker/save"><div class="formgrid">
+        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
+        <div><label>Device ID</label><input name="device_id" value="{broker['device_id'] or 'khomaapi-device-001'}"></div>
+        <div><label>Username</label><input name="username" placeholder="Tradovate username"></div>
+        <div><label>Password</label><input name="password" type="password" placeholder="Tradovate password"></div>
+        <div><label>App ID</label><input name="app_id" value="{broker['app_id'] or 'KhomaAPI'}"></div>
+        <div><label>App Version</label><input name="app_version" value="{broker['app_version'] or '1.0'}"></div>
+        <div><label>CID</label><input name="cid" value="{broker['cid'] or ''}"></div>
+        <div><label>SEC</label><input name="sec" type="password" placeholder="SEC"></div>
+        <div><label>Account Spec</label><input name="account_spec" value="{broker['account_spec'] or ''}" placeholder="Example: 1047092"></div>
+        <div><label>Account ID</label><input name="account_id" value="{broker['account_id'] or ''}" placeholder="Example: 203310"></div>
+      </div><button>Save Credentials</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form></div>
+    </div>
     '''
     return layout(content, user, "broker")
 
 
 @app.post("/broker/save")
-def broker_save(
-    request: Request,
-    env: str = Form(...),
-    username: str = Form(""),
-    password: str = Form(""),
-    app_id: str = Form(""),
-    app_version: str = Form("1.0"),
-    cid: str = Form(""),
-    sec: str = Form(""),
-    account_spec: str = Form(""),
-    account_id: str = Form(""),
-    device_id: str = Form("khomaapi-device-001"),
-):
+def broker_save(request: Request, env: str = Form(...), username: str = Form(""), password: str = Form(""), app_id: str = Form(""), app_version: str = Form("1.0"), cid: str = Form(""), sec: str = Form(""), account_spec: str = Form(""), account_id: str = Form(""), device_id: str = Form("khomaapi-device-001")):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
     con = db()
     old = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
-
     username_enc = enc(username) if username else old["username_enc"]
     password_enc = enc(password) if password else old["password_enc"]
     sec_enc = enc(sec) if sec else old["sec_enc"]
@@ -851,18 +988,40 @@ def broker_test(request: Request):
     con = db()
     try:
         tradovate_login(user["id"])
-        con.execute(
-            "UPDATE brokers SET connected=1,last_error='',last_test=? WHERE user_id=?",
-            (datetime.now(timezone.utc).isoformat(), user["id"]),
-        )
+        con.execute("UPDATE brokers SET connected=1,last_error='',last_test=? WHERE user_id=?", (datetime.now(timezone.utc).isoformat(), user["id"]))
     except Exception as e:
-        con.execute(
-            "UPDATE brokers SET connected=0,last_error=?,last_test=? WHERE user_id=?",
-            (str(e), datetime.now(timezone.utc).isoformat(), user["id"]),
-        )
+        con.execute("UPDATE brokers SET connected=0,last_error=?,last_test=? WHERE user_id=?", (str(e), datetime.now(timezone.utc).isoformat(), user["id"]))
     con.commit()
     con.close()
     return RedirectResponse("/broker")
+
+
+@app.get("/webhooks", response_class=HTMLResponse)
+def webhooks_page(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    domain = str(request.base_url).rstrip("/")
+    webhook_url = f"{domain}/webhook/trade"
+    example = json.dumps({
+        "client_id": user["email"],
+        "auth": user["webhook_secret"],
+        "symbol": "MNQM6",
+        "side": "buy",
+        "qty": 1,
+        "request_id": "{{strategy.order.id}}"
+    }, indent=2)
+
+    content = f'''
+    <div class="header"><div><h2>TradingView Webhooks</h2><p>Copy this URL and JSON into your TradingView alert.</p></div></div>
+    <div class="grid">
+      <div class="card span12"><h3>Webhook URL</h3><div class="keybox"><span id="webhook-url">{webhook_url}</span><button onclick="copyText('webhook-url')">Copy</button></div></div>
+      <div class="card span7"><h3>TradingView JSON</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button></div>
+      <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste the webhook URL.<br>4. Paste the JSON message.<br>5. Start automation in KhomaAPI.</p><div class="copy-note">Each client uses the same endpoint, but a unique client_id + secret. Accounts do not intersect.</div></div>
+    </div>
+    '''
+    return layout(content, user, "webhooks")
 
 
 @app.get("/risk", response_class=HTMLResponse)
@@ -872,7 +1031,7 @@ def risk_page(request: Request):
         return RedirectResponse("/login")
 
     content = f'''
-    <div class="header"><h2>Risk Engine</h2><p>Protect every account before orders are routed.</p></div>
+    <div class="header"><div><h2>Risk Engine</h2><p>Control max size, allowed symbols, daily order limits, duplicate locks, and execution mode.</p></div></div>
     <div class="card"><form method="post" action="/risk/save"><div class="formgrid">
       <div><label>Webhook Secret</label><input name="webhook_secret" value="{user['webhook_secret']}"></div>
       <div><label>Allowed Symbols</label><input name="allowed_symbols" value="{user['allowed_symbols']}"></div>
@@ -887,16 +1046,7 @@ def risk_page(request: Request):
 
 
 @app.post("/risk/save")
-def risk_save(
-    request: Request,
-    webhook_secret: str = Form(...),
-    allowed_symbols: str = Form(...),
-    max_contracts: int = Form(...),
-    max_orders: int = Form(...),
-    duplicate_seconds: int = Form(...),
-    max_rejections_per_day: int = Form(...),
-    live_mode: str = Form(...),
-):
+def risk_save(request: Request, webhook_secret: str = Form(...), allowed_symbols: str = Form(...), max_contracts: int = Form(...), max_orders: int = Form(...), duplicate_seconds: int = Form(...), max_rejections_per_day: int = Form(...), live_mode: str = Form(...)):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
@@ -916,19 +1066,58 @@ def risk_save(
     return RedirectResponse("/risk", status_code=302)
 
 
-@app.get("/webhooks", response_class=HTMLResponse)
-def webhooks_page(request: Request):
+@app.get("/logs", response_class=HTMLResponse)
+def logs(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
-    example = '{\n  "client_id": "' + user['email'] + '",\n  "auth": "' + user['webhook_secret'] + '",\n  "symbol": "MNQ",\n  "side": "buy",\n  "qty": 1,\n  "request_id": "{{strategy.order.id}}"\n}'
+    trades = get_user_trades(user["id"], 200)
+    rows = "".join([
+        f"<tr><td>{t['ts'][:19]}</td><td>{t['request_id']}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['mode']}</td><td>{t['status']}</td><td>{t['latency_ms']}ms</td><td>{t['message']}</td></tr>"
+        for t in trades
+    ]) or "<tr><td colspan='9'>No logs.</td></tr>"
 
     content = f'''
-    <div class="header"><h2>Webhooks</h2><p>Use this JSON from TradingView alerts.</p></div>
-    <div class="card"><h3>Trade Webhook</h3><div class="keybox">http://127.0.0.1:8000/webhook/trade</div><pre style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:18px;overflow:auto;">{example}</pre><h3>Flatten Webhook</h3><div class="keybox">http://127.0.0.1:8000/webhook/flatten</div></div>
+    <div class="header"><div><h2>Trade Logs</h2><p>Full history of every accepted, rejected, simulated, and live broker request.</p></div></div>
+    <div class="card"><table><tr><th>Time</th><th>Request ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Status</th><th>Latency</th><th>Message</th></tr>{rows}</table></div>
     '''
-    return layout(content, user, "webhooks")
+    return layout(content, user, "logs")
+
+
+@app.get("/journal", response_class=HTMLResponse)
+def journal_page(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    journal = daily_journal(user["id"])
+    journal_html = "".join([
+        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
+        for day, vals in journal
+    ]) or "<p class='muted'>No journal data yet.</p>"
+
+    content = f'''
+    <div class="header"><div><h2>Trading Journal</h2><p>Daily breakdown of automated trading activity.</p></div></div>
+    <div class="card">{journal_html}</div>
+    '''
+    return layout(content, user, "journal")
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    content = f'''
+    <div class="header"><div><h2>Settings</h2><p>Profile, authentication, and account security.</p></div></div>
+    <div class="grid">
+      <div class="card span6"><h3>Profile</h3><p class="muted">Email: <b>{user['email']}</b></p><p class="muted">Account created: {user['created_at']}</p></div>
+      <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login button is shown on login/signup, but OAuth credentials are not configured yet. Next step: create Google OAuth app and add callback.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
+    </div>
+    '''
+    return layout(content, user, "settings")
 
 
 @app.get("/start")
@@ -936,7 +1125,6 @@ def start(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
-
     con = db()
     con.execute("UPDATE users SET automation_status='Running' WHERE id=?", (user["id"],))
     con.commit()
@@ -949,7 +1137,6 @@ def pause(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
-
     con = db()
     con.execute("UPDATE users SET automation_status='Paused' WHERE id=?", (user["id"],))
     con.commit()
@@ -962,11 +1149,10 @@ def flatten_form(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
-
     return layout('''
-    <div class="header"><h2>Emergency Flatten</h2><p>Enter the exact Tradovate contract symbol you want to flatten.</p></div>
+    <div class="header"><div><h2>Emergency Flatten</h2><p>Close the currently detected position for one contract symbol.</p></div></div>
     <div class="card"><form method="post" action="/flatten"><input name="symbol" placeholder="Example: MNQM6" required><button class="danger">Flatten Symbol</button></form></div>
-    ''', user, "overview")
+    ''', user, "dashboard")
 
 
 @app.post("/flatten")
@@ -979,7 +1165,6 @@ def flatten_post(request: Request, symbol: str = Form(...)):
     try:
         if user["live_mode"] != "live":
             raise Exception("Flatten blocked because account is in simulation mode.")
-
         broker_connection_check(user["id"])
         result = safe_flatten_symbol(user["id"], symbol.upper())
         latency = round((time.perf_counter() - start_time) * 1000, 3)
@@ -987,30 +1172,35 @@ def flatten_post(request: Request, symbol: str = Form(...)):
     except Exception as e:
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], "manual-flatten", symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
-
     return RedirectResponse("/logs", status_code=302)
 
 
-@app.get("/logs", response_class=HTMLResponse)
-def logs(request: Request):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+# ============================================================
+# TRADOVATE OAUTH PLACEHOLDER ROUTES
+# ============================================================
 
-    con = db()
-    trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 150", (user["id"],)).fetchall()
-    con.close()
+@app.get("/auth/tradovate/connect")
+def tradovate_connect():
+    client_id = os.getenv("TRADOVATE_OAUTH_CID", "13286")
+    redirect_uri = os.getenv("TRADOVATE_OAUTH_REDIRECT", "https://web-production-6ad48.up.railway.app/auth/callback")
+    oauth_url = (
+        "https://trader.tradovate.com/oauth/authorize"
+        f"?client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&scope=openid"
+    )
+    return RedirectResponse(oauth_url)
 
-    rows = "".join([
-        f"<tr><td>{t['ts'][:19]}</td><td>{t['request_id']}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['mode']}</td><td>{t['status']}</td><td>{t['latency_ms']}</td><td>{t['message']}</td></tr>"
-        for t in trades
-    ]) or "<tr><td colspan='9'>No logs.</td></tr>"
 
-    content = f'''
-    <div class="header"><h2>Usage & Logs</h2><p>Every accepted, rejected, simulated, and live broker request is recorded.</p></div>
-    <div class="card"><table><tr><th>Time</th><th>Request ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Status</th><th>Latency</th><th>Message</th></tr>{rows}</table></div>
-    '''
-    return layout(content, user, "logs")
+@app.get("/auth/callback")
+def tradovate_callback(code: str = "", state: str = ""):
+    return {
+        "ok": True,
+        "message": "OAuth callback received. Token exchange is not implemented yet.",
+        "code": code,
+        "state": state,
+    }
 
 
 # ============================================================
@@ -1098,36 +1288,24 @@ def webhook_flatten(payload: WebhookFlatten):
     try:
         if payload.auth != user["webhook_secret"]:
             raise Exception("Invalid webhook secret.")
-
         if user["live_mode"] != "live":
             raise Exception("Flatten blocked in simulation mode.")
-
         broker_connection_check(user["id"])
         result = safe_flatten_symbol(user["id"], payload.symbol.upper())
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "live", "FLATTEN_SENT", latency, "Flatten attempted.", result)
-
-        return {
-            "ok": True,
-            "latency_ms": latency,
-            "result": result,
-        }
-
+        return {"ok": True, "latency_ms": latency, "result": result}
     except Exception as e:
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
-        return {
-            "ok": False,
-            "error": str(e),
-            "latency_ms": latency,
-        }
+        return {"ok": False, "error": str(e), "latency_ms": latency}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "app": "KhomaAPI v3.1 Institutional",
+        "app": "KhomaAPI v4 Dashboard MVP",
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1137,35 +1315,5 @@ def api_trades(request: Request):
     user = require_user(request)
     if not user:
         return {"ok": False, "error": "not authenticated"}
-
-    con = db()
-    rows = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 100", (user["id"],)).fetchall()
-    con.close()
-
+    rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
-@app.get("/auth/tradovate/connect")
-def tradovate_connect():
-
-    client_id = "13286"
-
-    redirect_uri = "https://web-production-6ad48.up.railway.app/auth/callback"
-
-    oauth_url = (
-        "https://trader.tradovate.com/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&response_type=code"
-        f"&scope=openid"
-    )
-
-
-    return RedirectResponse(oauth_url)
-
-@app.get("/auth/callback")
-def tradovate_callback(code: str = ""):
-
-    return {
-        "ok": True,
-        "message": "OAuth callback received.",
-        "code": code
-    }
