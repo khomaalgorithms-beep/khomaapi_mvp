@@ -881,8 +881,7 @@ def signup_page():
     <p>Already have an account? <a href="/login">Login</a></p>
     ''')
 
-
-@app.post("/signup")
+@app.post("/signup", response_class=HTMLResponse)
 def signup(email: str = Form(...), password: str = Form(...)):
     con = db()
     try:
@@ -927,7 +926,7 @@ def login_page():
     ''')
 
 
-@app.post("/login")
+@app.post("/login", response_class=HTMLResponse)
 def login(email: str = Form(...), password: str = Form(...)):
     con = db()
     user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
