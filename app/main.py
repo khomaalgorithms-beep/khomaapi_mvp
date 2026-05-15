@@ -5,7 +5,6 @@ from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
-
 from fastapi.staticfiles import StaticFiles
 import sqlite3
 import hashlib
@@ -24,9 +23,16 @@ import requests
 # ============================================================
 
 app = FastAPI(title="KhomaAPI v5")
+from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE_DIR / "static"),
+    name="static"
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
