@@ -1,10 +1,16 @@
 from fastapi import FastAPI, Form, Request
+
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Literal, Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
+from fastapi import FastAPI, Form, Request
+
+from starlette.middleware.sessions import SessionMiddleware
+from authlib.integrations.starlette_client import OAuth
+from starlette.config import Config
 import sqlite3
 import hashlib
 import os
@@ -19,6 +25,24 @@ import requests
 # ============================================================
 
 app = FastAPI(title="KhomaAPI v4")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key="khoma_google_login_secret"
+)
+
+config = Config(environ=os.environ)
+
+oauth = OAuth(config)
+
+oauth.register(
+    name="google",
+    client_id=os.getenv("GOOGLE_CLIENT_ID"),
+    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={
+        "scope": "openid email profile"
+    }
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
@@ -857,15 +881,160 @@ def logout(request: Request):
     return response
 
 
+# ============================================================
+# GOOGLE OAUTH LOGIN
+# ============================================================
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://web-production-6ad48.up.railway.app/auth/google/callback"
+)
+
+
 @app.get("/auth/google")
-def google_placeholder():
-    return JSONResponse(
-        status_code=501,
-        content={
-            "ok": False,
-            "message": "Google login UI is ready, but Google OAuth credentials are not configured yet. Next step: add Google Client ID/Secret and callback route."
-        }
+def auth_google():
+    if not GOOGLE_CLIENT_ID:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": "GOOGLE_CLIENT_ID not configured in Railway variables."
+            }
+        )
+
+    google_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&response_type=code"
+        "&scope=openid%20email%20profile"
+        "&access_type=online"
+        "&prompt=select_account"
     )
+
+    return RedirectResponse(google_url)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(code: str = ""):
+
+    if not code:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "Missing Google OAuth code."
+            }
+        )
+
+    token_response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=20,
+    )
+
+    token_data = token_response.json()
+
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "Failed to get Google access token.",
+                "details": token_data,
+            }
+        )
+
+    user_response = requests.get(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={
+            "Authorization": f"Bearer {access_token}"
+        },
+        timeout=20,
+    )
+
+    google_user = user_response.json()
+
+    email = google_user.get("email")
+
+    if not email:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "Google account email not received."
+            }
+        )
+
+    con = db()
+
+    existing_user = con.execute(
+        "SELECT * FROM users WHERE email=?",
+        (email.lower().strip(),),
+    ).fetchone()
+
+    if not existing_user:
+
+        random_password = secrets.token_hex(24)
+
+        cur = con.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at)
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                email.lower().strip(),
+                hash_password(random_password),
+                "khoma_live_" + secrets.token_urlsafe(24),
+                secrets.token_hex(20),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        uid = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO brokers(user_id) VALUES(?)",
+            (uid,),
+        )
+
+        con.commit()
+
+        user = con.execute(
+            "SELECT * FROM users WHERE id=?",
+            (uid,),
+        ).fetchone()
+
+    else:
+        user = existing_user
+
+    con.close()
+
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = user["id"]
+
+    response = RedirectResponse("/dashboard", status_code=302)
+
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        samesite="lax"
+    )
+
+    return response
 
 
 # ============================================================
@@ -1317,3 +1486,90 @@ def api_trades(request: Request):
         return {"ok": False, "error": "not authenticated"}
     rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
+# ============================================================
+# WEBHOOK API
+# ============================================================
+# ============================================================
+# GOOGLE OAUTH LOGIN
+# ============================================================
+
+@app.get("/auth/google")
+async def auth_google(request: Request):
+
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+
+    return await oauth.google.authorize_redirect(
+        request,
+        redirect_uri
+    )
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(request: Request):
+
+    token = await oauth.google.authorize_access_token(request)
+
+    user_info = token.get("userinfo")
+
+    email = user_info["email"]
+
+    con = db()
+
+    existing = con.execute(
+        "SELECT * FROM users WHERE email=?",
+        (email,)
+    ).fetchone()
+
+    if not existing:
+
+        cur = con.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO users(
+                email,
+                password_hash,
+                api_key,
+                webhook_secret,
+                created_at
+            )
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                email,
+                "google_oauth",
+                "khoma_live_" + secrets.token_urlsafe(24),
+                secrets.token_hex(20),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        uid = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO brokers(user_id) VALUES(?)",
+            (uid,)
+        )
+
+        con.commit()
+
+        existing = con.execute(
+            "SELECT * FROM users WHERE id=?",
+            (uid,)
+        ).fetchone()
+
+    con.close()
+
+    sid = secrets.token_urlsafe(32)
+
+    SESSIONS[sid] = existing["id"]
+
+    response = RedirectResponse("/dashboard")
+
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        samesite="lax"
+    )
+
+    return response
