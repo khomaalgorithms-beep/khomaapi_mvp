@@ -7,11 +7,15 @@ from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
 import sqlite3
 import hashlib
-import os
 import secrets
 import json
 import time
 import requests
+import os
+TRADOVATE_CID = int(os.getenv("TRADOVATE_CID"))
+TRADOVATE_SEC = os.getenv("TRADOVATE_SEC")
+TRADOVATE_APP_ID = os.getenv("TRADOVATE_APP_ID")
+TRADOVATE_APP_VERSION = os.getenv("TRADOVATE_APP_VERSION")
 
 # ============================================================
 # KHOMAAPI v5
@@ -187,7 +191,7 @@ def mask_value(value: str, visible: int = 5) -> str:
 # ============================================================
 
 def tradovate_base(env: str) -> str:
-    return "https://live.tradovateapi.com/v1" if env == "live" else "https://demo.tradovateapi.com/v1"
+    return "https://live-api.tradovate.com/v1" if env == "live" else "https://demo-api.tradovate.com/v1"
 
 
 def tv_headers(token: str) -> Dict[str, str]:
@@ -238,11 +242,11 @@ def tradovate_login_raw(env: str, username: str, password: str, user_id: int) ->
     payload = {
         "name": username,
         "password": password,
-        "appId": cfg["app_id"],
-        "appVersion": cfg["app_version"],
-        "cid": cfg["cid"],
-        "sec": cfg["sec"],
-        "deviceId": cfg["device_id"],
+        "appId": TRADOVATE_APP_ID,
+        "appVersion": TRADOVATE_APP_VERSION,
+        "cid": TRADOVATE_CID,
+        "sec": TRADOVATE_SEC,
+        "deviceId": "khomaapi-cloud"
     }
 
     response = requests.post(
