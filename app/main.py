@@ -1,16 +1,10 @@
 from fastapi import FastAPI, Form, Request
-
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Literal, Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, Form, Request
-
-from starlette.middleware.sessions import SessionMiddleware
-from authlib.integrations.starlette_client import OAuth
-from starlette.config import Config
 import sqlite3
 import hashlib
 import os
@@ -20,29 +14,14 @@ import time
 import requests
 
 # ============================================================
-# KHOMAAPI v4 DASHBOARD MVP
-# Cloud Tradovate execution + institutional SaaS dashboard
+# KHOMAAPI v5
+# Full SaaS dashboard + Google login + simplified broker connect
+# Client only enters Tradovate username/password.
+# Backend auto-handles CID, SEC, appId, deviceId, account ID, account spec.
+# TradingView controls side, qty, symbol dynamically.
 # ============================================================
 
-app = FastAPI(title="KhomaAPI v4")
-app.add_middleware(
-    SessionMiddleware,
-    secret_key="khoma_google_login_secret"
-)
-
-config = Config(environ=os.environ)
-
-oauth = OAuth(config)
-
-oauth.register(
-    name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={
-        "scope": "openid email profile"
-    }
-)
+app = FastAPI(title="KhomaAPI v5")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
@@ -105,7 +84,7 @@ def init_db():
         max_orders INTEGER DEFAULT 10,
         duplicate_seconds INTEGER DEFAULT 8,
         max_rejections_per_day INTEGER DEFAULT 3,
-        allowed_symbols TEXT DEFAULT 'MNQ,MNQM6,NQ,MES,ES,MYM,YM',
+        allowed_symbols TEXT DEFAULT '*',
         created_at TEXT
     )
     """)
@@ -123,6 +102,7 @@ def init_db():
         account_spec TEXT,
         account_id TEXT,
         device_id TEXT DEFAULT 'khomaapi-device-001',
+        access_token_enc TEXT,
         connected INTEGER DEFAULT 0,
         last_error TEXT DEFAULT '',
         last_test TEXT DEFAULT ''
@@ -156,6 +136,16 @@ def init_db():
         PRIMARY KEY(user_id, symbol, side, request_id)
     )
     """)
+
+    # Add columns safely if old DB already exists.
+    try:
+        cur.execute("ALTER TABLE brokers ADD COLUMN access_token_enc TEXT")
+    except Exception:
+        pass
+
+    # Upgrade existing users to allow all symbols by default if they still have restricted list.
+    # You can still restrict this later from Risk Engine.
+    cur.execute("UPDATE users SET allowed_symbols='*' WHERE allowed_symbols IS NULL OR allowed_symbols='' OR allowed_symbols='MNQ,NQ,MES,ES,MYM,YM' OR allowed_symbols='MNQ,MNQM6,NQ,MES,ES,MYM,YM'")
 
     con.commit()
     con.close()
@@ -193,11 +183,37 @@ def mask_value(value: str, visible: int = 5) -> str:
 
 
 # ============================================================
-# TRADOVATE API
+# TRADOVATE API CONFIG
 # ============================================================
 
 def tradovate_base(env: str) -> str:
     return "https://live.tradovateapi.com/v1" if env == "live" else "https://demo.tradovateapi.com/v1"
+
+
+def tv_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def get_backend_tradovate_config(user_id: int) -> Dict[str, str]:
+    cid = os.getenv("TRADOVATE_CID", "").strip()
+    sec = os.getenv("TRADOVATE_SEC", "").strip()
+    app_id = os.getenv("TRADOVATE_APP_ID", "KhomaAPI").strip() or "KhomaAPI"
+    app_version = os.getenv("TRADOVATE_APP_VERSION", "1.0").strip() or "1.0"
+    device_id = f"khomaapi-cloud-{user_id}"
+
+    if not cid or not sec:
+        raise Exception("TRADOVATE_CID or TRADOVATE_SEC is missing in Railway variables.")
+
+    return {
+        "cid": cid,
+        "sec": sec,
+        "app_id": app_id,
+        "app_version": app_version,
+        "device_id": device_id,
+    }
 
 
 def get_broker(user_id: int) -> Optional[Dict[str, Any]]:
@@ -212,31 +228,25 @@ def get_broker(user_id: int) -> Optional[Dict[str, Any]]:
     broker["username"] = dec(broker.get("username_enc"))
     broker["password"] = dec(broker.get("password_enc"))
     broker["sec"] = dec(broker.get("sec_enc"))
+    broker["access_token"] = dec(broker.get("access_token_enc")) if broker.get("access_token_enc") else ""
     return broker
 
 
-def tradovate_login(user_id: int) -> Tuple[str, Dict[str, Any]]:
-    broker = get_broker(user_id)
-    if not broker:
-        raise Exception("Broker profile not found.")
-
-    required = ["username", "password", "app_id", "cid", "sec", "account_spec", "account_id"]
-    missing = [field for field in required if not broker.get(field)]
-    if missing:
-        raise Exception("Missing broker fields: " + ", ".join(missing))
+def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
+    cfg = get_backend_tradovate_config(user_id)
 
     payload = {
-        "name": broker["username"],
-        "password": broker["password"],
-        "appId": broker["app_id"],
-        "appVersion": broker["app_version"] or "1.0",
-        "cid": broker["cid"],
-        "sec": broker["sec"],
-        "deviceId": broker["device_id"] or "khomaapi-device-001",
+        "name": username,
+        "password": password,
+        "appId": cfg["app_id"],
+        "appVersion": cfg["app_version"],
+        "cid": cfg["cid"],
+        "sec": cfg["sec"],
+        "deviceId": cfg["device_id"],
     }
 
     response = requests.post(
-        f"{tradovate_base(broker['env'])}/auth/accesstokenrequest",
+        f"{tradovate_base(env)}/auth/accesstokenrequest",
         json=payload,
         timeout=15,
     )
@@ -249,14 +259,48 @@ def tradovate_login(user_id: int) -> Tuple[str, Dict[str, Any]]:
     if response.status_code >= 400 or not isinstance(data, dict) or not data.get("accessToken"):
         raise Exception(f"Tradovate login failed: {data}")
 
-    return data["accessToken"], broker
+    return data["accessToken"], cfg
 
 
-def tv_headers(token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+def fetch_tradovate_accounts(env: str, token: str):
+    response = requests.get(
+        f"{tradovate_base(env)}/account/list",
+        headers=tv_headers(token),
+        timeout=15,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400 or not isinstance(data, list) or len(data) == 0:
+        raise Exception(f"Could not fetch Tradovate accounts: {data}")
+
+    active_accounts = [a for a in data if not a.get("closed") and not a.get("archived") and a.get("active", True)]
+    return active_accounts or data
+
+
+def tradovate_login(user_id: int) -> Tuple[str, Dict[str, Any]]:
+    broker = get_broker(user_id)
+    if not broker:
+        raise Exception("Broker profile not found.")
+
+    if not broker.get("username") or not broker.get("password"):
+        raise Exception("Broker username/password missing. Go to Broker Connect.")
+
+    if not broker.get("account_spec") or not broker.get("account_id"):
+        raise Exception("Broker account not detected. Reconnect broker.")
+
+    token, cfg = tradovate_login_raw(broker.get("env", "demo"), broker["username"], broker["password"], user_id)
+
+    broker["app_id"] = cfg["app_id"]
+    broker["app_version"] = cfg["app_version"]
+    broker["cid"] = cfg["cid"]
+    broker["sec"] = cfg["sec"]
+    broker["device_id"] = cfg["device_id"]
+    broker["access_token"] = token
+    return token, broker
 
 
 def tv_market_order(user_id: int, symbol: str, side: str, qty: int, retries: int = 3) -> Dict[str, Any]:
@@ -275,7 +319,7 @@ def tv_market_order(user_id: int, symbol: str, side: str, qty: int, retries: int
                 "orderType": "Market",
                 "isAutomated": True,
                 "timeInForce": "Day",
-                "deviceId": broker["device_id"] or "khomaapi-device-001",
+                "deviceId": broker["device_id"],
             }
 
             response = requests.post(
@@ -349,6 +393,12 @@ def get_current_position(user_id: int, symbol: str):
 
 
 def handle_trade_logic(user_id: int, symbol: str, side: str, qty: int):
+    side = normalize_side(side)
+
+    if side == "flatten":
+        result = safe_flatten_symbol(user_id, symbol)
+        return result, "FLATTENED"
+
     position = get_current_position(user_id, symbol)
 
     if position is None:
@@ -437,10 +487,6 @@ def get_user_trades(user_id: int, limit: int = 200):
 
 
 def estimate_trade_pnl(row) -> float:
-    """
-    Current MVP estimate. Real PnL requires fill/exit data.
-    For now, if broker_response includes pnl/realizedPnl later, use it.
-    """
     try:
         data = json.loads(row["broker_response"] or "{}")
         for key in ["pnl", "realizedPnl", "realizedPNL", "profit", "netPnL"]:
@@ -453,7 +499,7 @@ def estimate_trade_pnl(row) -> float:
 
 def dashboard_metrics(user_id: int):
     rows = list(reversed(get_user_trades(user_id, 500)))
-    executed = [r for r in rows if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT")]
+    executed = [r for r in rows if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED")]
     rejected = [r for r in rows if r["status"] == "REJECTED"]
 
     pnl_values = []
@@ -503,7 +549,7 @@ def daily_journal(user_id: int):
         days[day]["trades"] += 1
         if r["status"] == "REJECTED":
             days[day]["rejected"] += 1
-        if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT"):
+        if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED"):
             days[day]["executed"] += 1
         days[day]["pnl"] += estimate_trade_pnl(r)
 
@@ -518,7 +564,7 @@ def today_order_count(user_id: int) -> int:
         FROM trades
         WHERE user_id=?
         AND ts LIKE ?
-        AND status IN ('SIMULATED','EXECUTED','SENT_TO_BROKER','FLATTEN_SENT')
+        AND status IN ('SIMULATED','EXECUTED','SENT_TO_BROKER','FLATTEN_SENT','SKIPPED')
         """,
         (user_id, date.today().isoformat() + "%"),
     ).fetchone()
@@ -555,7 +601,7 @@ def broker_connection_check(user_id: int):
     if not broker:
         raise Exception("Broker profile not found.")
     if not broker["connected"]:
-        raise Exception("Broker not connected. Go to Broker Connection and click Test Connection first.")
+        raise Exception("Broker not connected. Go to Broker Connection and click Connect Broker first.")
 
 
 def check_duplicate(user, symbol: str, side: str, request_id: str):
@@ -588,6 +634,30 @@ def check_duplicate(user, symbol: str, side: str, request_id: str):
     con.close()
 
 
+def normalize_side(side: str) -> str:
+    s = str(side or "").lower().strip()
+
+    if s in ["buy", "long", "entry_long", "strategy.long"]:
+        return "buy"
+
+    if s in ["sell", "short", "entry_short", "strategy.short"]:
+        return "sell"
+
+    if s in ["flat", "flatten", "close", "exit", "close_all", "strategy.close", "strategy.exit"]:
+        return "flatten"
+
+    raise Exception(f"Unsupported side/action: {side}")
+
+
+def clean_qty(qty: Any) -> int:
+    try:
+        if qty is None or qty == "":
+            return 1
+        return max(1, int(float(qty)))
+    except Exception:
+        return 1
+
+
 def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: str):
     if auth != user["webhook_secret"]:
         raise Exception("Invalid webhook secret.")
@@ -595,14 +665,18 @@ def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: st
     if user["automation_status"] != "Running":
         raise Exception("Automation paused.")
 
-    symbol = symbol.upper().strip()
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        raise Exception("Missing symbol.")
+
+    side = normalize_side(side)
+    qty = clean_qty(qty)
+
     allowed = [item.strip().upper() for item in user["allowed_symbols"].split(",") if item.strip()]
+    allow_all = "*" in allowed or "ALL" in allowed
 
-    if symbol not in allowed:
+    if not allow_all and symbol not in allowed:
         raise Exception(f"Symbol {symbol} not allowed.")
-
-    if side not in ["buy", "sell"]:
-        raise Exception("Side must be buy or sell.")
 
     if qty < 1 or qty > int(user["max_contracts"]):
         raise Exception(f"Qty violates max contract limit: {user['max_contracts']}.")
@@ -613,7 +687,7 @@ def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: st
     emergency_risk_check(user["id"])
     check_duplicate(user, symbol, side, request_id)
 
-    return symbol
+    return symbol, side, qty
 
 
 # ============================================================
@@ -708,14 +782,12 @@ body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,-ap
 .top-actions {{ display:flex; align-items:center; gap:12px; }}
 .pill {{ display:inline-flex; align-items:center; gap:7px; padding:8px 11px; border-radius:999px; font-size:12px; font-weight:850; background:var(--green-soft); color:var(--green-dark); border:1px solid var(--green-line); }}
 .pill.gray {{ background:#f3f4f6; color:#374151; border-color:#e5e7eb; }}
-.pill.red {{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }}
 .avatar {{ width:42px; height:42px; border-radius:999px; background:#111827; color:white; display:flex; align-items:center; justify-content:center; font-weight:900; }}
 .content {{ padding:34px 42px 60px; }}
 .header {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:24px; }}
 .header h2 {{ margin:0; font-size:34px; letter-spacing:-1.3px; }} .header p {{ color:var(--muted); margin:9px 0 0; line-height:1.55; }}
 .grid {{ display:grid; grid-template-columns:repeat(12,1fr); gap:22px; }}
 .card {{ background:var(--card); border:1px solid var(--line); border-radius:22px; padding:24px; box-shadow:var(--shadow); }}
-.card.tight {{ padding:18px; }}
 .span3 {{ grid-column:span 3; }} .span4 {{ grid-column:span 4; }} .span5 {{ grid-column:span 5; }} .span6 {{ grid-column:span 6; }} .span7 {{ grid-column:span 7; }} .span8 {{ grid-column:span 8; }} .span12 {{ grid-column:span 12; }}
 .card h3 {{ margin:0 0 8px; font-size:16px; letter-spacing:-.2px; }} .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
 .metric {{ font-size:31px; font-weight:950; margin:13px 0 6px; letter-spacing:-1.2px; }}
@@ -728,7 +800,6 @@ input:focus,select:focus,textarea:focus {{ border-color:var(--green); box-shadow
 .keybox {{ border:1px solid var(--line); border-radius:14px; padding:16px; display:flex; justify-content:space-between; gap:12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:auto; background:#fbfcfd; font-size:13px; }}
 .codebox {{ background:#0b1220; color:#d1fae5; border-radius:18px; padding:20px; overflow:auto; font-size:13px; line-height:1.6; border:1px solid #1f2937; }}
 table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; border-bottom:1px solid var(--line); padding:13px 8px; font-size:14px; vertical-align:top; }} th {{ font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:.08em; }}
-.status-dot {{ width:9px; height:9px; border-radius:999px; display:inline-block; background:var(--green); margin-right:7px; }}
 .equity-wrap {{ height:270px; width:100%; }} .equity-svg {{ width:100%; height:100%; }}
 .journal-day {{ display:flex; justify-content:space-between; align-items:center; padding:14px 0; border-bottom:1px solid var(--line); }}
 .journal-day:last-child {{ border-bottom:none; }} .journal-day b {{ display:block; }} .journal-day small {{ color:var(--muted); }}
@@ -896,13 +967,7 @@ GOOGLE_REDIRECT_URI = os.getenv(
 @app.get("/auth/google")
 def auth_google():
     if not GOOGLE_CLIENT_ID:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "error": "GOOGLE_CLIENT_ID not configured in Railway variables."
-            }
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": "GOOGLE_CLIENT_ID not configured in Railway variables."})
 
     google_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -919,15 +984,8 @@ def auth_google():
 
 @app.get("/auth/google/callback")
 def auth_google_callback(code: str = ""):
-
     if not code:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": "Missing Google OAuth code."
-            }
-        )
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Missing Google OAuth code."})
 
     token_response = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -942,57 +1000,32 @@ def auth_google_callback(code: str = ""):
     )
 
     token_data = token_response.json()
-
     access_token = token_data.get("access_token")
 
     if not access_token:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": "Failed to get Google access token.",
-                "details": token_data,
-            }
-        )
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Failed to get Google access token.", "details": token_data})
 
-    user_response = requests.get(
+    google_user = requests.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
-        headers={
-            "Authorization": f"Bearer {access_token}"
-        },
+        headers={"Authorization": f"Bearer {access_token}"},
         timeout=20,
-    )
-
-    google_user = user_response.json()
+    ).json()
 
     email = google_user.get("email")
 
     if not email:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": "Google account email not received."
-            }
-        )
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Google account email not received."})
 
     con = db()
-
-    existing_user = con.execute(
-        "SELECT * FROM users WHERE email=?",
-        (email.lower().strip(),),
-    ).fetchone()
+    existing_user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
 
     if not existing_user:
-
         random_password = secrets.token_hex(24)
-
         cur = con.cursor()
-
         cur.execute(
             """
-            INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at)
-            VALUES(?,?,?,?,?)
+            INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at,allowed_symbols)
+            VALUES(?,?,?,?,?,?)
             """,
             (
                 email.lower().strip(),
@@ -1000,23 +1033,13 @@ def auth_google_callback(code: str = ""):
                 "khoma_live_" + secrets.token_urlsafe(24),
                 secrets.token_hex(20),
                 datetime.now(timezone.utc).isoformat(),
+                "*",
             ),
         )
-
         uid = cur.lastrowid
-
-        cur.execute(
-            "INSERT INTO brokers(user_id) VALUES(?)",
-            (uid,),
-        )
-
+        cur.execute("INSERT INTO brokers(user_id) VALUES(?)", (uid,))
         con.commit()
-
-        user = con.execute(
-            "SELECT * FROM users WHERE id=?",
-            (uid,),
-        ).fetchone()
-
+        user = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     else:
         user = existing_user
 
@@ -1024,16 +1047,8 @@ def auth_google_callback(code: str = ""):
 
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = user["id"]
-
     response = RedirectResponse("/dashboard", status_code=302)
-
-    response.set_cookie(
-        "khoma_session",
-        sid,
-        httponly=True,
-        samesite="lax"
-    )
-
+    response.set_cookie("khoma_session", sid, httponly=True, samesite="lax")
     return response
 
 
@@ -1101,50 +1116,69 @@ def broker_page(request: Request):
     con.close()
 
     content = f'''
-    <div class="header"><div><h2>Broker Connection</h2><p>Connect the Tradovate account that KhomaAPI should route orders into.</p></div></div>
+    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
     <div class="grid">
-      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}</p><a class="btn secondary" href="/broker/test">Test Connection</a></div>
-      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">For now, enter API credentials manually. OAuth Connect Tradovate flow can replace this after vendor approval.</p>
-      <form method="post" action="/broker/save"><div class="formgrid">
+      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
+      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
+      <form method="post" action="/broker/connect"><div class="formgrid">
         <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-        <div><label>Device ID</label><input name="device_id" value="{broker['device_id'] or 'khomaapi-device-001'}"></div>
-        <div><label>Username</label><input name="username" placeholder="Tradovate username"></div>
-        <div><label>Password</label><input name="password" type="password" placeholder="Tradovate password"></div>
-        <div><label>App ID</label><input name="app_id" value="{broker['app_id'] or 'KhomaAPI'}"></div>
-        <div><label>App Version</label><input name="app_version" value="{broker['app_version'] or '1.0'}"></div>
-        <div><label>CID</label><input name="cid" value="{broker['cid'] or ''}"></div>
-        <div><label>SEC</label><input name="sec" type="password" placeholder="SEC"></div>
-        <div><label>Account Spec</label><input name="account_spec" value="{broker['account_spec'] or ''}" placeholder="Example: 1047092"></div>
-        <div><label>Account ID</label><input name="account_id" value="{broker['account_id'] or ''}" placeholder="Example: 203310"></div>
-      </div><button>Save Credentials</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form></div>
+        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
+        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
+      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
+      <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
     </div>
     '''
     return layout(content, user, "broker")
 
 
-@app.post("/broker/save")
-def broker_save(request: Request, env: str = Form(...), username: str = Form(""), password: str = Form(""), app_id: str = Form(""), app_version: str = Form("1.0"), cid: str = Form(""), sec: str = Form(""), account_spec: str = Form(""), account_id: str = Form(""), device_id: str = Form("khomaapi-device-001")):
+@app.post("/broker/connect")
+def broker_connect(request: Request, env: str = Form(...), username: str = Form(...), password: str = Form(...)):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
     con = db()
-    old = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
-    username_enc = enc(username) if username else old["username_enc"]
-    password_enc = enc(password) if password else old["password_enc"]
-    sec_enc = enc(sec) if sec else old["sec_enc"]
+    try:
+        token, cfg = tradovate_login_raw(env, username, password, user["id"])
+        accounts = fetch_tradovate_accounts(env, token)
+        account = accounts[0]
 
-    con.execute(
-        """
-        UPDATE brokers
-        SET env=?, username_enc=?, password_enc=?, app_id=?, app_version=?, cid=?, sec_enc=?,
-            account_spec=?, account_id=?, device_id=?, connected=0, last_error=''
-        WHERE user_id=?
-        """,
-        (env, username_enc, password_enc, app_id, app_version, cid, sec_enc, account_spec, account_id, device_id, user["id"]),
-    )
-    con.commit()
-    con.close()
+        account_id = str(account.get("id"))
+        account_spec = str(account.get("name") or account.get("accountSpec") or account_id)
+
+        con.execute(
+            """
+            UPDATE brokers
+            SET env=?, username_enc=?, password_enc=?, app_id=?, app_version=?, cid=?, sec_enc=?,
+                account_spec=?, account_id=?, device_id=?, access_token_enc=?, connected=1, last_error='', last_test=?
+            WHERE user_id=?
+            """,
+            (
+                env,
+                enc(username),
+                enc(password),
+                cfg["app_id"],
+                cfg["app_version"],
+                cfg["cid"],
+                enc(cfg["sec"]),
+                account_spec,
+                account_id,
+                cfg["device_id"],
+                enc(token),
+                datetime.now(timezone.utc).isoformat(),
+                user["id"],
+            ),
+        )
+        con.commit()
+    except Exception as e:
+        con.execute(
+            "UPDATE brokers SET connected=0,last_error=?,last_test=? WHERE user_id=?",
+            (str(e), datetime.now(timezone.utc).isoformat(), user["id"]),
+        )
+        con.commit()
+    finally:
+        con.close()
+
     return RedirectResponse("/broker", status_code=302)
 
 
@@ -1156,10 +1190,16 @@ def broker_test(request: Request):
 
     con = db()
     try:
-        tradovate_login(user["id"])
-        con.execute("UPDATE brokers SET connected=1,last_error='',last_test=? WHERE user_id=?", (datetime.now(timezone.utc).isoformat(), user["id"]))
+        token, broker = tradovate_login(user["id"])
+        con.execute(
+            "UPDATE brokers SET connected=1,last_error='',last_test=?,access_token_enc=? WHERE user_id=?",
+            (datetime.now(timezone.utc).isoformat(), enc(token), user["id"]),
+        )
     except Exception as e:
-        con.execute("UPDATE brokers SET connected=0,last_error=?,last_test=? WHERE user_id=?", (str(e), datetime.now(timezone.utc).isoformat(), user["id"]))
+        con.execute(
+            "UPDATE brokers SET connected=0,last_error=?,last_test=? WHERE user_id=?",
+            (str(e), datetime.now(timezone.utc).isoformat(), user["id"]),
+        )
     con.commit()
     con.close()
     return RedirectResponse("/broker")
@@ -1176,18 +1216,19 @@ def webhooks_page(request: Request):
     example = json.dumps({
         "client_id": user["email"],
         "auth": user["webhook_secret"],
-        "symbol": "MNQM6",
-        "side": "buy",
-        "qty": 1,
+        "symbol": "{{ticker}}",
+        "side": "{{strategy.order.action}}",
+        "qty": "{{strategy.order.contracts}}",
         "request_id": "{{strategy.order.id}}"
     }, indent=2)
 
     content = f'''
-    <div class="header"><div><h2>TradingView Webhooks</h2><p>Copy this URL and JSON into your TradingView alert.</p></div></div>
+    <div class="header"><div><h2>TradingView Webhooks</h2><p>Copy this URL and dynamic JSON into your TradingView alert.</p></div></div>
     <div class="grid">
       <div class="card span12"><h3>Webhook URL</h3><div class="keybox"><span id="webhook-url">{webhook_url}</span><button onclick="copyText('webhook-url')">Copy</button></div></div>
-      <div class="card span7"><h3>TradingView JSON</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button></div>
-      <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste the webhook URL.<br>4. Paste the JSON message.<br>5. Start automation in KhomaAPI.</p><div class="copy-note">Each client uses the same endpoint, but a unique client_id + secret. Accounts do not intersect.</div></div>
+      <div class="card span7"><h3>Dynamic TradingView JSON</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button></div>
+      <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste webhook URL.<br>4. Paste dynamic JSON.<br>5. Your strategy controls buy/sell/qty/symbol automatically.</p><div class="copy-note">Each client uses the same endpoint, but unique client_id + secret. Accounts do not intersect.</div></div>
+      <div class="card span12"><h3>Manual Alert Format</h3><p class="muted">For manual alerts, set side to buy, sell, or flatten. Symbol can be any exact Tradovate contract symbol like MNQM6, MESM6, MYMM6, etc.</p></div>
     </div>
     '''
     return layout(content, user, "webhooks")
@@ -1203,7 +1244,7 @@ def risk_page(request: Request):
     <div class="header"><div><h2>Risk Engine</h2><p>Control max size, allowed symbols, daily order limits, duplicate locks, and execution mode.</p></div></div>
     <div class="card"><form method="post" action="/risk/save"><div class="formgrid">
       <div><label>Webhook Secret</label><input name="webhook_secret" value="{user['webhook_secret']}"></div>
-      <div><label>Allowed Symbols</label><input name="allowed_symbols" value="{user['allowed_symbols']}"></div>
+      <div><label>Allowed Symbols</label><input name="allowed_symbols" value="{user['allowed_symbols']}"><p class="muted">Use * to allow any TradingView symbol.</p></div>
       <div><label>Max Contracts Per Order</label><input name="max_contracts" value="{user['max_contracts']}"></div>
       <div><label>Max Orders Per Day</label><input name="max_orders" value="{user['max_orders']}"></div>
       <div><label>Duplicate Lock Seconds</label><input name="duplicate_seconds" value="{user['duplicate_seconds']}"></div>
@@ -1283,7 +1324,7 @@ def settings_page(request: Request):
     <div class="header"><div><h2>Settings</h2><p>Profile, authentication, and account security.</p></div></div>
     <div class="grid">
       <div class="card span6"><h3>Profile</h3><p class="muted">Email: <b>{user['email']}</b></p><p class="muted">Account created: {user['created_at']}</p></div>
-      <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login button is shown on login/signup, but OAuth credentials are not configured yet. Next step: create Google OAuth app and add callback.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
+      <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login is active through Google OAuth variables in Railway.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
     </div>
     '''
     return layout(content, user, "settings")
@@ -1380,8 +1421,8 @@ class WebhookTrade(BaseModel):
     client_id: str
     auth: str
     symbol: str
-    side: Literal["buy", "sell"]
-    qty: int = 1
+    side: str
+    qty: Optional[Any] = 1
     request_id: Optional[str] = None
 
 
@@ -1405,36 +1446,47 @@ def webhook_trade(payload: WebhookTrade):
         return JSONResponse(status_code=200, content={"ok": False, "error": "Client not found."})
 
     try:
-        symbol = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, request_id)
+        symbol, side, qty = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, request_id)
 
         if user["live_mode"] == "live":
             broker_connection_check(user["id"])
-            response, action = handle_trade_logic(user["id"], symbol, payload.side, payload.qty)
+            response, action = handle_trade_logic(user["id"], symbol, side, qty)
             mode = "live"
-            status = "EXECUTED" if action != "SKIPPED_SAME_DIRECTION" else "SKIPPED"
+            if action == "SKIPPED_SAME_DIRECTION":
+                status = "SKIPPED"
+            elif action == "FLATTENED":
+                status = "FLATTEN_SENT"
+            else:
+                status = "EXECUTED"
             message = action
         else:
-            response = {"simulated": True}
+            response = {"simulated": True, "symbol": symbol, "side": side, "qty": qty}
             action = "SIMULATED"
             mode = "simulation"
             status = "SIMULATED"
             message = "Simulation accepted. No real broker order sent."
 
         latency = round((time.perf_counter() - start_time) * 1000, 3)
-        log_trade(user["id"], request_id, symbol, payload.side, payload.qty, mode, status, latency, message, response)
+        log_trade(user["id"], request_id, symbol, side, qty, mode, status, latency, message, response)
 
         return {
             "ok": True,
             "action": action,
             "status": status,
             "mode": mode,
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
             "latency_ms": latency,
             "response": response,
         }
 
     except Exception as e:
         latency = round((time.perf_counter() - start_time) * 1000, 3)
-        log_trade(user["id"], request_id, payload.symbol.upper(), payload.side, payload.qty, "rejected", "REJECTED", latency, str(e), {})
+        safe_symbol = str(payload.symbol or "").upper()
+        safe_side = str(payload.side or "")
+        safe_qty = clean_qty(payload.qty)
+        log_trade(user["id"], request_id, safe_symbol, safe_side, safe_qty, "rejected", "REJECTED", latency, str(e), {})
         return {
             "ok": False,
             "error": str(e),
@@ -1474,7 +1526,7 @@ def webhook_flatten(payload: WebhookFlatten):
 def health():
     return {
         "ok": True,
-        "app": "KhomaAPI v4 Dashboard MVP",
+        "app": "KhomaAPI v5 Full SaaS Dashboard",
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1486,90 +1538,3 @@ def api_trades(request: Request):
         return {"ok": False, "error": "not authenticated"}
     rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
-# ============================================================
-# WEBHOOK API
-# ============================================================
-# ============================================================
-# GOOGLE OAUTH LOGIN
-# ============================================================
-
-@app.get("/auth/google")
-async def auth_google(request: Request):
-
-    redirect_uri = os.getenv("https://web-production-6ad48.up.railway.app/auth/google/callback")
-
-    return await oauth.google.authorize_redirect(
-        request,
-        redirect_uri
-    )
-
-@app.get("/auth/google/callback")
-async def auth_google_callback(request: Request):
-
-    token = await oauth.google.authorize_access_token(request)
-
-    user_info = token.get("userinfo")
-
-    email = user_info["email"]
-
-    con = db()
-
-    existing = con.execute(
-        "SELECT * FROM users WHERE email=?",
-        (email,)
-    ).fetchone()
-
-    if not existing:
-
-        cur = con.cursor()
-
-        cur.execute(
-            """
-            INSERT INTO users(
-                email,
-                password_hash,
-                api_key,
-                webhook_secret,
-                created_at
-            )
-            VALUES(?,?,?,?,?)
-            """,
-            (
-                email,
-                "google_oauth",
-                "khoma_live_" + secrets.token_urlsafe(24),
-                secrets.token_hex(20),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-
-        uid = cur.lastrowid
-
-        cur.execute(
-            "INSERT INTO brokers(user_id) VALUES(?)",
-            (uid,)
-        )
-
-        con.commit()
-
-        existing = con.execute(
-            "SELECT * FROM users WHERE id=?",
-            (uid,)
-        ).fetchone()
-
-    con.close()
-
-    sid = secrets.token_urlsafe(32)
-
-    SESSIONS[sid] = existing["id"]
-
-    response = RedirectResponse("/dashboard")
-
-    response.set_cookie(
-        "khoma_session",
-        sid,
-        httponly=True,
-        samesite="lax"
-    )
-
-    return response
