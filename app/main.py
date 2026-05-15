@@ -187,7 +187,7 @@ def mask_value(value: str, visible: int = 5) -> str:
 # ============================================================
 
 def tradovate_base(env: str) -> str:
-    return "https://live.tradovateapi.com/v1" if env == "live" else "https://demo.tradovateapi.com/v1"
+    return "https://live.tradovateapi.com" if env == "live" else "https://demo.tradovateapi.com"
 
 
 def tv_headers(token: str) -> Dict[str, str]:
