@@ -5,6 +5,8 @@ from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
+
+from fastapi.staticfiles import StaticFiles
 import sqlite3
 import hashlib
 import os
@@ -22,6 +24,7 @@ import requests
 # ============================================================
 
 app = FastAPI(title="KhomaAPI v5")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
@@ -818,7 +821,9 @@ function copyText(id) {{
 <body>
 <div class="shell">
 <aside class="sidebar">
-  <div class="brand"><div class="logo">K</div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
+  <div class="brand"><div class="logo">
+  <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:14px;">
+</div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
   <div class="nav">
     {nav_item(active,'dashboard','/dashboard','⌁','Dashboard')}
     {nav_item(active,'broker','/broker','◇','Broker Connect')}
