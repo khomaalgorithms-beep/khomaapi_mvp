@@ -1496,7 +1496,7 @@ def api_trades(request: Request):
 @app.get("/auth/google")
 async def auth_google(request: Request):
 
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    redirect_uri = os.getenv("https://web-production-6ad48.up.railway.app/auth/google/callback")
 
     return await oauth.google.authorize_redirect(
         request,
