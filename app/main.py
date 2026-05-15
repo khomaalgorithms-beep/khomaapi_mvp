@@ -24,6 +24,8 @@ import requests
 # ============================================================
 
 app = FastAPI(title="KhomaAPI v5")
+from fastapi.staticfiles import StaticFiles
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
