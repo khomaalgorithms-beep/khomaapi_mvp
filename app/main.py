@@ -834,17 +834,18 @@ function copyText(id) {{
   alert('Copied');
 }}
 
-function toggleProfileMenu() {
+<script>
+function toggleProfileMenu() {{
     const menu = document.getElementById("profileMenu");
     menu.style.display = menu.style.display === "block" ? "none" : "block";
-}
+}}
 
-document.addEventListener("click", function(event) {
+document.addEventListener("click", function(event) {{
     const menu = document.getElementById("profileMenu");
-    if (!event.target.closest(".avatar")) {
-        if(menu){ menu.style.display = "none"; }
-    }
-});
+    if (!event.target.closest(".avatar")) {{
+        if(menu){{ menu.style.display = "none"; }}
+    }}
+}});
 </script>
 
 </head>
