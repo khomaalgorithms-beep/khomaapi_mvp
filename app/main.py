@@ -833,7 +833,20 @@ function copyText(id) {{
   navigator.clipboard.writeText(text);
   alert('Copied');
 }}
+
+function toggleProfileMenu() {
+    const menu = document.getElementById("profileMenu");
+    menu.style.display = menu.style.display === "block" ? "none" : "block";
+}
+
+document.addEventListener("click", function(event) {
+    const menu = document.getElementById("profileMenu");
+    if (!event.target.closest(".avatar")) {
+        if(menu){ menu.style.display = "none"; }
+    }
+});
 </script>
+
 </head>
 <body>
 <div class="shell">
@@ -855,7 +868,28 @@ function copyText(id) {{
 <main class="main">
   <div class="topbar">
     <div class="top-left"><b>{email}</b><span>KhomaAlgorithms client workspace</span></div>
-    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span><div class="avatar">{initials}</div></div>
+    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span>
+<div style="position:relative;">
+  <div class="avatar" onclick="toggleProfileMenu()" style="cursor:pointer;">{initials}</div>
+
+  <div id="profileMenu" style="
+      display:none;
+      position:absolute;
+      right:0;
+      top:55px;
+      background:white;
+      border:1px solid #e5e7eb;
+      border-radius:14px;
+      width:220px;
+      box-shadow:0 20px 60px rgba(0,0,0,.08);
+      overflow:hidden;
+      z-index:9999;
+  ">
+      <a href="/settings" style="display:block;padding:14px 16px;text-decoration:none;color:#111827;font-weight:700;">Settings</a>
+      <a href="/logout" style="display:block;padding:14px 16px;text-decoration:none;color:#dc2626;font-weight:700;border-top:1px solid #e5e7eb;">Logout</a>
+  </div>
+</div>
+</div>
   </div>
   <div class="content">{content}</div>
 </main>
@@ -1348,7 +1382,35 @@ def settings_page(request: Request):
     content = f'''
     <div class="header"><div><h2>Settings</h2><p>Profile, authentication, and account security.</p></div></div>
     <div class="grid">
-      <div class="card span6"><h3>Profile</h3><p class="muted">Email: <b>{user['email']}</b></p><p class="muted">Account created: {user['created_at']}</p></div>
+      
+<div class="card span6">
+<h3>Profile</h3>
+
+<p class="muted">Current Email: <b>{user['email']}</b></p>
+<p class="muted">Account created: {user['created_at']}</p>
+
+<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
+
+<form method="post" action="/settings/change-email">
+<label>New Email</label>
+<input name="new_email" type="email" required>
+<button>Change Email</button>
+</form>
+
+<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
+
+<form method="post" action="/settings/change-password">
+<label>Current Password</label>
+<input name="current_password" type="password" required>
+
+<label>New Password</label>
+<input name="new_password" type="password" required>
+
+<button>Change Password</button>
+</form>
+
+</div>
+
       <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login is active through Google OAuth variables in Railway.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
     </div>
     '''
