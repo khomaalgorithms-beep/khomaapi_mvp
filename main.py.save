@@ -1,0 +1,8 @@
+app = FastAPI(title="KhomaAPI v5")
+
+BASE_DIR = Path(__file__).resolve().parent
+
+print("STATIC PATH:", BASE_DIR / "static")
+
+app.mount(KEY_PATH = BASE_DIR / ".khoma_secret_v31"
+

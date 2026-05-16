@@ -8,8 +8,7 @@ from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
 
-
-app = FastAPI(title="KhomaAPI v5")
+app = FastAPI(title="KhomaAPI")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -20,7 +19,38 @@ app.mount(
     StaticFiles(directory=BASE_DIR / "static"),
     name="static"
 )
+print("STATIC PATH:", BASE_DIR / "static")
 
+app.mount(
+    "/static",
+    StaticFiles(directory=str(BASE_DIR / "static")),
+    name="static"
+)
+import sqlite3
+import hashlib
+import os
+import secrets
+import json
+import time
+import requests
+
+# ============================================================
+# KHOMAAPI v5
+# Full SaaS dashboard + Google login + simplified broker connect
+# Client only enters Tradovate username/password.
+# Backend auto-handles CID, SEC, appId, deviceId, account ID, account spec.
+# TradingView controls side, qty, symbol dynamically.
+# ============================================================
+
+app = FastAPI(title="KhomaAPI v5")
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE_DIR / "static"),
+    name="static"
+)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
 
