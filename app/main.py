@@ -1,20 +1,24 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from typing import Optional, Dict, Any, Tuple
-
-
 from pathlib import Path
-
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
 
-from pathlib import Path
-from fastapi.staticfiles import StaticFiles
 app = FastAPI(title="KhomaAPI")
-BASE_DIR = Path(__file__).resolve().parent.parent
 
+BASE_DIR = Path(__file__).resolve().parent
+
+print("STATIC PATH:", BASE_DIR / "static")
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE_DIR / "static"),
+    name="static"
+)
 print("STATIC PATH:", BASE_DIR / "static")
 
 app.mount(
@@ -39,10 +43,6 @@ import requests
 # ============================================================
 
 app = FastAPI(title="KhomaAPI v5")
-from pathlib import Path
-from fastapi.staticfiles import StaticFiles
-
-BASE_DIR = Path(__file__).resolve().parent.parent
 
 app.mount(
     "/static",
