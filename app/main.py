@@ -18,7 +18,6 @@ import requests
 
 
 app = FastAPI(title="KhomaAPI v5")
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 print("STATIC PATH:", BASE_DIR / "static")
@@ -75,10 +74,6 @@ def verify_password(password: str, stored: str) -> bool:
 def init_db():
     con = db()
     cur = con.cursor()
-
-    @app.get("/test")
-    def test():
-        return {"working": True}
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +155,11 @@ def init_db():
 
 
 init_db()
+
+
+@app.get("/test")
+def test():
+    return {"working": True}
 
 
 # ============================================================
