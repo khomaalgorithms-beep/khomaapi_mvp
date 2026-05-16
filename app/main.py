@@ -8,6 +8,14 @@ from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
 
+import sqlite3
+import hashlib
+import os
+import secrets
+import json
+import time
+import requests
+
 
 app = FastAPI(title="KhomaAPI v5")
 
