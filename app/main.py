@@ -98,6 +98,9 @@ def init_db():
     con = db()
     cur = con.cursor()
 
+    @app.get("/test")
+    def test():
+        return {"working": True}
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
