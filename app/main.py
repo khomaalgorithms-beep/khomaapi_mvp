@@ -19,7 +19,7 @@ import requests
 
 app = FastAPI(title="KhomaAPI v5")
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 print("STATIC PATH:", BASE_DIR / "static")
 
