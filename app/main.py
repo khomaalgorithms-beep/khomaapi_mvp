@@ -18,15 +18,27 @@ import requests
 
 
 app = FastAPI(title="KhomaAPI v5")
-BASE_DIR = Path(__file__).resolve().parent.parent
 
-print("STATIC PATH:", BASE_DIR / "static")
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+print("STATIC DIR:", STATIC_DIR)
+print("STATIC EXISTS:", os.path.exists(STATIC_DIR))
 
 app.mount(
     "/static",
-    StaticFiles(directory=BASE_DIR / "static"),
+    StaticFiles(directory=STATIC_DIR),
     name="static"
 )
+
+@app.get("/debug-static")
+def debug_static():
+    return {
+        "base_dir": str(BASE_DIR),
+        "static_dir": STATIC_DIR,
+        "exists": os.path.exists(STATIC_DIR),
+        "files": os.listdir(STATIC_DIR) if os.path.exists(STATIC_DIR) else []
+    }
 
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
