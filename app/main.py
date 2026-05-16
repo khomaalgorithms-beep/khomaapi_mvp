@@ -891,7 +891,9 @@ def root(request: Request):
 @app.get("/signup", response_class=HTMLResponse)
 def signup_page():
     return login_layout('''
-    <div class="logo">K</div>
+    <div class="logo">
+<img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+</div>
     <h1>Create your KhomaAPI account</h1>
     <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
     <a class="btn google" href="/auth/google">Continue with Google</a>
@@ -935,7 +937,9 @@ def signup(email: str = Form(...), password: str = Form(...)):
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
     return login_layout('''
-    <div class="logo">K</div>
+    <div class="logo">
+<img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+</div>
     <h1>Welcome back</h1>
     <p>Login to your KhomaAPI execution workspace.</p>
     <a class="btn google" href="/auth/google">Continue with Google</a>
