@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -59,6 +59,37 @@ FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 SESSIONS: Dict[str, int] = {}
 
 APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
+
+
+# ============================================================
+# WEBSOCKET LIVE CONNECTIONS
+# ============================================================
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        disconnected = []
+
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except:
+                disconnected.append(connection)
+
+        for dead in disconnected:
+            self.disconnect(dead)
+
+manager = ConnectionManager()
 
 
 
@@ -242,6 +273,24 @@ def init_db():
 
     con.commit()
     con.close()
+
+    try:
+        import asyncio
+
+        asyncio.create_task(
+            manager.broadcast({
+                "event": "trade",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "status": status,
+                "latency_ms": latency_ms,
+                "message": message,
+                "time": datetime.now(timezone.utc).isoformat()
+            })
+        )
+    except Exception:
+        pass
 
 
 init_db()
@@ -971,7 +1020,44 @@ document.addEventListener("click", function(event) {{
   <div class="content">{content}</div>
 </main>
 </div>
+
+<script>
+
+const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+const socket = new WebSocket(
+    protocol + "://" + window.location.host + "/ws"
+);
+
+socket.onopen = () => {{
+    console.log("Live WebSocket connected");
+}};
+
+socket.onmessage = (event) => {{
+
+    const data = JSON.parse(event.data);
+
+    console.log("LIVE EVENT:", data);
+
+    if(data.event === "trade") {{
+
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/logs" ||
+           window.location.pathname === "/journal") {{
+
+            location.reload();
+        }}
+    }}
+}};
+
+socket.onclose = () => {{
+    console.log("WebSocket disconnected");
+}};
+
+</script>
+
 </body>
+
 </html>
 """
 
@@ -986,7 +1072,44 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial
 h1{{letter-spacing:-1px;margin:0 0 8px;}} p{{color:#6b7280;line-height:1.55;}} input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:13px;margin:8px 0 14px;box-sizing:border-box;}}
 button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;}} a{{color:#0f8f45;font-weight:850;}}
 .google{{background:white;color:#111827;border:1px solid #e5e7eb;width:100%;margin-bottom:12px;}}
-</style></head><body><div class="wrap"><div class="card">{content}</div></div></body></html>
+</style></head><body><div class="wrap"><div class="card">{content}</div></div>
+<script>
+
+const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+const socket = new WebSocket(
+    protocol + "://" + window.location.host + "/ws"
+);
+
+socket.onopen = () => {{
+    console.log("Live WebSocket connected");
+}};
+
+socket.onmessage = (event) => {{
+
+    const data = JSON.parse(event.data);
+
+    console.log("LIVE EVENT:", data);
+
+    if(data.event === "trade") {{
+
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/logs" ||
+           window.location.pathname === "/journal") {{
+
+            location.reload();
+        }}
+    }}
+}};
+
+socket.onclose = () => {{
+    console.log("WebSocket disconnected");
+}};
+
+</script>
+
+</body>
+</html>
 """
 
 
@@ -2034,3 +2157,16 @@ def verify_email_change(token: str):
     <p>Your new email is now active.</p>
     <a href='/settings'>Return to Settings</a>
     """)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
