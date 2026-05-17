@@ -833,8 +833,6 @@ function copyText(id) {{
   navigator.clipboard.writeText(text);
   alert('Copied');
 }}
-
-<script>
 function toggleProfileMenu() {{
     const menu = document.getElementById("profileMenu");
     menu.style.display = menu.style.display === "block" ? "none" : "block";
@@ -1392,7 +1390,7 @@ def settings_page(request: Request):
 
 <hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
 
-<form method="post" action="/settings/change-email">
+<form method="post" action="/change-email">
 <label>New Email</label>
 <input name="new_email" type="email" required>
 <button>Change Email</button>
@@ -1400,7 +1398,7 @@ def settings_page(request: Request):
 
 <hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
 
-<form method="post" action="/settings/change-password">
+<form method="post" action="/change-password">
 <label>Current Password</label>
 <input name="current_password" type="password" required>
 
