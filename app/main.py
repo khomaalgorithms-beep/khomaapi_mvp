@@ -1665,3 +1665,56 @@ def api_trades(request: Request):
         return {"ok": False, "error": "not authenticated"}
     rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
+
+@app.post("/change-email")
+def change_email(
+    request: Request,
+    new_email: str = Form(...)
+):
+    user = require_user(request)
+
+    if not user:
+        return RedirectResponse("/login")
+
+    con = db()
+
+    con.execute(
+        "UPDATE users SET email=? WHERE id=?",
+        (new_email.lower().strip(), user["id"])
+    )
+
+    con.commit()
+    con.close()
+
+    return RedirectResponse("/settings", status_code=302)
+
+
+@app.post("/change-password")
+def change_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...)
+):
+    user = require_user(request)
+
+    if not user:
+        return RedirectResponse("/login")
+
+    if not verify_password(current_password, user["password_hash"]):
+        return HTMLResponse(
+            "<h1>Wrong current password</h1>",
+            status_code=400
+        )
+
+    con = db()
+
+    con.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (hash_password(new_password), user["id"])
+    )
+
+    con.commit()
+    con.close()
+
+    return RedirectResponse("/settings", status_code=302)
+
