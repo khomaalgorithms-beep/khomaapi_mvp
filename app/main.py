@@ -1412,7 +1412,46 @@ def settings_page(request: Request):
 
 </div>
 
-      <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login is active through Google OAuth variables in Railway.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
+      
+<div class="card span6">
+  <h3>Account Management</h3>
+
+  <div class="google-box">
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Current Plan</b></p>
+      <div class="pill">KhomaAPI Professional</div>
+    </div>
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Subscription Status</b></p>
+      <div class="pill good">Active</div>
+    </div>
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Automation Status</b></p>
+      <div class="pill">{user['automation_status']}</div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:10px;">
+
+      <a class="btn secondary" href="/billing">
+        Change Payment Method
+      </a>
+
+      <a class="btn secondary" href="/subscription/cancel">
+        Cancel Subscription
+      </a>
+
+      <a class="btn secondary" href="/logout">
+        Logout From Account
+      </a>
+
+    </div>
+
+  </div>
+</div>
+
     </div>
     '''
     return layout(content, user, "settings")
