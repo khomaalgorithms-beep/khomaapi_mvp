@@ -15,6 +15,15 @@ import secrets
 import json
 import time
 import requests
+import requests
+
+import re
+import smtplib
+
+from email.mime.text import MIMEText
+from email_validator import validate_email, EmailNotValidError
+
+
 
 
 app = FastAPI(title="KhomaAPI v5")
@@ -81,6 +90,49 @@ def verify_password(password: str, stored: str) -> bool:
         return secrets.compare_digest(new_hash, old_hash)
     except Exception:
         return False
+
+
+def strong_password(password: str):
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters."
+
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain uppercase letter."
+
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain lowercase letter."
+
+    if not re.search(r"\d", password):
+        return False, "Password must contain number."
+
+    return True, "Strong password"
+
+
+def valid_email(email: str):
+    try:
+        validate_email(email)
+        return True
+    except EmailNotValidError:
+        return False
+
+
+def send_email(to_email, subject, body):
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASS")
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = to_email
+
+    server = smtplib.SMTP(host, port)
+    server.starttls()
+    server.login(user, password)
+    server.sendmail(user, [to_email], msg.as_string())
+    server.quit()
+
 
 
 def init_db():
@@ -940,6 +992,14 @@ def signup_page():
 
 @app.post("/signup", response_class=HTMLResponse)
 def signup(email: str = Form(...), password: str = Form(...)):
+
+    if not valid_email(email):
+        return login_layout("<h1>Invalid Email</h1><p>Please enter valid email.</p>")
+
+    ok, message = strong_password(password)
+
+    if not ok:
+        return login_layout(f"<h1>Weak Password</h1><p>{message}</p>")
     con = db()
     try:
         cur = con.cursor()
@@ -1664,6 +1724,7 @@ def api_trades(request: Request):
     rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
 
+
 @app.post("/change-email")
 def change_email(
     request: Request,
@@ -1673,6 +1734,18 @@ def change_email(
 
     if not user:
         return RedirectResponse("/login")
+
+    if not valid_email(new_email):
+        return HTMLResponse("""
+        <h1>Invalid Email</h1>
+        <p>Please enter valid email.</p>
+        """, status_code=400)
+
+    send_email(
+        new_email,
+        "KhomaAPI Email Changed",
+        "Your email was changed successfully."
+    )
 
     con = db()
 
@@ -1684,7 +1757,12 @@ def change_email(
     con.commit()
     con.close()
 
-    return RedirectResponse("/settings", status_code=302)
+    return HTMLResponse("""
+    <h1>Email Successfully Changed</h1>
+    <p>Your account email was updated successfully.</p>
+    <a href='/settings'>Return to Settings</a>
+    """)
+
 
 
 @app.post("/change-password")
@@ -1699,10 +1777,18 @@ def change_password(
         return RedirectResponse("/login")
 
     if not verify_password(current_password, user["password_hash"]):
-        return HTMLResponse(
-            "<h1>Wrong current password</h1>",
-            status_code=400
-        )
+        return HTMLResponse("""
+        <h1>Wrong Password</h1>
+        <p>Current password incorrect.</p>
+        """, status_code=400)
+
+    ok, message = strong_password(new_password)
+
+    if not ok:
+        return HTMLResponse(f"""
+        <h1>Weak Password</h1>
+        <p>{message}</p>
+        """, status_code=400)
 
     con = db()
 
@@ -1714,5 +1800,17 @@ def change_password(
     con.commit()
     con.close()
 
-    return RedirectResponse("/settings", status_code=302)
+    send_email(
+        user["email"],
+        "KhomaAPI Password Changed",
+        "Your password was successfully changed."
+    )
+
+    return HTMLResponse("""
+    <h1>Password Successfully Changed</h1>
+    <p>Your password has been updated successfully.</p>
+    <a href='/settings'>Return to Settings</a>
+    """)
+
+
 
