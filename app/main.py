@@ -182,7 +182,9 @@ def send_email(to_email, subject, body):
 
         server.quit()
 
-        print("EMAIL SENT")
+        
+        print("EMAIL SENT TO:", to_email)
+
 
         return True
 
@@ -1938,10 +1940,16 @@ def change_email(
     con.commit()
     con.close()
 
-    return HTMLResponse("""
-    <h1>Email Successfully Changed</h1>
-    <p>Your account email was updated successfully.</p>
-    <a href='/settings'>Return to Settings</a>
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
+    <h1>Email Updated</h1>
+
+    <p>Your email was changed successfully.</p>
+
+    <a class="btn" href="/settings">Return To Settings</a>
     """)
 
 
@@ -2051,9 +2059,20 @@ def forgot_password(email: str = Form(...)):
         f"Click here to reset password:\n\n{reset_link}"
     )
 
-    return HTMLResponse("""
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
     <h1>Reset Link Sent</h1>
-    <p>Check your email.</p>
+
+    <p>We sent a secure password reset link to your email.</p>
+
+    <p style="color:#6b7280;">
+    Check spam/promotions folder if you don't see it.
+    </p>
+
+    <a class="btn" href="/login">Return To Login</a>
     """)
 
 
@@ -2122,9 +2141,16 @@ def reset_password(token: str, password: str = Form(...)):
     con.commit()
     con.close()
 
-    return HTMLResponse("""
-    <h1>Password Reset Successful</h1>
-    <a href='/login'>Login</a>
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
+    <h1>Password Updated</h1>
+
+    <p>Your password was successfully reset.</p>
+
+    <a class="btn" href="/login">Login</a>
     """)
 
 
