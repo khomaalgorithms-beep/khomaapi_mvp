@@ -154,22 +154,41 @@ def valid_email(email: str):
         return False
 
 
+
 def send_email(to_email, subject, body):
-    host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASS")
 
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = to_email
+    try:
+        host = os.getenv("SMTP_HOST")
+        port = int(os.getenv("SMTP_PORT", "587"))
+        user = os.getenv("SMTP_USER")
+        password = os.getenv("SMTP_PASS")
 
-    server = smtplib.SMTP(host, port)
-    server.starttls()
-    server.login(user, password)
-    server.sendmail(user, [to_email], msg.as_string())
-    server.quit()
+        if not host or not user or not password:
+            print("SMTP VARIABLES MISSING")
+            return False
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = to_email
+
+        server = smtplib.SMTP(host, port, timeout=10)
+
+        server.starttls()
+
+        server.login(user, password)
+
+        server.sendmail(user, [to_email], msg.as_string())
+
+        server.quit()
+
+        print("EMAIL SENT")
+
+        return True
+
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))
+        return False
 
 
 
