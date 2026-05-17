@@ -14,7 +14,7 @@ import os
 import secrets
 import json
 import time
-import requests
+
 import requests
 
 import re
@@ -58,6 +58,9 @@ FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 
 SESSIONS: Dict[str, int] = {}
 
+APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
+
+
 
 # ============================================================
 # DATABASE + SECURITY
@@ -93,6 +96,7 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def strong_password(password: str):
+
     if len(password) < 8:
         return False, "Password must be at least 8 characters."
 
@@ -104,6 +108,9 @@ def strong_password(password: str):
 
     if not re.search(r"\d", password):
         return False, "Password must contain number."
+
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]", password):
+        return False, "Password must contain special character."
 
     return True, "Strong password"
 
@@ -213,6 +220,25 @@ def init_db():
     # Upgrade existing users to allow all symbols by default if they still have restricted list.
     # You can still restrict this later from Risk Engine.
     cur.execute("UPDATE users SET allowed_symbols='*' WHERE allowed_symbols IS NULL OR allowed_symbols='' OR allowed_symbols='MNQ,NQ,MES,ES,MYM,YM' OR allowed_symbols='MNQ,MNQM6,NQ,MES,ES,MYM,YM'")
+
+    
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_verifications(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER,
+        new_email TEXT,
+        created_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS password_resets(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER,
+        created_at TEXT
+    )
+    """)
+
 
     con.commit()
     con.close()
@@ -1041,6 +1067,7 @@ def login_page():
       <input name="password" type="password" placeholder="Password" required>
       <button>Login</button>
     </form>
+    <p><a href="/forgot-password">Forgot Password?</a></p>
     <p>New client? <a href="/signup">Create account</a></p>
     ''')
 
@@ -1057,7 +1084,13 @@ def login(email: str = Form(...), password: str = Form(...)):
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = user["id"]
     response = RedirectResponse("/dashboard", status_code=302)
-    response.set_cookie("khoma_session", sid, httponly=True, samesite="lax")
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
     return response
 
 
@@ -1166,7 +1199,13 @@ def auth_google_callback(code: str = ""):
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = user["id"]
     response = RedirectResponse("/dashboard", status_code=302)
-    response.set_cookie("khoma_session", sid, httponly=True, samesite="lax")
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
     return response
 
 
@@ -1814,3 +1853,184 @@ def change_password(
 
 
 
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page():
+    return login_layout("""
+    <h1>Forgot Password</h1>
+
+    <form method="post" action="/forgot-password">
+        <input name="email" type="email" placeholder="Your Email" required>
+        <button>Send Reset Link</button>
+    </form>
+    """)
+
+
+@app.post("/forgot-password")
+def forgot_password(email: str = Form(...)):
+
+    con = db()
+
+    user = con.execute(
+        "SELECT * FROM users WHERE email=?",
+        (email.lower().strip(),)
+    ).fetchone()
+
+    if not user:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Email Not Found</h1>
+        """)
+
+    token = secrets.token_urlsafe(48)
+
+    con.execute(
+        """
+        INSERT INTO password_resets(token,user_id,created_at)
+        VALUES(?,?,?)
+        """,
+        (
+            token,
+            user["id"],
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+
+    con.commit()
+    con.close()
+
+    reset_link = f"{APP_URL}/reset-password/{token}"
+
+    send_email(
+        email,
+        "Reset Your KhomaAPI Password",
+        f"Click here to reset password:\n\n{reset_link}"
+    )
+
+    return HTMLResponse("""
+    <h1>Reset Link Sent</h1>
+    <p>Check your email.</p>
+    """)
+
+
+@app.get("/reset-password/{token}", response_class=HTMLResponse)
+def reset_password_page(token: str):
+
+    return login_layout(f"""
+    <h1>Create New Password</h1>
+
+    <form method="post" action="/reset-password/{token}">
+        <input name="password" type="password" placeholder="New Password" required>
+        <button>Reset Password</button>
+    </form>
+    """)
+
+
+@app.post("/reset-password/{token}")
+def reset_password(token: str, password: str = Form(...)):
+
+    ok, message = strong_password(password)
+
+    if not ok:
+        return HTMLResponse(f"""
+        <h1>Weak Password</h1>
+        <p>{message}</p>
+        """)
+
+    con = db()
+
+    row = con.execute(
+        "SELECT * FROM password_resets WHERE token=?",
+        (token,)
+    ).fetchone()
+
+    if not row:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Invalid Token</h1>
+        """)
+
+    created = datetime.fromisoformat(row["created_at"])
+    now = datetime.now(timezone.utc)
+
+    if (now - created).total_seconds() > 3600:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Reset Link Expired</h1>
+        <p>Your reset link expired. Please request another one.</p>
+        """)
+
+    con.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (
+            hash_password(password),
+            row["user_id"]
+        )
+    )
+
+    con.execute(
+        "DELETE FROM password_resets WHERE token=?",
+        (token,)
+    )
+
+    con.commit()
+    con.close()
+
+    return HTMLResponse("""
+    <h1>Password Reset Successful</h1>
+    <a href='/login'>Login</a>
+    """)
+
+
+@app.get("/verify-email-change/{token}")
+def verify_email_change(token: str):
+
+    con = db()
+
+    row = con.execute(
+        "SELECT * FROM email_verifications WHERE token=?",
+        (token,)
+    ).fetchone()
+
+    if not row:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Invalid Verification Link</h1>
+        """)
+
+    created = datetime.fromisoformat(row["created_at"])
+    now = datetime.now(timezone.utc)
+
+    if (now - created).total_seconds() > 3600:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Verification Link Expired</h1>
+        """)
+
+    con.execute(
+        "UPDATE users SET email=? WHERE id=?",
+        (
+            row["new_email"],
+            row["user_id"]
+        )
+    )
+
+    con.execute(
+        "DELETE FROM email_verifications WHERE token=?",
+        (token,)
+    )
+
+    con.commit()
+    con.close()
+
+    return HTMLResponse("""
+    <h1>Email Successfully Updated</h1>
+    <p>Your new email is now active.</p>
+    <a href='/settings'>Return to Settings</a>
+    """)
