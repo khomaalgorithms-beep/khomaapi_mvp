@@ -16,7 +16,7 @@ import json
 import time
 
 import requests
-
+from app.tradovate_oauth import build_tradovate_login
 import re
 import smtplib
 
@@ -2215,3 +2215,84 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+@app.get("/connected-accounts")
+def connected_accounts():
+
+    login_url = build_tradovate_login()
+
+    return f"""
+    <html>
+
+    <head>
+    <title>KhomaAPI Accounts</title>
+
+    <style>
+
+    body {{
+        background:#0b1120;
+        color:white;
+        font-family:Arial;
+        padding:40px;
+    }}
+
+    .card {{
+        background:#111827;
+        border-radius:20px;
+        padding:30px;
+        max-width:900px;
+        margin:auto;
+    }}
+
+    .btn {{
+        background:#2563eb;
+        color:white;
+        padding:15px 25px;
+        border-radius:12px;
+        text-decoration:none;
+        display:inline-block;
+        margin-top:20px;
+        font-weight:bold;
+        border:none;
+        cursor:pointer;
+    }}
+
+    .metric {{
+        font-size:40px;
+        font-weight:bold;
+        margin-top:20px;
+    }}
+
+    </style>
+
+    </head>
+
+    <body>
+
+    <div class="card">
+
+    <h1>KhomaAPI Copy Trading</h1>
+
+    <p>
+    Connect multiple Tradovate accounts and execute trades across all accounts simultaneously.
+    </p>
+
+    <div class="metric">
+    0 Connected Accounts
+    </div>
+
+    <a class="btn" href="{login_url}">
+    Connect Tradovate
+    </a>
+
+    <br><br>
+
+    <button class="btn">
+    Start Copy Trading
+    </button>
+
+    </div>
+
+    </body>
+
+    </html>
+    """
