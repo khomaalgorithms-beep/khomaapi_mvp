@@ -2191,10 +2191,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-@app.get("/connected-accounts")
+@app.get("/connected-accounts", response_class=HTMLResponse)
 
 
-@app.get("/connected-accounts")
+@app.get("/connected-accounts", response_class=HTMLResponse)
 def connected_accounts():
 
     login_url = build_tradovate_login()
