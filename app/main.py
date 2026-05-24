@@ -1397,7 +1397,11 @@ def dashboard(request: Request):
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
       <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
-      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p><a class="btn secondary" href="/broker">Manage Broker</a></div>
+      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p>
+<a class="btn secondary" href="/auth/tradovate/connect">
+Connect Tradovate
+</a>
+</div>
 
       <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
       <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
@@ -1864,6 +1868,64 @@ def webhook_flatten(payload: WebhookFlatten):
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
         return {"ok": False, "error": str(e), "latency_ms": latency}
+
+
+
+
+@app.get("/oauth/callback")
+def oauth_callback(code: str = ""):
+
+    if not code:
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
+        }
+
+    return HTMLResponse(f"""
+    <html>
+    <body style="
+        background:#081225;
+        color:white;
+        font-family:Arial;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+    ">
+
+    <div style="
+        background:#111827;
+        padding:40px;
+        border-radius:20px;
+        width:500px;
+        text-align:center;
+    ">
+
+    <h1>Tradovate Connected</h1>
+
+    <p>
+    OAuth connection successful.
+    </p>
+
+    <p>
+    Authorization Code:
+    </p>
+
+    <div style="
+        background:black;
+        padding:15px;
+        border-radius:10px;
+        word-break:break-all;
+        margin-top:20px;
+    ">
+    {code}
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """)
 
 
 @app.get("/health")
