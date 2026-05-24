@@ -1781,6 +1781,67 @@ class WebhookFlatten(BaseModel):
     request_id: Optional[str] = None
 
 
+
+
+@app.get("/auth/tradovate/connect")
+def tradovate_connect():
+
+    login_url = build_tradovate_login()
+
+    return RedirectResponse(login_url)
+
+
+@app.get("/oauth/callback")
+def oauth_callback(code: str = ""):
+
+    if not code:
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
+        }
+
+    return HTMLResponse(f"""
+    <html>
+    <body style="
+        background:#081225;
+        color:white;
+        font-family:Arial;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+    ">
+
+    <div style="
+        background:#111827;
+        padding:40px;
+        border-radius:20px;
+        width:500px;
+        text-align:center;
+    ">
+
+    <h1>Tradovate Connected</h1>
+
+    <p>OAuth connection successful.</p>
+
+    <div style="
+        background:black;
+        padding:15px;
+        border-radius:10px;
+        word-break:break-all;
+        margin-top:20px;
+    ">
+    {code}
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """)
+
+
+
 @app.post("/webhook/trade")
 def webhook_trade(payload: WebhookTrade):
     start_time = time.perf_counter()
