@@ -2194,21 +2194,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/connected-accounts")
 
 
-@app.get("/oauth/callback")
-def oauth_callback(code: str = ""):
-
-    if not code:
-        return {
-            "ok": False,
-            "error": "Missing OAuth code"
-        }
-
-    return {
-        "ok": True,
-        "message": "Tradovate account connected successfully",
-        "code": code
-    }
-
+@app.get("/connected-accounts")
 def connected_accounts():
 
     login_url = build_tradovate_login()
