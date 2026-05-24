@@ -24,7 +24,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email_validator import validate_email, EmailNotValidError
 
-from app.tradovate_oauth import build_tradovate_login
 
 
 app = FastAPI(title="KhomaAPI v5")
@@ -1758,30 +1757,6 @@ def flatten_post(request: Request, symbol: str = Form(...)):
 # TRADOVATE OAUTH PLACEHOLDER ROUTES
 # ============================================================
 
-@app.get("/auth/tradovate/connect")
-def tradovate_connect():
-    client_id = os.getenv("TRADOVATE_OAUTH_CID", "13286")
-    redirect_uri = os.getenv("TRADOVATE_OAUTH_REDIRECT", "https://web-production-6ad48.up.railway.app/auth/callback")
-    oauth_url = (
-        "https://trader.tradovate.com/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&response_type=code"
-        f"&scope=openid"
-    )
-    return RedirectResponse(oauth_url)
-
-
-@app.get("/auth/callback")
-def tradovate_callback(code: str = "", state: str = ""):
-    return {
-        "ok": True,
-        "message": "OAuth callback received. Token exchange is not implemented yet.",
-        "code": code,
-        "state": state,
-    }
-
-
 # ============================================================
 # WEBHOOK API
 # ============================================================
@@ -2217,6 +2192,23 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 @app.get("/connected-accounts")
+
+
+@app.get("/oauth/callback")
+def oauth_callback(code: str = ""):
+
+    if not code:
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
+        }
+
+    return {
+        "ok": True,
+        "message": "Tradovate account connected successfully",
+        "code": code
+    }
+
 def connected_accounts():
 
     login_url = build_tradovate_login()
