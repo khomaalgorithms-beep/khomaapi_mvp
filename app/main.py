@@ -16,6 +16,7 @@ import json
 import time
 
 import requests
+
 from app.tradovate_oauth import build_tradovate_login
 import re
 import smtplib
@@ -23,7 +24,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email_validator import validate_email, EmailNotValidError
 
-
+from app.tradovate_oauth import build_tradovate_login
 
 
 app = FastAPI(title="KhomaAPI v5")
