@@ -15,4 +15,4 @@ def build_tradovate_login():
         "redirect_uri": redirect_uri
     })
 
-    return f"https://trader.tradovate.com/oauth?{params}"
+    return f"https://trader.tradovate.com/oauth/authorize?{params}"
