@@ -1040,19 +1040,6 @@ document.addEventListener("click", function(event) {{
 </div>
   </div>
   <div class="content">{content}</div>
-
-<div class="card">
-<h2>Connected Accounts</h2>
-
-<div id="accounts-list">
-
-<div class="account-card">
-<h3>No accounts connected yet<br><br><button class='btn secondary'>Disconnect</button></h3>
-<p>Accounts connected through Tradovate OAuth will appear here.</p>
-</div>
-
-</div>
-</div>
 </main>
 </div>
 
@@ -1442,7 +1429,7 @@ def broker_page(request: Request):
       <form method="post" action="/broker/connect"><div class="formgrid">
         <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
         <div>
-      </div><button>Login with Tradovate</button><a class="btn secondary" href="/auth/tradovate/connect">Login with Tradovate</a></form>
+      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Login with Tradovate</a></form>
       <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
     </div>
     '''
