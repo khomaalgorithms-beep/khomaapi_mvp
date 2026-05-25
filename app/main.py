@@ -7,7 +7,8 @@ from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
-
+import os
+import httpx
 import sqlite3
 import hashlib
 import os
@@ -2398,3 +2399,54 @@ def connected_accounts():
 
     </html>
     """
+@app.get("/api/tradovate/accounts")
+async def get_tradovate_accounts():
+
+    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
+
+    if not access_token:
+        return {
+            "ok": False,
+            "error": "No Tradovate access token"
+        }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    async with httpx.AsyncClient() as client:
+
+        response = await client.get(
+            "https://demo-api.tradovate.com/v1/account/list",
+            headers=headers
+        )
+
+        return response.json()
+
+import os
+import httpx
+
+@app.get("/api/tradovate/accounts")
+async def get_tradovate_accounts():
+
+    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
+
+    if not access_token:
+        return {
+            "ok": False,
+            "error": "No Tradovate token"
+        }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    async with httpx.AsyncClient() as client:
+
+        response = await client.get(
+            "https://demo-api.tradovate.com/v1/account/list",
+            headers=headers
+        )
+
+        return response.json()
+

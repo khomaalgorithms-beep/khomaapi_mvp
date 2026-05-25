@@ -1,0 +1,101 @@
+<div class="broker-login-card">
+
+    <h2>Connect Tradovate</h2>
+
+    <p>
+        Securely connect your Tradovate account using OAuth.
+        KhomaCloud automatically detects all connected accounts.
+    </p>
+
+    <button class="oauth-btn" onclick="loginTradovate()">
+        Login with Tradovate
+    </button>
+
+    <div id="connected-accounts"></div>
+
+</div>
+
+<script>
+
+function loginTradovate() {
+    window.location.href = "/auth/tradovate/connect";
+}
+
+async function loadTradovateAccounts() {
+
+    const response = await fetch("/api/tradovate/accounts");
+    const data = await response.json();
+
+    if (!data || !Array.isArray(data)) return;
+
+    const container = document.getElementById("connected-accounts");
+
+    container.innerHTML = "<h3>Connected Accounts</h3>";
+
+    data.forEach(account => {
+
+        container.innerHTML += `
+            <div class="account-card">
+                <strong>${account.name}</strong>
+                <br>
+                Account ID: ${account.id}
+            </div>
+        `;
+    });
+}
+
+loadTradovateAccounts();
+
+</script>
+
+
+
+<div class="broker-login-card">
+
+    <h2>Connect Tradovate</h2>
+
+    <p>
+        Securely connect your Tradovate account using OAuth.
+        KhomaCloud automatically detects all connected accounts.
+    </p>
+
+    <button class="oauth-btn" onclick="loginTradovate()">
+        Login with Tradovate
+    </button>
+
+    <div id="connected-accounts"></div>
+
+</div>
+
+<script>
+
+function loginTradovate() {
+    window.location.href = "/auth/tradovate/connect";
+}
+
+async function loadTradovateAccounts() {
+
+    const response = await fetch("/api/tradovate/accounts");
+    const data = await response.json();
+
+    if (!Array.isArray(data)) return;
+
+    const container = document.getElementById("connected-accounts");
+
+    container.innerHTML = "<h3>Connected Accounts</h3>";
+
+    data.forEach(account => {
+
+        container.innerHTML += `
+            <div class="account-card">
+                <strong>${account.name}</strong><br>
+                Account ID: ${account.id}
+            </div>
+        `;
+    });
+}
+
+loadTradovateAccounts();
+
+</script>
+
