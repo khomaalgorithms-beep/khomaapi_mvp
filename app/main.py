@@ -1040,19 +1040,6 @@ document.addEventListener("click", function(event) {{
 </div>
   </div>
   <div class="content">{content}</div>
-
-<div class="card">
-<h2>Connected Accounts</h2>
-
-<div id="accounts-list">
-
-<div class="account-card">
-<h3>No accounts connected yet<br><br><button class='btn secondary'>Disconnect</button></h3>
-<p>Accounts connected through Tradovate OAuth will appear here.</p>
-</div>
-
-</div>
-</div>
 </main>
 </div>
 
