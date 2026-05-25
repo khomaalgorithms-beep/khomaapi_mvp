@@ -1425,11 +1425,12 @@ def broker_page(request: Request):
     <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
     <div class="grid">
       <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
-      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Secure OAuth connection powered by KhomaCloud. All Tradovate accounts are automatically detected after login.</p>
+      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
       <form method="post" action="/broker/connect"><div class="formgrid">
         <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-        <div>
-      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Login with Tradovate</a></form>
+        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
+        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
+      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
       <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
     </div>
     '''
