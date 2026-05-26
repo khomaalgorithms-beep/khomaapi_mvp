@@ -1887,11 +1887,104 @@ def webhook_flatten(payload: WebhookFlatten):
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
+    @app.get("/oauth/callback")
+    async def oauth_callback(
+            request: Request,
+            code: str = ""
+    ):
 
+        if not code:
+            return HTMLResponse("""
+            <h1>OAuth Failed</h1>
+            <p>Missing authorization code.</p>
+            """)
 
+        try:
 
-@app.get("/oauth/callback")
-def oauth_callback(code: str = ""):
+            token_url = "https://demo-api.tradovate.com/v1/auth/oauthtoken"
+
+            payload = {
+                "grantType": "authorization_code",
+                "code": code,
+                "redirectUri": os.getenv("TRADOVATE_REDIRECT_URI"),
+                "clientId": os.getenv("TRADOVATE_CID"),
+                "clientSecret": os.getenv("TRADOVATE_SEC")
+            }
+
+            async with httpx.AsyncClient() as client:
+
+                response = await client.post(
+                    token_url,
+                    json=payload,
+                    timeout=20
+                )
+
+                data = response.json()
+
+            access_token = data.get("accessToken")
+
+            if not access_token:
+                return HTMLResponse(f"""
+                <h1>OAuth Failed</h1>
+                <pre>{json.dumps(data, indent=2)}</pre>
+                """)
+
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            async with httpx.AsyncClient() as client:
+
+                acc_response = await client.get(
+                    "https://demo-api.tradovate.com/v1/account/list",
+                    headers=headers,
+                    timeout=20
+                )
+
+                accounts = acc_response.json()
+
+            return HTMLResponse(f"""
+            <html>
+            <body style="
+                background:#081225;
+                color:white;
+                font-family:Arial;
+                padding:40px;
+            ">
+
+            <div style="
+                background:#111827;
+                border-radius:20px;
+                padding:30px;
+                max-width:900px;
+                margin:auto;
+            ">
+
+            <h1>Tradovate OAuth Success</h1>
+
+            <p>Access token received successfully.</p>
+
+            <h2>Detected Accounts</h2>
+
+            <pre style="
+                background:black;
+                padding:20px;
+                border-radius:12px;
+                overflow:auto;
+            ">{json.dumps(accounts, indent=2)}</pre>
+
+            </div>
+
+            </body>
+            </html>
+            """)
+
+        except Exception as e:
+
+            return HTMLResponse(f"""
+            <h1>OAuth Error</h1>
+            <pre>{str(e)}</pre>
+            """)
 
     if not code:
         return {
