@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -8,25 +8,48 @@ from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
 
+import os
+import httpx
 import sqlite3
 import hashlib
 import os
 import secrets
 import json
 import time
+
 import requests
+
+from app.tradovate_oauth import build_tradovate_login
+import re
+import smtplib
+
+from email.mime.text import MIMEText
+from email_validator import validate_email, EmailNotValidError
+
 
 
 app = FastAPI(title="KhomaAPI v5")
-BASE_DIR = Path(__file__).resolve().parent.parent
 
-print("STATIC PATH:", BASE_DIR / "static")
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+print("STATIC DIR:", STATIC_DIR)
+print("STATIC EXISTS:", os.path.exists(STATIC_DIR))
 
 app.mount(
     "/static",
-    StaticFiles(directory=BASE_DIR / "static"),
+    StaticFiles(directory=STATIC_DIR),
     name="static"
 )
+
+@app.get("/debug-static")
+def debug_static():
+    return {
+        "base_dir": str(BASE_DIR),
+        "static_dir": STATIC_DIR,
+        "exists": os.path.exists(STATIC_DIR),
+        "files": os.listdir(STATIC_DIR) if os.path.exists(STATIC_DIR) else []
+    }
 
 DB_PATH = BASE_DIR / "khomaapi_v31.db"
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
@@ -36,6 +59,40 @@ if not KEY_PATH.exists():
 FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 
 SESSIONS: Dict[str, int] = {}
+
+APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
+
+
+# ============================================================
+# WEBSOCKET LIVE CONNECTIONS
+# ============================================================
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        disconnected = []
+
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except:
+                disconnected.append(connection)
+
+        for dead in disconnected:
+            self.disconnect(dead)
+
+manager = ConnectionManager()
+
 
 
 # ============================================================
@@ -71,13 +128,77 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def strong_password(password: str):
+
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters."
+
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain uppercase letter."
+
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain lowercase letter."
+
+    if not re.search(r"\d", password):
+        return False, "Password must contain number."
+
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]", password):
+        return False, "Password must contain special character."
+
+    return True, "Strong password"
+
+
+def valid_email(email: str):
+    try:
+        validate_email(email)
+        return True
+    except EmailNotValidError:
+        return False
+
+
+
+def send_email(to_email, subject, body):
+
+    try:
+        host = os.getenv("SMTP_HOST")
+        port = int(os.getenv("SMTP_PORT", "587"))
+        user = os.getenv("SMTP_USER")
+        password = os.getenv("SMTP_PASS")
+
+        if not host or not user or not password:
+            print("SMTP VARIABLES MISSING")
+            return False
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = to_email
+
+        server = smtplib.SMTP(host, port, timeout=10)
+
+        server.starttls()
+
+        server.login(user, password)
+
+        server.sendmail(user, [to_email], msg.as_string())
+
+        server.quit()
+
+        
+        print("EMAIL SENT TO:", to_email)
+
+
+        return True
+
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))
+        return False
+
+
+
 def init_db():
     con = db()
     cur = con.cursor()
-
-    @app.get("/test")
-    def test():
-        return {"working": True}
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,11 +275,53 @@ def init_db():
     # You can still restrict this later from Risk Engine.
     cur.execute("UPDATE users SET allowed_symbols='*' WHERE allowed_symbols IS NULL OR allowed_symbols='' OR allowed_symbols='MNQ,NQ,MES,ES,MYM,YM' OR allowed_symbols='MNQ,MNQM6,NQ,MES,ES,MYM,YM'")
 
+    
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_verifications(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER,
+        new_email TEXT,
+        created_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS password_resets(
+        token TEXT PRIMARY KEY,
+        user_id INTEGER,
+        created_at TEXT
+    )
+    """)
+
+
     con.commit()
     con.close()
 
+    try:
+        import asyncio
+
+        asyncio.create_task(
+            manager.broadcast({
+                "event": "trade",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "status": status,
+                "latency_ms": latency_ms,
+                "message": message,
+                "time": datetime.now(timezone.utc).isoformat()
+            })
+        )
+    except Exception:
+        pass
+
 
 init_db()
+
+
+@app.get("/test")
+def test():
+    return {"working": True}
 
 
 # ============================================================
@@ -820,7 +983,19 @@ function copyText(id) {{
   navigator.clipboard.writeText(text);
   alert('Copied');
 }}
+function toggleProfileMenu() {{
+    const menu = document.getElementById("profileMenu");
+    menu.style.display = menu.style.display === "block" ? "none" : "block";
+}}
+
+document.addEventListener("click", function(event) {{
+    const menu = document.getElementById("profileMenu");
+    if (!event.target.closest(".avatar")) {{
+        if(menu){{ menu.style.display = "none"; }}
+    }}
+}});
 </script>
+
 </head>
 <body>
 <div class="shell">
@@ -842,12 +1017,70 @@ function copyText(id) {{
 <main class="main">
   <div class="topbar">
     <div class="top-left"><b>{email}</b><span>KhomaAlgorithms client workspace</span></div>
-    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span><div class="avatar">{initials}</div></div>
+    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span>
+<div style="position:relative;">
+  <div class="avatar" onclick="toggleProfileMenu()" style="cursor:pointer;">{initials}</div>
+
+  <div id="profileMenu" style="
+      display:none;
+      position:absolute;
+      right:0;
+      top:55px;
+      background:white;
+      border:1px solid #e5e7eb;
+      border-radius:14px;
+      width:220px;
+      box-shadow:0 20px 60px rgba(0,0,0,.08);
+      overflow:hidden;
+      z-index:9999;
+  ">
+      <a href="/settings" style="display:block;padding:14px 16px;text-decoration:none;color:#111827;font-weight:700;">Settings</a>
+      <a href="/logout" style="display:block;padding:14px 16px;text-decoration:none;color:#dc2626;font-weight:700;border-top:1px solid #e5e7eb;">Logout</a>
+  </div>
+</div>
+</div>
   </div>
   <div class="content">{content}</div>
 </main>
 </div>
+
+<script>
+
+const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+const socket = new WebSocket(
+    protocol + "://" + window.location.host + "/ws"
+);
+
+socket.onopen = () => {{
+    console.log("Live WebSocket connected");
+}};
+
+socket.onmessage = (event) => {{
+
+    const data = JSON.parse(event.data);
+
+    console.log("LIVE EVENT:", data);
+
+    if(data.event === "trade") {{
+
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/logs" ||
+           window.location.pathname === "/journal") {{
+
+            location.reload();
+        }}
+    }}
+}};
+
+socket.onclose = () => {{
+    console.log("WebSocket disconnected");
+}};
+
+</script>
+
 </body>
+
 </html>
 """
 
@@ -862,7 +1095,44 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial
 h1{{letter-spacing:-1px;margin:0 0 8px;}} p{{color:#6b7280;line-height:1.55;}} input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:13px;margin:8px 0 14px;box-sizing:border-box;}}
 button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;}} a{{color:#0f8f45;font-weight:850;}}
 .google{{background:white;color:#111827;border:1px solid #e5e7eb;width:100%;margin-bottom:12px;}}
-</style></head><body><div class="wrap"><div class="card">{content}</div></div></body></html>
+</style></head><body><div class="wrap"><div class="card">{content}</div></div>
+<script>
+
+const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+const socket = new WebSocket(
+    protocol + "://" + window.location.host + "/ws"
+);
+
+socket.onopen = () => {{
+    console.log("Live WebSocket connected");
+}};
+
+socket.onmessage = (event) => {{
+
+    const data = JSON.parse(event.data);
+
+    console.log("LIVE EVENT:", data);
+
+    if(data.event === "trade") {{
+
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/logs" ||
+           window.location.pathname === "/journal") {{
+
+            location.reload();
+        }}
+    }}
+}};
+
+socket.onclose = () => {{
+    console.log("WebSocket disconnected");
+}};
+
+</script>
+
+</body>
+</html>
 """
 
 
@@ -878,7 +1148,9 @@ def root(request: Request):
 @app.get("/signup", response_class=HTMLResponse)
 def signup_page():
     return login_layout('''
-    <div class="logo">K</div>
+    <div class="logo">
+<img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+</div>
     <h1>Create your KhomaAPI account</h1>
     <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
     <a class="btn google" href="/auth/google">Continue with Google</a>
@@ -892,6 +1164,14 @@ def signup_page():
 
 @app.post("/signup", response_class=HTMLResponse)
 def signup(email: str = Form(...), password: str = Form(...)):
+
+    if not valid_email(email):
+        return login_layout("<h1>Invalid Email</h1><p>Please enter valid email.</p>")
+
+    ok, message = strong_password(password)
+
+    if not ok:
+        return login_layout(f"<h1>Weak Password</h1><p>{message}</p>")
     con = db()
     try:
         cur = con.cursor()
@@ -922,7 +1202,9 @@ def signup(email: str = Form(...), password: str = Form(...)):
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
     return login_layout('''
-    <div class="logo">K</div>
+    <div class="logo">
+<img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+</div>
     <h1>Welcome back</h1>
     <p>Login to your KhomaAPI execution workspace.</p>
     <a class="btn google" href="/auth/google">Continue with Google</a>
@@ -931,6 +1213,7 @@ def login_page():
       <input name="password" type="password" placeholder="Password" required>
       <button>Login</button>
     </form>
+    <p><a href="/forgot-password">Forgot Password?</a></p>
     <p>New client? <a href="/signup">Create account</a></p>
     ''')
 
@@ -947,7 +1230,13 @@ def login(email: str = Form(...), password: str = Form(...)):
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = user["id"]
     response = RedirectResponse("/dashboard", status_code=302)
-    response.set_cookie("khoma_session", sid, httponly=True, samesite="lax")
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
     return response
 
 
@@ -1056,7 +1345,13 @@ def auth_google_callback(code: str = ""):
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = user["id"]
     response = RedirectResponse("/dashboard", status_code=302)
-    response.set_cookie("khoma_session", sid, httponly=True, samesite="lax")
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
     return response
 
 
@@ -1104,7 +1399,11 @@ def dashboard(request: Request):
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
       <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
-      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p><a class="btn secondary" href="/broker">Manage Broker</a></div>
+      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p>
+<a class="btn secondary" href="/auth/tradovate/connect">
+Connect Tradovate
+</a>
+</div>
 
       <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
       <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
@@ -1331,8 +1630,75 @@ def settings_page(request: Request):
     content = f'''
     <div class="header"><div><h2>Settings</h2><p>Profile, authentication, and account security.</p></div></div>
     <div class="grid">
-      <div class="card span6"><h3>Profile</h3><p class="muted">Email: <b>{user['email']}</b></p><p class="muted">Account created: {user['created_at']}</p></div>
-      <div class="card span6"><h3>Google Login</h3><div class="google-box"><p class="muted">Google login is active through Google OAuth variables in Railway.</p><a class="btn secondary" href="/auth/google">Test Google Login</a></div></div>
+      
+<div class="card span6">
+<h3>Profile</h3>
+
+<p class="muted">Current Email: <b>{user['email']}</b></p>
+<p class="muted">Account created: {user['created_at']}</p>
+
+<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
+
+<form method="post" action="/change-email">
+<label>New Email</label>
+<input name="new_email" type="email" required>
+<button>Change Email</button>
+</form>
+
+<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">
+
+<form method="post" action="/change-password">
+<label>Current Password</label>
+<input name="current_password" type="password" required>
+
+<label>New Password</label>
+<input name="new_password" type="password" required>
+
+<button>Change Password</button>
+</form>
+
+</div>
+
+      
+<div class="card span6">
+  <h3>Account Management</h3>
+
+  <div class="google-box">
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Current Plan</b></p>
+      <div class="pill">KhomaAPI Professional</div>
+    </div>
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Subscription Status</b></p>
+      <div class="pill good">Active</div>
+    </div>
+
+    <div style="margin-bottom:22px;">
+      <p class="muted" style="margin-bottom:8px;"><b>Automation Status</b></p>
+      <div class="pill">{user['automation_status']}</div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:10px;">
+
+      <a class="btn secondary" href="/billing">
+        Change Payment Method
+      </a>
+
+      <a class="btn secondary" href="/subscription/cancel">
+        Cancel Subscription
+      </a>
+
+      <a class="btn secondary" href="/logout">
+        Logout From Account
+      </a>
+
+    </div>
+
+  </div>
+</div>
+
     </div>
     '''
     return layout(content, user, "settings")
@@ -1397,30 +1763,6 @@ def flatten_post(request: Request, symbol: str = Form(...)):
 # TRADOVATE OAUTH PLACEHOLDER ROUTES
 # ============================================================
 
-@app.get("/auth/tradovate/connect")
-def tradovate_connect():
-    client_id = os.getenv("TRADOVATE_OAUTH_CID", "13286")
-    redirect_uri = os.getenv("TRADOVATE_OAUTH_REDIRECT", "https://web-production-6ad48.up.railway.app/auth/callback")
-    oauth_url = (
-        "https://trader.tradovate.com/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&response_type=code"
-        f"&scope=openid"
-    )
-    return RedirectResponse(oauth_url)
-
-
-@app.get("/auth/callback")
-def tradovate_callback(code: str = "", state: str = ""):
-    return {
-        "ok": True,
-        "message": "OAuth callback received. Token exchange is not implemented yet.",
-        "code": code,
-        "state": state,
-    }
-
-
 # ============================================================
 # WEBHOOK API
 # ============================================================
@@ -1440,6 +1782,22 @@ class WebhookFlatten(BaseModel):
     symbol: str
     request_id: Optional[str] = None
 
+@app.get("/auth/tradovate/connect")
+def tradovate_connect(request: Request):
+
+    env = request.query_params.get("env", "demo")
+
+    if env == "prop":
+        tradovate_env = "live"
+    elif env == "live":
+        tradovate_env = "live"
+    else:
+        tradovate_env = "demo"
+
+
+    login_url = build_tradovate_login()
+
+    return RedirectResponse(login_url)
 
 @app.post("/webhook/trade")
 def webhook_trade(payload: WebhookTrade):
@@ -1529,6 +1887,157 @@ def webhook_flatten(payload: WebhookFlatten):
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
+    @app.get("/oauth/callback")
+    async def oauth_callback(
+            request: Request,
+            code: str = ""
+    ):
+
+        if not code:
+            return HTMLResponse("""
+            <h1>OAuth Failed</h1>
+            <p>Missing authorization code.</p>
+            """)
+
+        try:
+
+            token_url = "https://demo-api.tradovate.com/v1/auth/oauthtoken"
+
+            payload = {
+                "grantType": "authorization_code",
+                "code": code,
+                "redirectUri": os.getenv("TRADOVATE_REDIRECT_URI"),
+                "clientId": os.getenv("TRADOVATE_CID"),
+                "clientSecret": os.getenv("TRADOVATE_SEC")
+            }
+
+            async with httpx.AsyncClient() as client:
+
+                response = await client.post(
+                    token_url,
+                    json=payload,
+                    timeout=20
+                )
+
+                data = response.json()
+
+            access_token = data.get("accessToken")
+
+            if not access_token:
+                return HTMLResponse(f"""
+                <h1>OAuth Failed</h1>
+                <pre>{json.dumps(data, indent=2)}</pre>
+                """)
+
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            async with httpx.AsyncClient() as client:
+
+                acc_response = await client.get(
+                    "https://demo-api.tradovate.com/v1/account/list",
+                    headers=headers,
+                    timeout=20
+                )
+
+                accounts = acc_response.json()
+
+            return HTMLResponse(f"""
+            <html>
+            <body style="
+                background:#081225;
+                color:white;
+                font-family:Arial;
+                padding:40px;
+            ">
+
+            <div style="
+                background:#111827;
+                border-radius:20px;
+                padding:30px;
+                max-width:900px;
+                margin:auto;
+            ">
+
+            <h1>Tradovate OAuth Success</h1>
+
+            <p>Access token received successfully.</p>
+
+            <h2>Detected Accounts</h2>
+
+            <pre style="
+                background:black;
+                padding:20px;
+                border-radius:12px;
+                overflow:auto;
+            ">{json.dumps(accounts, indent=2)}</pre>
+
+            </div>
+
+            </body>
+            </html>
+            """)
+
+        except Exception as e:
+
+            return HTMLResponse(f"""
+            <h1>OAuth Error</h1>
+            <pre>{str(e)}</pre>
+            """)
+
+    if not code:
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
+        }
+
+    return HTMLResponse(f"""
+    <html>
+    <body style="
+        background:#081225;
+        color:white;
+        font-family:Arial;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+    ">
+
+    <div style="
+        background:#111827;
+        padding:40px;
+        border-radius:20px;
+        width:500px;
+        text-align:center;
+    ">
+
+    <h1>Tradovate Connected</h1>
+
+    <p>
+    OAuth connection successful.
+    </p>
+
+    <p>
+    Authorization Code:
+    </p>
+
+    <div style="
+        background:black;
+        padding:15px;
+        border-radius:10px;
+        word-break:break-all;
+        margin-top:20px;
+    ">
+    {code}
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """)
+
 
 @app.get("/health")
 def health():
@@ -1546,3 +2055,422 @@ def api_trades(request: Request):
         return {"ok": False, "error": "not authenticated"}
     rows = get_user_trades(user["id"], 100)
     return [dict(row) for row in rows]
+
+
+@app.post("/change-email")
+def change_email(
+    request: Request,
+    new_email: str = Form(...)
+):
+    user = require_user(request)
+
+    if not user:
+        return RedirectResponse("/login")
+
+    if not valid_email(new_email):
+        return HTMLResponse("""
+        <h1>Invalid Email</h1>
+        <p>Please enter valid email.</p>
+        """, status_code=400)
+
+    send_email(
+        new_email,
+        "KhomaAPI Email Changed",
+        "Your email was changed successfully."
+    )
+
+    con = db()
+
+    con.execute(
+        "UPDATE users SET email=? WHERE id=?",
+        (new_email.lower().strip(), user["id"])
+    )
+
+    con.commit()
+    con.close()
+
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
+    <h1>Email Updated</h1>
+
+    <p>Your email was changed successfully.</p>
+
+    <a class="btn" href="/settings">Return To Settings</a>
+    """)
+
+
+
+@app.post("/change-password")
+def change_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...)
+):
+    user = require_user(request)
+
+    if not user:
+        return RedirectResponse("/login")
+
+    if not verify_password(current_password, user["password_hash"]):
+        return HTMLResponse("""
+        <h1>Wrong Password</h1>
+        <p>Current password incorrect.</p>
+        """, status_code=400)
+
+    ok, message = strong_password(new_password)
+
+    if not ok:
+        return HTMLResponse(f"""
+        <h1>Weak Password</h1>
+        <p>{message}</p>
+        """, status_code=400)
+
+    con = db()
+
+    con.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (hash_password(new_password), user["id"])
+    )
+
+    con.commit()
+    con.close()
+
+    send_email(
+        user["email"],
+        "KhomaAPI Password Changed",
+        "Your password was successfully changed."
+    )
+
+    return HTMLResponse("""
+    <h1>Password Successfully Changed</h1>
+    <p>Your password has been updated successfully.</p>
+    <a href='/settings'>Return to Settings</a>
+    """)
+
+
+
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page():
+    return login_layout("""
+    <h1>Forgot Password</h1>
+
+    <form method="post" action="/forgot-password">
+        <input name="email" type="email" placeholder="Your Email" required>
+        <button>Send Reset Link</button>
+    </form>
+    """)
+
+
+@app.post("/forgot-password")
+def forgot_password(email: str = Form(...)):
+
+    con = db()
+
+    user = con.execute(
+        "SELECT * FROM users WHERE email=?",
+        (email.lower().strip(),)
+    ).fetchone()
+
+    if not user:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Email Not Found</h1>
+        """)
+
+    token = secrets.token_urlsafe(48)
+
+    con.execute(
+        """
+        INSERT INTO password_resets(token,user_id,created_at)
+        VALUES(?,?,?)
+        """,
+        (
+            token,
+            user["id"],
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+
+    con.commit()
+    con.close()
+
+    reset_link = f"{APP_URL}/reset-password/{token}"
+
+    send_email(
+        email,
+        "Reset Your KhomaAPI Password",
+        f"Click here to reset password:\n\n{reset_link}"
+    )
+
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
+    <h1>Reset Link Sent</h1>
+
+    <p>We sent a secure password reset link to your email.</p>
+
+    <p style="color:#6b7280;">
+    Check spam/promotions folder if you don't see it.
+    </p>
+
+    <a class="btn" href="/login">Return To Login</a>
+    """)
+
+
+@app.get("/reset-password/{token}", response_class=HTMLResponse)
+def reset_password_page(token: str):
+
+    return login_layout(f"""
+    <h1>Create New Password</h1>
+
+    <form method="post" action="/reset-password/{token}">
+        <input name="password" type="password" placeholder="New Password" required>
+        <button>Reset Password</button>
+    </form>
+    """)
+
+
+@app.post("/reset-password/{token}")
+def reset_password(token: str, password: str = Form(...)):
+
+    ok, message = strong_password(password)
+
+    if not ok:
+        return HTMLResponse(f"""
+        <h1>Weak Password</h1>
+        <p>{message}</p>
+        """)
+
+    con = db()
+
+    row = con.execute(
+        "SELECT * FROM password_resets WHERE token=?",
+        (token,)
+    ).fetchone()
+
+    if not row:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Invalid Token</h1>
+        """)
+
+    created = datetime.fromisoformat(row["created_at"])
+    now = datetime.now(timezone.utc)
+
+    if (now - created).total_seconds() > 3600:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Reset Link Expired</h1>
+        <p>Your reset link expired. Please request another one.</p>
+        """)
+
+    con.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (
+            hash_password(password),
+            row["user_id"]
+        )
+    )
+
+    con.execute(
+        "DELETE FROM password_resets WHERE token=?",
+        (token,)
+    )
+
+    con.commit()
+    con.close()
+
+    return login_layout("""
+    <div class="logo">
+    <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+    </div>
+
+    <h1>Password Updated</h1>
+
+    <p>Your password was successfully reset.</p>
+
+    <a class="btn" href="/login">Login</a>
+    """)
+
+
+@app.get("/verify-email-change/{token}")
+def verify_email_change(token: str):
+
+    con = db()
+
+    row = con.execute(
+        "SELECT * FROM email_verifications WHERE token=?",
+        (token,)
+    ).fetchone()
+
+    if not row:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Invalid Verification Link</h1>
+        """)
+
+    created = datetime.fromisoformat(row["created_at"])
+    now = datetime.now(timezone.utc)
+
+    if (now - created).total_seconds() > 3600:
+        con.close()
+
+        return HTMLResponse("""
+        <h1>Verification Link Expired</h1>
+        """)
+
+    con.execute(
+        "UPDATE users SET email=? WHERE id=?",
+        (
+            row["new_email"],
+            row["user_id"]
+        )
+    )
+
+    con.execute(
+        "DELETE FROM email_verifications WHERE token=?",
+        (token,)
+    )
+
+    con.commit()
+    con.close()
+
+    return HTMLResponse("""
+    <h1>Email Successfully Updated</h1>
+    <p>Your new email is now active.</p>
+    <a href='/settings'>Return to Settings</a>
+    """)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+def connected_accounts():
+
+    login_url = build_tradovate_login()
+
+    return f"""
+    <html>
+
+    <head>
+    <title>KhomaAPI Accounts</title>
+
+    <style>
+
+    body {{
+        background:#0b1120;
+        color:white;
+        font-family:Arial;
+        padding:40px;
+    }}
+
+    .card {{
+        background:#111827;
+        border-radius:20px;
+        padding:30px;
+        max-width:900px;
+        margin:auto;
+    }}
+
+    .btn {{
+        background:#2563eb;
+        color:white;
+        padding:15px 25px;
+        border-radius:12px;
+        text-decoration:none;
+        display:inline-block;
+        margin-top:20px;
+        font-weight:bold;
+        border:none;
+        cursor:pointer;
+    }}
+
+    .metric {{
+        font-size:40px;
+        font-weight:bold;
+        margin-top:20px;
+    }}
+
+    </style>
+
+    </head>
+
+    <body>
+
+    <div class="card">
+
+    <h1>KhomaAPI Copy Trading</h1>
+
+    <p>
+    Connect multiple Tradovate accounts and execute trades across all accounts simultaneously.
+    </p>
+
+    <div class="metric">
+    0 Connected Accounts
+    </div>
+
+    <a class="btn" href="{login_url}">
+    Connect Tradovate
+    </a>
+
+    <br><br>
+
+    <button class="btn">
+    Start Copy Trading
+    </button>
+
+    </div>
+
+    </body>
+
+    </html>
+    """
+
+import os
+import httpx
+
+@app.get("/api/tradovate/accounts")
+async def get_tradovate_accounts():
+
+
+    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
+
+    if not access_token:
+        return {
+            "ok": False,
+            "error": "No Tradovate token"
+        }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    async with httpx.AsyncClient() as client:
+
+        response = await client.get(
+            "https://demo-api.tradovate.com/v1/account/list",
+            headers=headers
+        )
+
+        return response.json()
+
