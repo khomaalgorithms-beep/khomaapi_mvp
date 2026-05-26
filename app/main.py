@@ -1423,16 +1423,185 @@ def broker_page(request: Request):
     con.close()
 
     content = f'''
-    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
+    <div class="header">
+      <div>
+        <h2>Broker Infrastructure</h2>
+        <p>
+        Connect prop firm, live, or demo Tradovate accounts.
+        KhomaAPI automatically detects accounts and enables cloud execution.
+        </p>
+      </div>
+    </div>
+
     <div class="grid">
-      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
-      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
-      <form method="post" action="/broker/connect"><div class="formgrid">
-        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
-        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
-      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
-      <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
+
+      <div class="card span4">
+        <h3>Connection Status</h3>
+
+        <div class="metric {'good' if broker['connected'] else 'bad'}">
+          {'Connected' if broker['connected'] else 'Disconnected'}
+        </div>
+
+        <p class="muted">
+          Last test: {broker['last_test'] or 'Not tested'}
+          <br>
+          Last error: {broker['last_error'] or 'None'}
+        </p>
+
+        <div style="margin-top:20px;">
+          <div class="pill">
+            Environment: {broker['env'].upper()}
+          </div>
+        </div>
+
+        <div style="margin-top:20px;">
+          <a class="btn secondary" href="/broker/test">
+            Retest Connection
+          </a>
+        </div>
+      </div>
+
+      <div class="card span8">
+
+        <h3>Connect Broker</h3>
+
+        <p class="muted">
+          KhomaAPI supports:
+          Demo • Live • Prop Firms
+        </p>
+
+        <form method="post" action="/broker/connect">
+
+          <div class="formgrid">
+
+            <div>
+              <label>Environment</label>
+
+              <select name="env">
+
+                <option value="demo"
+                {'selected' if broker['env'] == 'demo' else ''}>
+                Demo
+                </option>
+
+                <option value="live"
+                {'selected' if broker['env'] == 'live' else ''}>
+                Live
+                </option>
+
+                <option value="prop"
+                {'selected' if broker['env'] == 'prop' else ''}>
+                Prop Firm
+                </option>
+
+              </select>
+            </div>
+
+            <div>
+              <label>Tradovate Username</label>
+              <input
+                name="username"
+                placeholder="Tradovate username"
+                required
+              >
+            </div>
+
+            <div>
+              <label>Password</label>
+              <input
+                type="password"
+                name="password"
+                placeholder="Tradovate password"
+                required
+              >
+            </div>
+
+          </div>
+
+          <button>
+            Connect Broker
+          </button>
+
+          <a class="btn secondary"
+             href="/auth/tradovate/connect">
+             OAuth Connect
+          </a>
+
+        </form>
+
+      </div>
+
+      <div class="card span12">
+
+        <h3>Connected Accounts</h3>
+
+        <p class="muted">
+          All detected Tradovate accounts available for execution.
+        </p>
+
+        <table>
+
+          <tr>
+            <th>Account</th>
+            <th>Environment</th>
+            <th>Status</th>
+            <th>Execution</th>
+          </tr>
+
+          <tr>
+            <td>{broker['account_spec'] or 'No account detected'}</td>
+            <td>{broker['env'].upper()}</td>
+            <td>
+              {'Connected' if broker['connected'] else 'Disconnected'}
+            </td>
+            <td>
+              Cloud Execution
+            </td>
+          </tr>
+
+        </table>
+
+      </div>
+
+      <div class="card span6">
+
+        <h3>Copy Trading Infrastructure</h3>
+
+        <p class="muted">
+          KhomaAPI can route one TradingView signal
+          across multiple funded accounts simultaneously.
+        </p>
+
+        <div class="metric">
+          1
+        </div>
+
+        <p class="muted">
+          Connected Accounts
+        </p>
+
+      </div>
+
+      <div class="card span6">
+
+        <h3>Execution Engine</h3>
+
+        <p class="muted">
+          • No VPS
+          <br>
+          • No Ngrok
+          <br>
+          • No screen clicking
+          <br>
+          • Direct cloud execution
+          <br>
+          • Tradovate infrastructure routing
+          <br>
+          • Prop firm compatible
+        </p>
+
+      </div>
+
     </div>
     '''
     return layout(content, user, "broker")
