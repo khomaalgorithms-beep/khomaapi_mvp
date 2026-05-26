@@ -1197,6 +1197,248 @@ def signup(email: str = Form(...), password: str = Form(...)):
     con.close()
     return RedirectResponse("/login", status_code=302)
 
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return login_layout('''
+    <div class="logo">
+<img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
+</div>
+    <h1>Welcome back</h1>
+    <p>Login to your KhomaAPI execution workspace.</p>
+    <a class="btn google" href="/auth/google">Continue with Google</a>
+    <form method="post" action="/login">
+      <input name="email" placeholder="Email" required>
+      <input name="password" type="password" placeholder="Password" required>
+      <button>Login</button>
+    </form>
+    <p><a href="/forgot-password">Forgot Password?</a></p>
+    <p>New client? <a href="/signup">Create account</a></p>
+    ''')
+
+
+@app.post("/login", response_class=HTMLResponse)
+def login(email: str = Form(...), password: str = Form(...)):
+    con = db()
+    user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+    con.close()
+
+    if not user or not verify_password(password, user["password_hash"]):
+        return login_layout("<h1>Invalid login</h1><p>Email or password is wrong.</p><a href='/login'>Try again</a>")
+
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = user["id"]
+    response = RedirectResponse("/dashboard", status_code=302)
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    return response
+
+
+@app.get("/logout")
+def logout(request: Request):
+    sid = request.cookies.get("khoma_session")
+    SESSIONS.pop(sid, None)
+    response = RedirectResponse("/login")
+    response.delete_cookie("khoma_session")
+    return response
+
+
+# ============================================================
+# GOOGLE OAUTH LOGIN
+# ============================================================
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://web-production-6ad48.up.railway.app/auth/google/callback"
+)
+
+
+@app.get("/auth/google")
+def auth_google():
+    if not GOOGLE_CLIENT_ID:
+        return JSONResponse(status_code=500, content={"ok": False, "error": "GOOGLE_CLIENT_ID not configured in Railway variables."})
+
+    google_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&response_type=code"
+        "&scope=openid%20email%20profile"
+        "&access_type=online"
+        "&prompt=select_account"
+    )
+
+    return RedirectResponse(google_url)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(code: str = ""):
+    if not code:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Missing Google OAuth code."})
+
+    token_response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=20,
+    )
+
+    token_data = token_response.json()
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Failed to get Google access token.", "details": token_data})
+
+    google_user = requests.get(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
+    ).json()
+
+    email = google_user.get("email")
+
+    if not email:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Google account email not received."})
+
+    con = db()
+    existing_user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+
+    if not existing_user:
+        random_password = secrets.token_hex(24)
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at,allowed_symbols)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                email.lower().strip(),
+                hash_password(random_password),
+                "khoma_live_" + secrets.token_urlsafe(24),
+                secrets.token_hex(20),
+                datetime.now(timezone.utc).isoformat(),
+                "*",
+            ),
+        )
+        uid = cur.lastrowid
+        cur.execute("INSERT INTO brokers(user_id) VALUES(?)", (uid,))
+        con.commit()
+        user = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    else:
+        user = existing_user
+
+    con.close()
+
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = user["id"]
+    response = RedirectResponse("/dashboard", status_code=302)
+    response.set_cookie(
+        "khoma_session",
+        sid,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    return response
+
+
+# ============================================================
+# DASHBOARD ROUTES
+# ============================================================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    con = db()
+    broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
+    trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10", (user["id"],)).fetchall()
+    con.close()
+
+    m = dashboard_metrics(user["id"])
+    journal = daily_journal(user["id"])
+
+    trade_rows = "".join([
+        f"<tr><td>{t['ts'][:19]}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['status']}</td><td>{t['mode']}</td><td>{t['latency_ms']}ms</td></tr>"
+        for t in trades
+    ]) or "<tr><td colspan='7'>No trades yet.</td></tr>"
+
+    journal_rows = "".join([
+        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
+        for day, vals in journal
+    ]) or "<p class='muted'>No journal data yet.</p>"
+
+    broker_status = "Connected" if broker and broker["connected"] else "Disconnected"
+    broker_class = "good" if broker and broker["connected"] else "bad"
+
+    content = f'''
+    <div class="header">
+      <div><h2>Execution Dashboard</h2><p>Equity, live monitoring, journal, and risk visibility for your automated trading infrastructure.</p></div>
+      <div><a class="btn" href="/start">Start Automation</a><a class="btn secondary" href="/pause">Pause</a></div>
+    </div>
+
+    <div class="grid">
+      <div class="card span3"><h3>Total PnL</h3><div class="metric good">${m['total_pnl']}</div><p class="muted">Calculated from available trade data. Fill-based PnL can be added next.</p></div>
+      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses</p></div>
+      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Based on stored PnL series.</p></div>
+      <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
+
+      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
+      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p>
+<a class="btn secondary" href="/auth/tradovate/connect">
+Connect Tradovate
+</a>
+</div>
+
+      <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
+      <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
+    </div>
+    '''
+    return layout(content, user, "dashboard")
+
+
+@app.get("/broker", response_class=HTMLResponse)
+def broker_page(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    con = db()
+    broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
+    con.close()
+
+    content = f'''
+    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
+    <div class="grid">
+      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
+      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
+      <form method="post" action="/broker/connect"><div class="formgrid">
+        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
+        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
+        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
+      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
+      <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
+    </div>
+    '''
+    return layout(content, user, "broker")
+
+
+@app.post("/broker/connect")
+def broker_connect(request: Request, env: str = Form(...), username: str = Form(...), password: str = Form(...)):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
@@ -1579,30 +1821,9 @@ def oauth_callback(code: str = ""):
         text-align:center;
     ">
 
-    <h1>
-Tradovate Connected</h1>
+    <h1>Tradovate Connected</h1>
 
-<p style="font-size:20px;color:#9ca3af;margin-top:12px;">
-Your Tradovate account was connected successfully.
-</p>
-
-<div style="margin-top:35px;">
-
-<a href="/broker" style="
-background:#16a34a;
-padding:16px 28px;
-border-radius:14px;
-text-decoration:none;
-color:white;
-font-size:18px;
-font-weight:700;
-display:inline-block;
-">
-Return To Dashboard
-</a>
-
-</div>
-</p>
+    <p>OAuth connection successful.</p>
 
     <div style="
         background:black;
@@ -1742,30 +1963,10 @@ def oauth_callback(code: str = ""):
         text-align:center;
     ">
 
-    <h1>
-Tradovate Connected</h1>
+    <h1>Tradovate Connected</h1>
 
-<p style="font-size:20px;color:#9ca3af;margin-top:12px;">
-Your Tradovate account was connected successfully.
-</p>
-
-<div style="margin-top:35px;">
-
-<a href="/broker" style="
-background:#16a34a;
-padding:16px 28px;
-border-radius:14px;
-text-decoration:none;
-color:white;
-font-size:18px;
-font-weight:700;
-display:inline-block;
-">
-Return To Dashboard
-</a>
-
-</div>
-
+    <p>
+    OAuth connection successful.
     </p>
 
     <p>
@@ -2249,508 +2450,3 @@ async def get_tradovate_accounts():
 
         return response.json()
 
-
-
-@app.get("/broker")
-async def broker_page():
-
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html>
-<head>
-<title>KhomaAPI Broker Connect</title>
-
-<style>
-
-body{
-font-family:Inter,sans-serif;
-background:#f4f7f5;
-margin:0;
-padding:0;
-color:#111827;
-}
-
-.wrapper{
-padding:40px;
-}
-
-.card{
-background:white;
-border-radius:24px;
-padding:40px;
-max-width:900px;
-margin:auto;
-box-shadow:0 4px 18px rgba(0,0,0,0.06);
-}
-
-h1{
-font-size:42px;
-margin-bottom:12px;
-}
-
-.subtitle{
-font-size:20px;
-color:#6b7280;
-margin-bottom:40px;
-}
-
-.select{
-width:100%;
-padding:18px;
-font-size:20px;
-border-radius:14px;
-border:1px solid #d1d5db;
-margin-bottom:30px;
-}
-
-.greenbtn{
-width:100%;
-padding:20px;
-background:#16a34a;
-color:white;
-font-size:22px;
-font-weight:700;
-border:none;
-border-radius:16px;
-cursor:pointer;
-}
-
-.accounts{
-margin-top:50px;
-}
-
-.accountcard{
-background:#f9fafb;
-border:1px solid #e5e7eb;
-padding:22px;
-border-radius:18px;
-margin-top:18px;
-display:flex;
-justify-content:space-between;
-align-items:center;
-}
-
-.disconnect{
-background:#ef4444;
-color:white;
-border:none;
-padding:12px 18px;
-border-radius:12px;
-font-weight:700;
-cursor:pointer;
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="wrapper">
-
-<div class="card">
-
-<h1>Broker Connection</h1>
-
-<div class="subtitle">
-Secure OAuth connection powered by KhomaCloud.
-</div>
-
-<select class="select">
-
-<option>Demo</option>
-<option>Live Cash</option>
-<option>Prop Firm</option>
-
-</select>
-
-<a href="/auth/tradovate/connect">
-
-<button class="greenbtn">
-Login with Tradovate
-</button>
-
-</a>
-
-<div class="accounts">
-
-<h2>Connected Accounts</h2>
-
-<div class="accountcard">
-
-<div>
-<div style="font-size:20px;font-weight:700;">
-No accounts connected yet
-</div>
-
-<div style="color:#6b7280;">
-Accounts connected through OAuth will appear here.
-</div>
-</div>
-
-<button class="disconnect">
-Disconnect
-</button>
-
-</div>
-
-</div>
-
-</div>
-
-</div>
-
-</body>
-</html>
-""")
-
-
-@app.get("/dashboard")
-async def dashboard():
-
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html>
-<head>
-
-<title>KhomaAPI Dashboard</title>
-
-<style>
-
-body{
-margin:0;
-background:#f6f7f8;
-font-family:Inter,sans-serif;
-color:#111827;
-}
-
-.sidebar{
-position:fixed;
-left:0;
-top:0;
-width:260px;
-height:100vh;
-background:white;
-border-right:1px solid #e5e7eb;
-padding:30px;
-box-sizing:border-box;
-}
-
-.logo{
-font-size:38px;
-font-weight:900;
-margin-bottom:50px;
-}
-
-.menu{
-display:flex;
-flex-direction:column;
-gap:20px;
-}
-
-.menu a{
-text-decoration:none;
-font-size:18px;
-font-weight:700;
-color:#374151;
-}
-
-.main{
-margin-left:260px;
-padding:50px;
-}
-
-.top{
-display:flex;
-justify-content:space-between;
-align-items:center;
-margin-bottom:45px;
-}
-
-.title{
-font-size:56px;
-font-weight:900;
-}
-
-.status{
-background:#16a34a;
-color:white;
-padding:14px 20px;
-border-radius:14px;
-font-weight:700;
-}
-
-.grid{
-display:grid;
-grid-template-columns:repeat(4,1fr);
-gap:24px;
-margin-bottom:35px;
-}
-
-.card{
-background:white;
-border-radius:28px;
-padding:30px;
-box-shadow:0 4px 18px rgba(0,0,0,0.04);
-}
-
-.metric{
-font-size:18px;
-color:#6b7280;
-margin-bottom:10px;
-}
-
-.value{
-font-size:44px;
-font-weight:900;
-}
-
-.green{
-color:#16a34a;
-}
-
-.red{
-color:#dc2626;
-}
-
-.chart{
-height:320px;
-border-radius:24px;
-background:linear-gradient(
-180deg,
-#dcfce7 0%,
-#ffffff 100%
-);
-
-position:relative;
-overflow:hidden;
-margin-top:20px;
-}
-
-.line{
-position:absolute;
-left:5%;
-top:58%;
-width:90%;
-height:5px;
-background:#16a34a;
-transform:rotate(-6deg);
-border-radius:999px;
-}
-
-.section{
-font-size:34px;
-font-weight:900;
-margin-bottom:24px;
-}
-
-.accounts{
-display:grid;
-grid-template-columns:repeat(2,1fr);
-gap:22px;
-margin-top:30px;
-}
-
-.account{
-background:white;
-padding:28px;
-border-radius:24px;
-display:flex;
-justify-content:space-between;
-align-items:center;
-}
-
-.accname{
-font-size:24px;
-font-weight:800;
-}
-
-.accsub{
-margin-top:8px;
-color:#6b7280;
-}
-
-.disconnect{
-background:#ef4444;
-border:none;
-color:white;
-padding:12px 18px;
-border-radius:14px;
-font-weight:700;
-cursor:pointer;
-}
-
-.feed{
-background:white;
-padding:30px;
-border-radius:28px;
-margin-top:40px;
-}
-
-.trade{
-display:flex;
-justify-content:space-between;
-padding:18px 0;
-border-bottom:1px solid #f3f4f6;
-}
-
-.buy{
-color:#16a34a;
-font-weight:800;
-}
-
-.sell{
-color:#dc2626;
-font-weight:800;
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="sidebar">
-
-<div class="logo">
-KhomaAPI
-</div>
-
-<div class="menu">
-
-<a href="/dashboard">Dashboard</a>
-<a href="/broker">Broker Connect</a>
-<a href="#">Copy Trading</a>
-<a href="#">Trade Logs</a>
-<a href="#">Journal</a>
-<a href="#">Risk Engine</a>
-<a href="#">Settings</a>
-
-</div>
-
-</div>
-
-<div class="main">
-
-<div class="top">
-
-<div class="title">
-Execution Dashboard
-</div>
-
-<div class="status">
-Automation Active
-</div>
-
-</div>
-
-<div class="grid">
-
-<div class="card">
-<div class="metric">Win Rate</div>
-<div class="value green">71%</div>
-</div>
-
-<div class="card">
-<div class="metric">Profit Factor</div>
-<div class="value">2.37</div>
-</div>
-
-<div class="card">
-<div class="metric">Max Drawdown</div>
-<div class="value red">-3.9%</div>
-</div>
-
-<div class="card">
-<div class="metric">Net Profit</div>
-<div class="value green">$28,440</div>
-</div>
-
-</div>
-
-<div class="card">
-
-<div class="section">
-Equity Curve
-</div>
-
-<div class="chart">
-<div class="line"></div>
-</div>
-
-</div>
-
-<div style="margin-top:45px;">
-
-<div class="section">
-Connected Accounts
-</div>
-
-<div class="accounts">
-
-<div class="account">
-
-<div>
-<div class="accname">
-TopStep 50K
-</div>
-
-<div class="accsub">
-Connected • Copy Trading Enabled
-</div>
-</div>
-
-<button class="disconnect">
-Disconnect
-</button>
-
-</div>
-
-<div class="account">
-
-<div>
-<div class="accname">
-TakeProfitTrader
-</div>
-
-<div class="accsub">
-Connected • MNQ Enabled
-</div>
-</div>
-
-<button class="disconnect">
-Disconnect
-</button>
-
-</div>
-
-</div>
-
-</div>
-
-<div class="feed">
-
-<div class="section">
-Live Trade Feed
-</div>
-
-<div class="trade">
-<div>MNQ LONG</div>
-<div class="buy">+$420</div>
-</div>
-
-<div class="trade">
-<div>MNQ SHORT</div>
-<div class="sell">-$180</div>
-</div>
-
-<div class="trade">
-<div>MES LONG</div>
-<div class="buy">+$260</div>
-</div>
-
-</div>
-
-</div>
-
-</body>
-</html>
-""")
