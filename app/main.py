@@ -2056,11 +2056,11 @@ def webhook_flatten(payload: WebhookFlatten):
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
-    @app.get("/oauth/callback")
-    async def oauth_callback(
+@app.get("/oauth/callback")
+async def oauth_callback(
             request: Request,
             code: str = ""
-    ):
+):
 
         if not code:
             return HTMLResponse("""
@@ -2155,15 +2155,15 @@ def webhook_flatten(payload: WebhookFlatten):
             <pre>{str(e)}</pre>
             """)
 
-    if not code:
+if not code:
         return {
             "ok": False,
             "error": "Missing OAuth code"
         }
 
-    return HTMLResponse(f"""
-    <html>
-    <body style="
+return HTMLResponse(f"""
+<html>
+<body style="
         background:#081225;
         color:white;
         font-family:Arial;
@@ -2171,42 +2171,41 @@ def webhook_flatten(payload: WebhookFlatten):
         justify-content:center;
         align-items:center;
         height:100vh;
-    ">
+">
 
-    <div style="
+<div style="
         background:#111827;
         padding:40px;
         border-radius:20px;
         width:500px;
         text-align:center;
-    ">
+">
 
-    <h1>Tradovate Connected</h1>
+<h1>Tradovate Connected</h1>
 
-    <p>
-    OAuth connection successful.
-    </p>
+<p>
+OAuth connection successful.
+</p>
 
-    <p>
-    Authorization Code:
-    </p>
+<p>
+Authorization Code:
+</p>
 
-    <div style="
+<div style="
         background:black;
         padding:15px;
         border-radius:10px;
         word-break:break-all;
         margin-top:20px;
-    ">
-    {code}
-    </div>
+">
+{code}
+</div>
 
-    </div>
+</div>
 
-    </body>
-    </html>
-    """)
-
+</body>
+</html>
+""")
 
 @app.get("/health")
 def health():
