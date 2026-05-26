@@ -1388,48 +1388,7 @@ def dashboard(request: Request):
     content = f'''
     <div class="header">
       <div><h2>Execution Dashboard</h2><p>Equity, live monitoring, journal, and risk visibility for your automated trading infrastructure.</p></div>
-      <div><a class="btn" href="/start">Start Automation</a><a class="btn secondary" href="/pause">Pause</a></div>
-    </div>
-
-    <div class="grid">
-      <div class="card span3"><h3>Total PnL</h3><div class="metric good">${m['total_pnl']}</div><p class="muted">Calculated from available trade data. Fill-based PnL can be added next.</p></div>
-      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses</p></div>
-      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Based on stored PnL series.</p></div>
-      <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
-
-      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
-      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p>
-<a class="btn secondary" href="/auth/tradovate/connect">
-Connect Tradovate
-</a>
-</div>
-
-      <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
-      <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
-    </div>
-    '''
-    return layout(content, user, "dashboard")
-
-
-@app.get("/broker", response_class=HTMLResponse)
-def broker_page(request: Request):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
-
-    con = db()
-    broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
-    con.close()
-
-    content = f'''
-    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
-    <div class="grid">
-      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
-      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Secure OAuth connection powered by KhomaCloud. All Tradovate accounts are automatically detected after login.</p>
-      <form method="post" action="/broker/connect"><div class="formgrid">
-        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-        <div>
-      </div><button>Login with Tradovate</button><a class="btn secondary" href="/auth/tradovate/connect">Login with Tradovate</a></form>
+      <div><a class="btn" href="/start">Start Automation</a></form>
       <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
     </div>
     '''
@@ -1820,9 +1779,30 @@ def oauth_callback(code: str = ""):
         text-align:center;
     ">
 
-    <h1>Tradovate Connected</h1>
+    <h1>
+Tradovate Connected</h1>
 
-    <p>OAuth connection successful.</p>
+<p style="font-size:20px;color:#9ca3af;margin-top:12px;">
+Your Tradovate account was connected successfully.
+</p>
+
+<div style="margin-top:35px;">
+
+<a href="/broker" style="
+background:#16a34a;
+padding:16px 28px;
+border-radius:14px;
+text-decoration:none;
+color:white;
+font-size:18px;
+font-weight:700;
+display:inline-block;
+">
+Return To Dashboard
+</a>
+
+</div>
+</p>
 
     <div style="
         background:black;
@@ -1962,10 +1942,30 @@ def oauth_callback(code: str = ""):
         text-align:center;
     ">
 
-    <h1>Tradovate Connected</h1>
+    <h1>
+Tradovate Connected</h1>
 
-    <p>
-    OAuth connection successful.
+<p style="font-size:20px;color:#9ca3af;margin-top:12px;">
+Your Tradovate account was connected successfully.
+</p>
+
+<div style="margin-top:35px;">
+
+<a href="/broker" style="
+background:#16a34a;
+padding:16px 28px;
+border-radius:14px;
+text-decoration:none;
+color:white;
+font-size:18px;
+font-weight:700;
+display:inline-block;
+">
+Return To Dashboard
+</a>
+
+</div>
+
     </p>
 
     <p>
