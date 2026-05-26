@@ -2449,3 +2449,157 @@ async def get_tradovate_accounts():
 
         return response.json()
 
+
+
+@app.get("/broker")
+async def broker_page():
+
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html>
+<head>
+<title>KhomaAPI Broker Connect</title>
+
+<style>
+
+body{
+font-family:Inter,sans-serif;
+background:#f4f7f5;
+margin:0;
+padding:0;
+color:#111827;
+}
+
+.wrapper{
+padding:40px;
+}
+
+.card{
+background:white;
+border-radius:24px;
+padding:40px;
+max-width:900px;
+margin:auto;
+box-shadow:0 4px 18px rgba(0,0,0,0.06);
+}
+
+h1{
+font-size:42px;
+margin-bottom:12px;
+}
+
+.subtitle{
+font-size:20px;
+color:#6b7280;
+margin-bottom:40px;
+}
+
+.select{
+width:100%;
+padding:18px;
+font-size:20px;
+border-radius:14px;
+border:1px solid #d1d5db;
+margin-bottom:30px;
+}
+
+.greenbtn{
+width:100%;
+padding:20px;
+background:#16a34a;
+color:white;
+font-size:22px;
+font-weight:700;
+border:none;
+border-radius:16px;
+cursor:pointer;
+}
+
+.accounts{
+margin-top:50px;
+}
+
+.accountcard{
+background:#f9fafb;
+border:1px solid #e5e7eb;
+padding:22px;
+border-radius:18px;
+margin-top:18px;
+display:flex;
+justify-content:space-between;
+align-items:center;
+}
+
+.disconnect{
+background:#ef4444;
+color:white;
+border:none;
+padding:12px 18px;
+border-radius:12px;
+font-weight:700;
+cursor:pointer;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="wrapper">
+
+<div class="card">
+
+<h1>Broker Connection</h1>
+
+<div class="subtitle">
+Secure OAuth connection powered by KhomaCloud.
+</div>
+
+<select class="select">
+
+<option>Demo</option>
+<option>Live Cash</option>
+<option>Prop Firm</option>
+
+</select>
+
+<a href="/auth/tradovate/connect">
+
+<button class="greenbtn">
+Login with Tradovate
+</button>
+
+</a>
+
+<div class="accounts">
+
+<h2>Connected Accounts</h2>
+
+<div class="accountcard">
+
+<div>
+<div style="font-size:20px;font-weight:700;">
+No accounts connected yet
+</div>
+
+<div style="color:#6b7280;">
+Accounts connected through OAuth will appear here.
+</div>
+</div>
+
+<button class="disconnect">
+Disconnect
+</button>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+</body>
+</html>
+""")
+
