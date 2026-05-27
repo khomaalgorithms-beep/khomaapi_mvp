@@ -423,8 +423,21 @@ def tradovate_login_raw(env: str, username: str, password: str, user_id: int) ->
         timeout=15,
     )
 
-    try:
-        data = response.json()
+    
+try:
+                    data = response.json()
+                except Exception:
+                    data = {
+                        "raw": response.text
+                    }
+
+
+
+except Exception:
+    data = {
+        "raw": response.text
+    }
+
     except Exception:
         data = {"raw": response.text}
 
