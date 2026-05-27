@@ -31,7 +31,7 @@ from email_validator import validate_email, EmailNotValidError
 app = FastAPI(title="KhomaAPI v5")
 
 # AUTO CREATE BROKER TABLE
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect("database.db")
 
 conn.execute("""
 CREATE TABLE IF NOT EXISTS broker_connections (
