@@ -455,10 +455,31 @@ def fetch_tradovate_accounts(env: str, token: str):
         except Exception:
             data = {"raw": response.text}
 
-    if response.status_code >= 400 or not isinstance(data, list) or len(data) == 0:
-        raise Exception(f"Could not fetch Tradovate accounts: {data}")
+    if (response.status_code >= 400 or not isinstance(data, list) or len(data) == 0):
 
-    active_accounts = [a for a in data if not a.get("closed") and not a.get("archived") and a.get("active", True)]
+        fallback = requests.get(
+            f"{tradovate_base(env)}/account/deps",
+            headers=tv_headers(token),
+            timeout=15,
+        )
+
+        try:
+            fallback_data = fallback.json()
+        except Exception:
+            fallback_data = []
+
+        if isinstance(fallback_data, list) and len(fallback_data) > 0:
+            data = fallback_data
+        else:
+            raise Exception(f"Could not fetch Tradovate accounts: {data}")
+
+    active_accounts = [
+        a for a in data
+        if not a.get("closed")
+        and not a.get("archived")
+        and a.get("active", True)
+    ]
+
     return active_accounts or data
 
 
