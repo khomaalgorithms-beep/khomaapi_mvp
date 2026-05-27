@@ -34,7 +34,9 @@ app = FastAPI(title="KhomaAPI v5")
 conn = sqlite3.connect("database.db")
 
 conn.execute("""
-CREATE TABLE IF NOT EXISTS broker_connections (
+DROP TABLE IF EXISTS broker_connections;
+
+CREATE TABLE broker_connections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     broker_username TEXT,
     broker_password TEXT,
@@ -1853,12 +1855,14 @@ def oauth_callback(request: Request, code: str = ""):
 
         conn = db()
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS broker_connections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            broker_username TEXT,
-            broker_password TEXT,
-            access_token TEXT
-        )
+        DROP TABLE IF EXISTS broker_connections;
+
+CREATE TABLE broker_connections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    broker_username TEXT,
+    broker_password TEXT,
+    access_token TEXT
+)
         """)
         conn.commit()
         conn.close()
@@ -2515,12 +2519,14 @@ def create_broker_table():
     conn = sqlite3.connect(DB_PATH)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS broker_connections (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        broker_username TEXT,
-        broker_password TEXT,
-        access_token TEXT
-    )
+    DROP TABLE IF EXISTS broker_connections;
+
+CREATE TABLE broker_connections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    broker_username TEXT,
+    broker_password TEXT,
+    access_token TEXT
+)
     """)
 
     conn.commit()
