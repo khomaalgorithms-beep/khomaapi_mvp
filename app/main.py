@@ -443,6 +443,18 @@ def fetch_tradovate_accounts(env: str, token: str):
     except Exception:
         data = {"raw": response.text}
 
+    if not data:
+        response = requests.get(
+            f"{tradovate_base(env)}/account/deps",
+            headers=tv_headers(token),
+            timeout=15,
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw": response.text}
+
     if response.status_code >= 400 or not isinstance(data, list) or len(data) == 0:
         raise Exception(f"Could not fetch Tradovate accounts: {data}")
 
