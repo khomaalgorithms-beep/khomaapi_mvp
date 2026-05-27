@@ -7,10 +7,7 @@ from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date
 from cryptography.fernet import Fernet
-
-
 import os
-
 import httpx
 import sqlite3
 import hashlib
@@ -423,21 +420,8 @@ def tradovate_login_raw(env: str, username: str, password: str, user_id: int) ->
         timeout=15,
     )
 
-    
-try:
-                    data = response.json()
-                except Exception:
-                    data = {
-                        "raw": response.text
-                    }
-
-
-
-except Exception:
-    data = {
-        "raw": response.text
-    }
-
+    try:
+        data = response.json()
     except Exception:
         data = {"raw": response.text}
 
@@ -1438,185 +1422,16 @@ def broker_page(request: Request):
     con.close()
 
     content = f'''
-    <div class="header">
-      <div>
-        <h2>Broker Infrastructure</h2>
-        <p>
-        Connect prop firm, live, or demo Tradovate accounts.
-        KhomaAPI automatically detects accounts and enables cloud execution.
-        </p>
-      </div>
-    </div>
-
+    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
     <div class="grid">
-
-      <div class="card span4">
-        <h3>Connection Status</h3>
-
-        <div class="metric {'good' if broker['connected'] else 'bad'}">
-          {'Connected' if broker['connected'] else 'Disconnected'}
-        </div>
-
-        <p class="muted">
-          Last test: {broker['last_test'] or 'Not tested'}
-          <br>
-          Last error: {broker['last_error'] or 'None'}
-        </p>
-
-        <div style="margin-top:20px;">
-          <div class="pill">
-            Environment: {broker['env'].upper()}
-          </div>
-        </div>
-
-        <div style="margin-top:20px;">
-          <a class="btn secondary" href="/broker/test">
-            Retest Connection
-          </a>
-        </div>
-      </div>
-
-      <div class="card span8">
-
-        <h3>Connect Broker</h3>
-
-        <p class="muted">
-          KhomaAPI supports:
-          Demo • Live • Prop Firms
-        </p>
-
-        <form method="post" action="/broker/connect">
-
-          <div class="formgrid">
-
-            <div>
-              <label>Environment</label>
-
-              <select name="env">
-
-                <option value="demo"
-                {'selected' if broker['env'] == 'demo' else ''}>
-                Demo
-                </option>
-
-                <option value="live"
-                {'selected' if broker['env'] == 'live' else ''}>
-                Live
-                </option>
-
-                <option value="prop"
-                {'selected' if broker['env'] == 'prop' else ''}>
-                Prop Firm
-                </option>
-
-              </select>
-            </div>
-
-            <div>
-              <label>Tradovate Username</label>
-              <input
-                name="username"
-                placeholder="Tradovate username"
-                required
-              >
-            </div>
-
-            <div>
-              <label>Password</label>
-              <input
-                type="password"
-                name="password"
-                placeholder="Tradovate password"
-                required
-              >
-            </div>
-
-          </div>
-
-          <button>
-            Connect Broker
-          </button>
-
-          <a class="btn secondary"
-             href="/auth/tradovate/connect">
-             OAuth Connect
-          </a>
-
-        </form>
-
-      </div>
-
-      <div class="card span12">
-
-        <h3>Connected Accounts</h3>
-
-        <p class="muted">
-          All detected Tradovate accounts available for execution.
-        </p>
-
-        <table>
-
-          <tr>
-            <th>Account</th>
-            <th>Environment</th>
-            <th>Status</th>
-            <th>Execution</th>
-          </tr>
-
-          <tr>
-            <td>{broker['account_spec'] or 'No account detected'}</td>
-            <td>{broker['env'].upper()}</td>
-            <td>
-              {'Connected' if broker['connected'] else 'Disconnected'}
-            </td>
-            <td>
-              Cloud Execution
-            </td>
-          </tr>
-
-        </table>
-
-      </div>
-
-      <div class="card span6">
-
-        <h3>Copy Trading Infrastructure</h3>
-
-        <p class="muted">
-          KhomaAPI can route one TradingView signal
-          across multiple funded accounts simultaneously.
-        </p>
-
-        <div class="metric">
-          1
-        </div>
-
-        <p class="muted">
-          Connected Accounts
-        </p>
-
-      </div>
-
-      <div class="card span6">
-
-        <h3>Execution Engine</h3>
-
-        <p class="muted">
-          • No VPS
-          <br>
-          • No Ngrok
-          <br>
-          • No screen clicking
-          <br>
-          • Direct cloud execution
-          <br>
-          • Tradovate infrastructure routing
-          <br>
-          • Prop firm compatible
-        </p>
-
-      </div>
-
+      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
+      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
+      <form method="post" action="/broker/connect"><div class="formgrid">
+        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
+        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
+        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
+      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
+      <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
     </div>
     '''
     return layout(content, user, "broker")
@@ -1966,22 +1781,67 @@ class WebhookFlatten(BaseModel):
     symbol: str
     request_id: Optional[str] = None
 
+
+
+
 @app.get("/auth/tradovate/connect")
-def tradovate_connect(request: Request):
-
-    env = request.query_params.get("env", "demo")
-
-    if env == "prop":
-        tradovate_env = "live"
-    elif env == "live":
-        tradovate_env = "live"
-    else:
-        tradovate_env = "demo"
-
+def tradovate_connect():
 
     login_url = build_tradovate_login()
 
     return RedirectResponse(login_url)
+
+
+@app.get("/oauth/callback")
+def oauth_callback(code: str = ""):
+
+    if not code:
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
+        }
+
+    return HTMLResponse(f"""
+    <html>
+    <body style="
+        background:#081225;
+        color:white;
+        font-family:Arial;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+    ">
+
+    <div style="
+        background:#111827;
+        padding:40px;
+        border-radius:20px;
+        width:500px;
+        text-align:center;
+    ">
+
+    <h1>Tradovate Connected</h1>
+
+    <p>OAuth connection successful.</p>
+
+    <div style="
+        background:black;
+        padding:15px;
+        border-radius:10px;
+        word-break:break-all;
+        margin-top:20px;
+    ">
+    {code}
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """)
+
+
 
 @app.post("/webhook/trade")
 def webhook_trade(payload: WebhookTrade):
@@ -2072,118 +1932,65 @@ def webhook_flatten(payload: WebhookFlatten):
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
 
+
+
 @app.get("/oauth/callback")
-async def oauth_callback(
-    request: Request,
-    code: str = ""
-):
+def oauth_callback(code: str = ""):
 
     if not code:
-        return HTMLResponse("<h1>OAuth Failed</h1><p>Missing code.</p>")
-
-    try:
-
-        token_url = "https://live.tradovateapi.com/auth/oauthtoken"
-
-        payload = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": os.getenv("TRADOVATE_REDIRECT_URI"),
-            "client_id": os.getenv("TRADOVATE_CLIENT_ID"),
-            "client_secret": os.getenv("TRADOVATE_CLIENT_SECRET")
+        return {
+            "ok": False,
+            "error": "Missing OAuth code"
         }
 
-        async with httpx.AsyncClient() as client:
+    return HTMLResponse(f"""
+    <html>
+    <body style="
+        background:#081225;
+        color:white;
+        font-family:Arial;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+    ">
 
-            response = await client.post(
-                token_url,
-                data=payload,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                timeout=20
-            )
+    <div style="
+        background:#111827;
+        padding:40px;
+        border-radius:20px;
+        width:500px;
+        text-align:center;
+    ">
 
-            data = response.json()
+    <h1>Tradovate Connected</h1>
 
-        access_token = data.get("access_token")
+    <p>
+    OAuth connection successful.
+    </p>
 
-        if not access_token:
-            return HTMLResponse(f"<h1>OAuth Failed</h1><pre>{json.dumps(data, indent=2)}</pre>")
+    <p>
+    Authorization Code:
+    </p>
 
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
+    <div style="
+        background:black;
+        padding:15px;
+        border-radius:10px;
+        word-break:break-all;
+        margin-top:20px;
+    ">
+    {code}
+    </div>
 
-        async with httpx.AsyncClient() as client:
+    </div>
 
-            acc_response = await client.get(
-                "https://live.tradovateapi.com/account/list",
-                headers=headers,
-                timeout=20
-            )
+    </body>
+    </html>
+    """)
 
-            accounts = acc_response.json()
 
-            if not accounts:
-
-                acc_response = await client.get(
-                    "https://live.tradovateapi.com/account/deps",
-                    headers=headers,
-                    timeout=20
-                )
-
-                accounts = acc_response.json()
-
-        if not accounts or not isinstance(accounts, list):
-            return HTMLResponse(f"<h1>No Accounts Found</h1><pre>{json.dumps(accounts, indent=2)}</pre>")
-
-        account = accounts[0]
-
-        sid = request.cookies.get("khoma_session")
-        uid = SESSIONS.get(sid)
-
-        if not uid:
-            return HTMLResponse("<h1>Not logged into KhomaAPI</h1>")
-
-        con = db()
-
-        con.execute(
-            """
-            UPDATE brokers
-            SET
-                connected=1,
-                env='live',
-                account_id=?,
-                account_spec=?,
-                access_token_enc=?,
-                last_error='',
-                last_test=?
-            WHERE user_id=?
-            """,
-            (
-                str(account.get("id")),
-                str(account.get("name") or account.get("accountSpec") or account.get("id")),
-                enc(access_token),
-                datetime.now(timezone.utc).isoformat(),
-                uid
-            )
-        )
-
-        con.commit()
-        con.close()
-
-        return RedirectResponse("/broker", status_code=302)
-
-    except Exception as e:
-
-        return HTMLResponse(f"""
-        <h1>OAuth Error</h1>
-        <pre>{str(e)}</pre>
-        """)
-
-@app.get("/health"
-)
+@app.get("/health")
 def health():
     return {
         "ok": True,
@@ -2508,7 +2315,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+@app.get("/connected-accounts", response_class=HTMLResponse)
 
+
+@app.get("/connected-accounts", response_class=HTMLResponse)
 def connected_accounts():
 
     login_url = build_tradovate_login()
@@ -2589,13 +2399,35 @@ def connected_accounts():
 
     </html>
     """
+@app.get("/api/tradovate/accounts")
+async def get_tradovate_accounts():
+
+    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
+
+    if not access_token:
+        return {
+            "ok": False,
+            "error": "No Tradovate access token"
+        }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    async with httpx.AsyncClient() as client:
+
+        response = await client.get(
+            "https://demo-api.tradovate.com/v1/account/list",
+            headers=headers
+        )
+
+        return response.json()
 
 import os
 import httpx
 
 @app.get("/api/tradovate/accounts")
 async def get_tradovate_accounts():
-
 
     access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
 
@@ -2612,7 +2444,7 @@ async def get_tradovate_accounts():
     async with httpx.AsyncClient() as client:
 
         response = await client.get(
-            "https://demo-api.tradovate.com/account/list",
+            "https://demo-api.tradovate.com/v1/account/list",
             headers=headers
         )
 
