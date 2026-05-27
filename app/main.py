@@ -2072,7 +2072,7 @@ async def oauth_callback(
 
         try:
 
-            token_url = "https://demo-api.tradovate.com/v1/auth/accesstokenrequest"
+            token_url = "https://demo-api.tradovate.com/auth/oauthtoken"
 
             payload = {
                 "grant_type": "authorization_code",
@@ -2118,7 +2118,7 @@ async def oauth_callback(
             async with httpx.AsyncClient() as client:
 
                 acc_response = await client.get(
-                    "https://demo-api.tradovate.com/v1/account/list",
+                    "https://demo-api.tradovate.com/account/list",
                     headers=headers,
                     timeout=20
                 )
@@ -2597,7 +2597,7 @@ async def get_tradovate_accounts():
     async with httpx.AsyncClient() as client:
 
         response = await client.get(
-            "https://demo-api.tradovate.com/v1/account/list",
+            "https://demo-api.tradovate.com/account/list",
             headers=headers
         )
 
