@@ -2093,7 +2093,15 @@ async def oauth_callback(
                     timeout=20
                 )
 
-                data = response.json()
+                print("STATUS:", response.status_code)
+                print("RAW RESPONSE:", response.text)
+
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {
+                        "raw": response.text
+                    }
 
             access_token = data.get("accessToken")
 
