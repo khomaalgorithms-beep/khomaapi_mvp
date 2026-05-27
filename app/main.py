@@ -2477,3 +2477,30 @@ def debug_accounts():
     except Exception as e:
         return {"error": str(e)}
 
+
+
+@app.get("/debug/accounts")
+def debug_accounts():
+
+    try:
+        token, cfg = tradovate_login(1)
+
+        response = requests.get(
+            f"{tradovate_base('live')}/account/list",
+            headers=tv_headers(token),
+            timeout=15,
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw": response.text}
+
+        return {
+            "status": response.status_code,
+            "data": data
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
