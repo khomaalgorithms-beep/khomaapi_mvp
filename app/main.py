@@ -33,7 +33,7 @@ app = FastAPI(title="KhomaAPI v5")
 # AUTO CREATE BROKER TABLE
 conn = sqlite3.connect("database.db")
 
-conn.execute("""
+conn.executescript("""
 DROP TABLE IF EXISTS broker_connections;
 
 CREATE TABLE broker_connections (
@@ -41,8 +41,11 @@ CREATE TABLE broker_connections (
     broker_username TEXT,
     broker_password TEXT,
     access_token TEXT
-)
+);
 """)
+
+conn.commit()
+conn.close()
 
 conn.commit()
 conn.close()
