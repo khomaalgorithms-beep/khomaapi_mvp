@@ -1829,77 +1829,69 @@ def tradovate_connect():
 @app.get("/oauth/callback")
 def oauth_callback(code: str = ""):
 
-    broker = {
-        "broker_username": os.getenv("TV_USERNAME", ""),
-        "broker_password": os.getenv("TV_PASSWORD", "")
-    }
-
-    if not code:
-        return {
-            "ok": False,
-            "error": "Missing OAuth code"
-        }
-
     try:
 
-        token_response = requests.post(
-            "https://live.tradovateapi.com/auth/accessTokenRequest",
-            json={
-                "name": broker["broker_username"],
-                "password": broker["broker_password"],
-                "cid": os.getenv("TRADOVATE_CID"),
-                "sec": os.getenv("TRADOVATE_SEC"),
-                "deviceId": "KhomaCloud",
-                "appId": "KhomaCloud",
-                "appVersion": "1.0",
-                "grantType": "authorization_code",
-                "code": code,
-                "redirectUri": "https://web-production-6ad48.up.railway.app/oauth/callback"
-            },
+        if not code:
+            return {
+                "ok": False,
+                "error": "Missing OAuth code"
+            }
+
+        # LOAD SAVED BROKER
+        conn = db()
+
+        broker = conn.execute(
+            "SELECT * FROM broker_connections ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        conn.close()
+
+        if not broker:
+            return {
+                "ok": False,
+                "error": "No broker saved"
+            }
+
+        payload = {
+            "name": broker["broker_username"],
+            "password": broker["broker_password"],
+            "appId": os.getenv("TV_APP_ID"),
+            "appVersion": "1.0",
+            "cid": os.getenv("TV_CID"),
+            "sec": os.getenv("TV_SECRET"),
+            "deviceId": "KhomaAPI"
+        }
+
+        response = requests.post(
+            "https://live.tradovateapi.com/v1/auth/accesstokenrequest",
+            json=payload,
             timeout=20
         )
 
-        data = token_response.json()
+        data = response.json()
 
-        access_token = data.get("accessToken") or data.get("access_token")
-
-        if not access_token:
+        if not data.get("accessToken"):
             return {
                 "ok": False,
                 "error": "No access token returned",
                 "response": data
             }
 
-        conn = sqlite3.connect("database.db")
-        cur = conn.cursor()
+        access_token = data["accessToken"]
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS broker_credentials (
-            user_id INTEGER PRIMARY KEY,
-            tradovate_username TEXT,
-            tradovate_password TEXT,
-            access_token TEXT,
-            environment TEXT
-        )
-        """)
+        conn = db()
 
-        cur.execute("""
-        INSERT OR REPLACE INTO broker_credentials
-        (
-            user_id,
-            tradovate_username,
-            tradovate_password,
-            access_token,
-            environment
+        conn.execute(
+            """
+            UPDATE broker_connections
+            SET access_token=?
+            WHERE id=?
+            """,
+            (
+                access_token,
+                broker["id"]
+            )
         )
-        VALUES (?, ?, ?, ?, ?)
-        """, (
-            1,
-            "",
-            "",
-            access_token,
-            "live"
-        ))
 
         conn.commit()
         conn.close()
@@ -1914,7 +1906,6 @@ def oauth_callback(code: str = ""):
             "ok": False,
             "error": str(e)
         }
-
 
 
 @app.post("/webhook/trade")
