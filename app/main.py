@@ -1829,6 +1829,11 @@ def tradovate_connect():
 @app.get("/oauth/callback")
 def oauth_callback(code: str = ""):
 
+    broker = {
+        "broker_username": os.getenv("TV_USERNAME", ""),
+        "broker_password": os.getenv("TV_PASSWORD", "")
+    }
+
     if not code:
         return {
             "ok": False,
