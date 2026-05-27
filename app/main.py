@@ -1825,6 +1825,7 @@ def tradovate_connect():
     return RedirectResponse(login_url)
 
 
+
 @app.get("/oauth/callback")
 def oauth_callback(code: str = ""):
 
@@ -1834,12 +1835,73 @@ def oauth_callback(code: str = ""):
             "error": "Missing OAuth code"
         }
 
-    
-    return RedirectResponse(
-        url="/broker",
-        status_code=302
-    )
+    try:
 
+        token_response = requests.post(
+            "https://live.tradovateapi.com/auth/oauthtoken",
+            json={
+                "grantType": "authorization_code",
+                "code": code,
+                "redirectUri": "https://web-production-6ad48.up.railway.app/oauth/callback"
+            },
+            timeout=20
+        )
+
+        data = token_response.json()
+
+        access_token = data.get("accessToken") or data.get("access_token")
+
+        if not access_token:
+            return {
+                "ok": False,
+                "error": "No access token returned",
+                "response": data
+            }
+
+        conn = sqlite3.connect("database.db")
+        cur = conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS broker_credentials (
+            user_id INTEGER PRIMARY KEY,
+            tradovate_username TEXT,
+            tradovate_password TEXT,
+            access_token TEXT,
+            environment TEXT
+        )
+        """)
+
+        cur.execute("""
+        INSERT OR REPLACE INTO broker_credentials
+        (
+            user_id,
+            tradovate_username,
+            tradovate_password,
+            access_token,
+            environment
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            1,
+            "",
+            "",
+            access_token,
+            "live"
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return RedirectResponse(
+            url="/broker",
+            status_code=302
+        )
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
 
 
 
