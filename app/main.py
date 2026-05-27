@@ -2580,3 +2580,26 @@ def oauth_test():
             "error": str(e)
         }
 
+
+
+import os
+
+@app.get("/debug/db-path")
+def debug_db_path():
+
+    try:
+
+        db_path = os.path.abspath("database.db")
+
+        exists = os.path.exists(db_path)
+
+        return {
+            "db_path": db_path,
+            "exists": exists
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
+
