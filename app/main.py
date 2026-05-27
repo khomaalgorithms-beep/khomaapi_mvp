@@ -2058,117 +2058,109 @@ def webhook_flatten(payload: WebhookFlatten):
         log_trade(user["id"], request_id, payload.symbol.upper(), "flatten", 0, "rejected", "REJECTED", latency, str(e), {})
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
+
 @app.get("/oauth/callback")
 async def oauth_callback(
-            request: Request,
-            code: str = ""
+    request: Request,
+    code: str = ""
 ):
 
-        if not code:
-            return HTMLResponse("""
-            <h1>OAuth Failed</h1>
-            <p>Missing authorization code.</p>
-            """)
+    if not code:
+        return HTMLResponse("<h1>OAuth Failed</h1><p>Missing code.</p>")
 
-        try:
+    try:
 
-            token_url = "https://demo-api.tradovate.com/auth/oauthtoken"
+        token_url = "https://live.tradovateapi.com/auth/oauthtoken"
 
-            payload = {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": os.getenv("TRADOVATE_REDIRECT_URI"),
-                "client_id": os.getenv("TRADOVATE_CLIENT_ID"),
-                "client_secret": os.getenv("TRADOVATE_CLIENT_SECRET")
-            }
+        payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": os.getenv("TRADOVATE_REDIRECT_URI"),
+            "client_id": os.getenv("TRADOVATE_CLIENT_ID"),
+            "client_secret": os.getenv("TRADOVATE_CLIENT_SECRET")
+        }
 
-            async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
 
-                response = await client.post(
-                    token_url,
-                    data=payload,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    },
-                    timeout=20
-                )
+            response = await client.post(
+                token_url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=20
+            )
 
-                print("STATUS:", response.status_code)
-                print("RAW RESPONSE:", response.text)
+            data = response.json()
 
-                try:
-                    data = response.json()
-                except Exception:
-                    data = {
-                        "raw": response.text
-                    }
+        access_token = data.get("access_token")
 
-            access_token = data.get("accessToken")
+        if not access_token:
+            return HTMLResponse(f"<h1>OAuth Failed</h1><pre>{json.dumps(data, indent=2)}</pre>")
 
-            if not access_token:
-                return HTMLResponse(f"""
-                <h1>OAuth Failed</h1>
-                <pre>{json.dumps(data, indent=2)}</pre>
-                """)
+        headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
 
-            headers = {
-                "Authorization": f"Bearer {access_token}"
-            }
+        async with httpx.AsyncClient() as client:
 
-            async with httpx.AsyncClient() as client:
+            acc_response = await client.get(
+                "https://live.tradovateapi.com/account/list",
+                headers=headers,
+                timeout=20
+            )
 
-                acc_response = await client.get(
-                    "https://demo-api.tradovate.com/account/list",
-                    headers=headers,
-                    timeout=20
-                )
+            accounts = acc_response.json()
 
-                accounts = acc_response.json()
+        if not accounts or not isinstance(accounts, list):
+            return HTMLResponse(f"<h1>No Accounts Found</h1><pre>{json.dumps(accounts, indent=2)}</pre>")
 
-            return HTMLResponse(f"""
-            <html>
-            <body style="
-                background:#081225;
-                color:white;
-                font-family:Arial;
-                padding:40px;
-            ">
+        account = accounts[0]
 
-            <div style="
-                background:#111827;
-                border-radius:20px;
-                padding:30px;
-                max-width:900px;
-                margin:auto;
-            ">
+        sid = request.cookies.get("khoma_session")
+        uid = SESSIONS.get(sid)
 
-            <h1>Tradovate OAuth Success</h1>
+        if not uid:
+            return HTMLResponse("<h1>Not logged into KhomaAPI</h1>")
 
-            <p>Access token received successfully.</p>
+        con = db()
 
-            <h2>Detected Accounts</h2>
+        con.execute(
+            """
+            UPDATE brokers
+            SET
+                connected=1,
+                env='live',
+                account_id=?,
+                account_spec=?,
+                access_token_enc=?,
+                last_error='',
+                last_test=?
+            WHERE user_id=?
+            """,
+            (
+                str(account.get("id")),
+                str(account.get("name") or account.get("accountSpec") or account.get("id")),
+                enc(access_token),
+                datetime.now(timezone.utc).isoformat(),
+                uid
+            )
+        )
 
-            <pre style="
-                background:black;
-                padding:20px;
-                border-radius:12px;
-                overflow:auto;
-            ">{json.dumps(accounts, indent=2)}</pre>
+        con.commit()
+        con.close()
 
-            </div>
+        return RedirectResponse("/broker", status_code=302)
 
-            </body>
-            </html>
-            """)
+    except Exception as e:
 
-        except Exception as e:
+        return HTMLResponse(f"""
+        <h1>OAuth Error</h1>
+        <pre>{str(e)}</pre>
+        """)
 
-            return HTMLResponse(f"""
-            <h1>OAuth Error</h1>
-            <pre>{str(e)}</pre>
-            """)
-
-@app.get("/health")
+@app.get("/health"
+)
 def health():
     return {
         "ok": True,
