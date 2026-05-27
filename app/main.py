@@ -1845,85 +1845,62 @@ def tradovate_connect():
 
 
 @app.get("/oauth/callback")
-def oauth_callback(code: str = ""):
+def oauth_callback(request: Request, code: str = ""):
 
     try:
-
         if not code:
-            return {
-                "ok": False,
-                "error": "Missing OAuth code"
-            }
-
-        # LOAD SAVED BROKER
-        conn = db()
-
-        broker = conn.execute(
-            "SELECT * FROM broker_connections ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-        conn.close()
-
-        if not broker:
-            return {
-                "ok": False,
-                "error": "No broker saved"
-            }
-
-        payload = {
-            "name": broker["broker_username"],
-            "password": broker["broker_password"],
-            "appId": os.getenv("TV_APP_ID"),
-            "appVersion": "1.0",
-            "cid": os.getenv("TV_CID"),
-            "sec": os.getenv("TV_SECRET"),
-            "deviceId": "KhomaAPI"
-        }
-
-        response = requests.post(
-            "https://live.tradovateapi.com/v1/auth/accesstokenrequest",
-            json=payload,
-            timeout=20
-        )
-
-        data = response.json()
-
-        if not data.get("accessToken"):
-            return {
-                "ok": False,
-                "error": "No access token returned",
-                "response": data
-            }
-
-        access_token = data["accessToken"]
+            return {"ok": False, "error": "Missing OAuth code"}
 
         conn = db()
-
-        conn.execute(
-            """
-            UPDATE broker_connections
-            SET access_token=?
-            WHERE id=?
-            """,
-            (
-                access_token,
-                broker["id"]
-            )
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS broker_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            broker_username TEXT,
+            broker_password TEXT,
+            access_token TEXT
         )
-
+        """)
         conn.commit()
         conn.close()
 
-        return RedirectResponse(
-            url="/broker",
-            status_code=302
+        payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": os.getenv("TRADOVATE_REDIRECT_URI"),
+            "client_id": os.getenv("TRADOVATE_CLIENT_ID") or os.getenv("TV_CID"),
+            "client_secret": os.getenv("TRADOVATE_CLIENT_SECRET") or os.getenv("TV_SECRET")
+        }
+
+        response = requests.post(
+            "https://live.tradovateapi.com/v1/auth/oauthtoken",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=20
         )
 
+        try:
+            data = response.json()
+        except Exception:
+            return {"ok": False, "error": "OAuth response not JSON", "raw": response.text}
+
+        access_token = data.get("access_token") or data.get("accessToken")
+
+        if not access_token:
+            return {"ok": False, "error": "No access token returned", "response": data}
+
+        conn = db()
+        conn.execute("DELETE FROM broker_connections")
+        conn.execute(
+            "INSERT INTO broker_connections(access_token) VALUES(?)",
+            (access_token,)
+        )
+        conn.commit()
+        conn.close()
+
+        return RedirectResponse(url="/broker", status_code=302)
+
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/webhook/trade")
