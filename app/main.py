@@ -1840,8 +1840,8 @@ def oauth_callback(code: str = ""):
         token_response = requests.post(
             "https://live.tradovateapi.com/auth/accessTokenRequest",
             json={
-                "name": "",
-                "password": "",
+                "name": broker["broker_username"],
+                "password": broker["broker_password"],
                 "cid": os.getenv("TRADOVATE_CID"),
                 "sec": os.getenv("TRADOVATE_SEC"),
                 "deviceId": "KhomaCloud",
