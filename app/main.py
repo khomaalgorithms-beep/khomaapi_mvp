@@ -1838,8 +1838,15 @@ def oauth_callback(code: str = ""):
     try:
 
         token_response = requests.post(
-            "https://live.tradovateapi.com/auth/oauthtoken",
+            "https://live.tradovateapi.com/auth/accessTokenRequest",
             json={
+                "name": "",
+                "password": "",
+                "cid": os.getenv("TRADOVATE_CID"),
+                "sec": os.getenv("TRADOVATE_SEC"),
+                "deviceId": "KhomaCloud",
+                "appId": "KhomaCloud",
+                "appVersion": "1.0",
                 "grantType": "authorization_code",
                 "code": code,
                 "redirectUri": "https://web-production-6ad48.up.railway.app/oauth/callback"
