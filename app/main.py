@@ -2550,4 +2550,3 @@ def create_broker_table():
     conn.close()
 
     return {"ok": True, "table": "broker_connections created"}
-
