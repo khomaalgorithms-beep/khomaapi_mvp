@@ -2550,3 +2550,33 @@ def create_broker_table():
     conn.close()
 
     return {"ok": True, "table": "broker_connections created"}
+
+
+@app.get("/oauth-test")
+def oauth_test():
+
+    try:
+
+        conn = db()
+
+        row = conn.execute(
+            "SELECT * FROM broker_connections ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        conn.close()
+
+        if not row:
+            return {"ok": False, "error": "No broker connection found"}
+
+        return {
+            "ok": True,
+            "access_token": row["access_token"][:25],
+            "environment": row["environment"]
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
