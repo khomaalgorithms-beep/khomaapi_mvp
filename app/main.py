@@ -2112,6 +2112,16 @@ async def oauth_callback(
 
             accounts = acc_response.json()
 
+            if not accounts:
+
+                acc_response = await client.get(
+                    "https://live.tradovateapi.com/account/deps",
+                    headers=headers,
+                    timeout=20
+                )
+
+                accounts = acc_response.json()
+
         if not accounts or not isinstance(accounts, list):
             return HTMLResponse(f"<h1>No Accounts Found</h1><pre>{json.dumps(accounts, indent=2)}</pre>")
 
