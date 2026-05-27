@@ -2072,14 +2072,16 @@ async def oauth_callback(
 
         try:
 
-            token_url = "https://demo-api.tradovate.com/v1/auth/oauthtoken"
+            token_url = "https://demo-api.tradovate.com/v1/auth/accesstokenrequest"
 
             payload = {
-                "grantType": "authorization_code",
-                "code": code,
-                "redirectUri": os.getenv("TRADOVATE_REDIRECT_URI"),
-                "clientId": os.getenv("TRADOVATE_CID"),
-                "clientSecret": os.getenv("TRADOVATE_SEC")
+                "name": os.getenv("TRADOVATE_USERNAME"),
+                "password": os.getenv("TRADOVATE_PASSWORD"),
+                "appId": os.getenv("TRADOVATE_APP_ID"),
+                "appVersion": "1.0",
+                "cid": os.getenv("TRADOVATE_CID"),
+                "sec": os.getenv("TRADOVATE_SEC"),
+                "deviceId": "KhomaAPI"
             }
 
             async with httpx.AsyncClient() as client:
