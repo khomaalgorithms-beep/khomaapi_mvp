@@ -2535,7 +2535,7 @@ def debug_accounts():
 @app.get("/create-broker-table")
 def create_broker_table():
 
-    conn = sqlite3.connect("database.db")
+    conn = sqlite3.connect(DB_PATH)
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS broker_connections (
