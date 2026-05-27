@@ -2530,3 +2530,24 @@ def debug_accounts():
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/create-broker-table")
+def create_broker_table():
+
+    conn = sqlite3.connect("database.db")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS broker_connections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        broker_username TEXT,
+        broker_password TEXT,
+        access_token TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "table": "broker_connections created"}
+
