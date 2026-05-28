@@ -19,6 +19,7 @@ import time
 import requests
 
 from app.tradovate_oauth import build_tradovate_login, exchange_code_for_token, fetch_accounts
+from app import tradovate_oauth as tvo
 import re
 import smtplib
 
@@ -465,6 +466,178 @@ def disconnect_broker_account(user_id: int, row_id: int) -> bool:
     deleted = cur.rowcount > 0
     con.close()
     return deleted
+
+
+# ============================================================
+# LIVE TRADE MONITOR (reads positions/fills/PnL from Tradovate)
+# ============================================================
+
+# Dollar value per 1.0 point move, per contract root. Used to turn fill price
+# differences into realized PnL. Covers the CME index futures this app targets;
+# unknown symbols fall back to 1.0.
+CONTRACT_MULTIPLIERS = {
+    "ES": 50.0, "MES": 5.0,
+    "NQ": 20.0, "MNQ": 2.0,
+    "YM": 5.0, "MYM": 0.5,
+    "RTY": 50.0, "M2K": 5.0,
+    "CL": 1000.0, "MCL": 100.0,
+    "GC": 100.0, "MGC": 10.0,
+    "SI": 5000.0,
+    "6E": 125000.0, "6B": 62500.0, "6J": 12500000.0,
+}
+
+_MONTH_CODES = "FGHJKMNQUVXZ"
+
+
+def symbol_root(name: str) -> str:
+    """MNQM6 -> MNQ, ESZ4 -> ES. Returns the input if it doesn't match a futures code."""
+    name = (name or "").upper().strip()
+    m = re.match(r"^([A-Z0-9]+?)([" + _MONTH_CODES + r"])(\d{1,2})$", name)
+    return m.group(1) if m else name
+
+
+def contract_multiplier(name: str) -> float:
+    return CONTRACT_MULTIPLIERS.get(symbol_root(name), 1.0)
+
+
+def realized_pnl_from_fills(fills, name_for) -> float:
+    """FIFO realized PnL across a set of fills. `name_for(contractId)` -> symbol name."""
+    books: Dict[Any, list] = {}
+    realized = 0.0
+
+    for f in sorted(fills, key=lambda x: str(x.get("timestamp", ""))):
+        cid = f.get("contractId")
+        qty = abs(float(f.get("qty") or 0))
+        price = float(f.get("price") or 0)
+        action = str(f.get("action") or "").lower()
+        if qty == 0:
+            continue
+
+        signed = qty if action == "buy" else -qty
+        mult = contract_multiplier(name_for(cid))
+        book = books.setdefault(cid, [])
+
+        # Close against opposing open lots first (FIFO).
+        while signed != 0 and book and (book[0][0] > 0) != (signed > 0):
+            lot_qty, lot_price = book[0]
+            match = min(abs(signed), abs(lot_qty))
+            if lot_qty > 0:            # long lot closed by a sell
+                realized += (price - lot_price) * match * mult
+            else:                      # short lot closed by a buy
+                realized += (lot_price - price) * match * mult
+            if abs(lot_qty) == match:
+                book.pop(0)
+            else:
+                book[0][0] = lot_qty - (match if lot_qty > 0 else -match)
+            signed -= (match if signed > 0 else -match)
+
+        if signed != 0:
+            book.append([signed, price])
+
+    return round(realized, 2)
+
+
+def _snapshot_value(snap, keys):
+    if isinstance(snap, dict):
+        for k in keys:
+            if snap.get(k) is not None:
+                try:
+                    return float(snap[k])
+                except Exception:
+                    pass
+    return None
+
+
+def live_account_monitor(user_id: int) -> Dict[str, Any]:
+    """Aggregate live open positions + PnL across the user's connected accounts."""
+    accounts = get_broker_accounts(user_id, connected_only=True)
+    out_accounts = []
+    token_cache: Dict[tuple, tuple] = {}
+    contract_names: Dict[Any, str] = {}
+    today = date.today().isoformat()
+
+    for a in accounts:
+        token = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+        env = a.get("env") or "live"
+        acct_id = a.get("account_id")
+
+        if not token or not acct_id:
+            out_accounts.append({
+                "name": a["account_name"], "env": env,
+                "open_pnl": None, "realized_pnl": None, "total_cash": None,
+                "positions": [], "error": "Reconnect required",
+            })
+            continue
+
+        key = (token, env)
+        if key not in token_cache:
+            token_cache[key] = (tvo.get_positions(env, token), tvo.get_fills(env, token))
+        positions_all, fills_all = token_cache[key]
+
+        def name_for(cid):
+            if cid in contract_names:
+                return contract_names[cid]
+            c = tvo.get_contract(env, token, cid) or {}
+            nm = c.get("name") if isinstance(c, dict) else None
+            contract_names[cid] = nm or f"#{cid}"
+            return contract_names[cid]
+
+        try:
+            acct_id_int = int(acct_id)
+        except Exception:
+            acct_id_int = None
+
+        def belongs(obj):
+            aid = obj.get("accountId")
+            return acct_id_int is None or aid == acct_id_int or str(aid) == str(acct_id)
+
+        positions = []
+        for p in (positions_all or []):
+            if not belongs(p):
+                continue
+            net = float(p.get("netPos") or 0)
+            if net == 0:
+                continue
+            positions.append({
+                "symbol": name_for(p.get("contractId")),
+                "side": "long" if net > 0 else "short",
+                "qty": abs(int(net)),
+                "avg_price": p.get("netPrice"),
+            })
+
+        acct_fills = [
+            f for f in (fills_all or [])
+            if belongs(f) and str(f.get("timestamp", ""))[:10] == today
+        ]
+        realized = realized_pnl_from_fills(acct_fills, name_for) if acct_fills else 0.0
+
+        snap = tvo.get_cash_snapshot(env, token, acct_id)
+        open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL", "totalPnL"))
+        total_cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
+
+        out_accounts.append({
+            "name": a["account_name"], "env": env,
+            "open_pnl": open_pnl, "realized_pnl": realized, "total_cash": total_cash,
+            "positions": positions,
+        })
+
+    def total(field):
+        vals = [acc[field] for acc in out_accounts if acc.get(field) is not None]
+        return round(sum(vals), 2) if vals else None
+
+    totals = {"open_pnl": total("open_pnl"), "realized_pnl": total("realized_pnl")}
+    if totals["open_pnl"] is not None or totals["realized_pnl"] is not None:
+        totals["total_pnl"] = round((totals["open_pnl"] or 0) + (totals["realized_pnl"] or 0), 2)
+    else:
+        totals["total_pnl"] = None
+
+    return {
+        "ok": True,
+        "connected": len(accounts) > 0,
+        "accounts": out_accounts,
+        "totals": totals,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
@@ -1457,6 +1630,73 @@ def auth_google_callback(code: str = ""):
 # DASHBOARD ROUTES
 # ============================================================
 
+DASHBOARD_LIVE_SCRIPT = """
+<script>
+(function () {
+  function fmt(v) {
+    if (v === null || v === undefined) return "—";
+    var n = Number(v);
+    return (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
+  }
+  function cls(v) {
+    if (v === null || v === undefined) return "metric";
+    return "metric " + (Number(v) > 0 ? "good" : (Number(v) < 0 ? "bad" : ""));
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+    });
+  }
+  function render(data) {
+    var tp = document.getElementById("totalPnl");
+    var lp = document.getElementById("livePnl");
+    var lm = document.getElementById("liveMonitor");
+    if (!data || !data.connected) {
+      if (tp) tp.textContent = "—";
+      if (lp) lp.innerHTML = "<p class='muted'>Connect a Tradovate account to see live PnL.</p>";
+      if (lm) lm.innerHTML = "<p class='muted'>No connected account yet. Go to Broker Connect to link your Tradovate accounts.</p>";
+      return;
+    }
+    if (tp && data.totals && data.totals.total_pnl !== null && data.totals.total_pnl !== undefined) {
+      tp.textContent = fmt(data.totals.total_pnl);
+      tp.className = cls(data.totals.total_pnl);
+    }
+    if (lp) {
+      var h = "";
+      (data.accounts || []).forEach(function (a) {
+        h += "<div class='journal-day'><div><b>" + esc(a.name) + "</b><small>" + esc((a.env || "").toUpperCase()) + "</small></div>" +
+             "<div style='text-align:right'><b class='" + (Number(a.open_pnl) < 0 ? "bad" : "good") + "'>Open " + fmt(a.open_pnl) + "</b>" +
+             "<small>Realized " + fmt(a.realized_pnl) + "</small></div></div>";
+      });
+      lp.innerHTML = h || "<p class='muted'>No accounts.</p>";
+    }
+    if (lm) {
+      var rows = "";
+      (data.accounts || []).forEach(function (a) {
+        (a.positions || []).forEach(function (p) {
+          rows += "<tr><td><b>" + esc(p.symbol) + "</b></td><td>" + esc(a.name) + "</td><td>" +
+                  esc(p.side) + "</td><td>" + esc(p.qty) + "</td><td>" +
+                  (p.avg_price == null ? "—" : esc(p.avg_price)) + "</td></tr>";
+        });
+      });
+      lm.innerHTML = rows
+        ? "<table><tr><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Avg Price</th></tr>" + rows + "</table>"
+        : "<p class='muted'>No open positions right now.</p>";
+    }
+  }
+  function poll() {
+    fetch("/api/live/monitor", { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () {});
+  }
+  poll();
+  setInterval(poll, 6000);
+})();
+</script>
+"""
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
     user = require_user(request)
@@ -1464,50 +1704,50 @@ def dashboard(request: Request):
         return RedirectResponse("/login")
 
     con = db()
-    broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
     trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10", (user["id"],)).fetchall()
     con.close()
 
     m = dashboard_metrics(user["id"])
     journal = daily_journal(user["id"])
 
+    running = user["automation_status"] == "Running"
+    state_label = "ON" if running else "OFF"
+    state_class = "good" if running else "bad"
+    mode = user["live_mode"].upper()
+
     trade_rows = "".join([
         f"<tr><td>{t['ts'][:19]}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['status']}</td><td>{t['mode']}</td><td>{t['latency_ms']}ms</td></tr>"
         for t in trades
-    ]) or "<tr><td colspan='7'>No trades yet.</td></tr>"
+    ]) or "<tr><td colspan='7'>No execution events yet.</td></tr>"
 
     journal_rows = "".join([
         f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
         for day, vals in journal
     ]) or "<p class='muted'>No journal data yet.</p>"
 
-    broker_status = "Connected" if broker and broker["connected"] else "Disconnected"
-    broker_class = "good" if broker and broker["connected"] else "bad"
+    start_btn = '<a class="btn secondary" href="/start">Start Automation</a>' if running else '<a class="btn" href="/start">Start Automation</a>'
+    pause_btn = '<a class="btn" href="/pause">Pause</a>' if running else '<a class="btn secondary" href="/pause">Pause</a>'
 
     content = f'''
     <div class="header">
-      <div><h2>Execution Dashboard</h2><p>Equity, live monitoring, journal, and risk visibility for your automated trading infrastructure.</p></div>
-      <div><a class="btn" href="/start">Start Automation</a><a class="btn secondary" href="/pause">Pause</a></div>
+      <div><h2>Execution Dashboard</h2><p>System is <b class="{state_class}">{state_label}</b> · Mode: <b>{mode}</b> · Orders today: <b>{today_order_count(user['id'])}</b></p></div>
+      <div>{start_btn}{pause_btn}</div>
     </div>
 
     <div class="grid">
-      <div class="card span3"><h3>Total PnL</h3><div class="metric good">${m['total_pnl']}</div><p class="muted">Calculated from available trade data. Fill-based PnL can be added next.</p></div>
-      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses</p></div>
-      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Based on stored PnL series.</p></div>
+      <div class="card span3"><h3>Total PnL (live)</h3><div class="metric good" id="totalPnl">—</div><p class="muted">Open + realized from connected accounts.</p></div>
+      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses (from trade log)</p></div>
+      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">From stored trade log.</p></div>
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
-      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Builds automatically as trades are logged.</p><div class="equity-wrap">{chart_svg(m['equity'])}</div></div>
-      <div class="card span4"><h3>Automation Health</h3><div class="metric {broker_class}">{broker_status}</div><p class="muted">Mode: <b>{user['live_mode'].upper()}</b><br>Status: <b>{user['automation_status']}</b><br>Orders today: <b>{today_order_count(user['id'])}</b></p>
-<a class="btn secondary" href="/auth/tradovate/connect">
-Connect Tradovate
-</a>
-</div>
+      <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Open positions from your connected Tradovate accounts. Refreshes automatically.</p><div id="liveMonitor"><p class="muted">Loading live positions…</p></div></div>
+      <div class="card span4"><h3>Live Account PnL</h3><p class="muted">Per connected account.</p><div id="livePnl"><p class="muted">Loading…</p></div></div>
 
-      <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Latest execution events from KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
+      <div class="card span8"><h3>Execution Log</h3><p class="muted">Recent order events routed by KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
       <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
     </div>
     '''
-    return layout(content, user, "dashboard")
+    return layout(content + DASHBOARD_LIVE_SCRIPT, user, "dashboard")
 
 
 @app.get("/broker", response_class=HTMLResponse)
@@ -2436,6 +2676,39 @@ def debug_accounts(request: Request):
     if not user:
         return {"ok": False, "error": "Not logged in"}
     return {"ok": True, "accounts": get_broker_accounts(user["id"])}
+
+
+@app.get("/api/live/monitor")
+def api_live_monitor(request: Request):
+    user = require_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Not logged in"})
+    try:
+        return live_account_monitor(user["id"])
+    except Exception as e:
+        return {"ok": False, "connected": False, "accounts": [], "totals": {}, "error": str(e)}
+
+
+@app.get("/debug/tradovate/raw")
+def debug_tradovate_raw(request: Request):
+    """Raw Tradovate responses for the first connected account, to verify field mappings."""
+    user = require_user(request)
+    if not user:
+        return {"ok": False, "error": "Not logged in"}
+    accts = get_broker_accounts(user["id"], connected_only=True)
+    if not accts:
+        return {"ok": False, "error": "No connected account"}
+    a = accts[0]
+    token = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+    env = a.get("env") or "live"
+    return {
+        "ok": True,
+        "account": a["account_name"],
+        "env": env,
+        "positions": tvo.get_positions(env, token),
+        "fills": tvo.get_fills(env, token),
+        "cash_snapshot": tvo.get_cash_snapshot(env, token, a.get("account_id")),
+    }
 
 
 @app.get("/create-broker-table")

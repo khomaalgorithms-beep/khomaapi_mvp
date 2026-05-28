@@ -120,3 +120,59 @@ def fetch_accounts(access_token: str) -> dict:
             last_error = data
 
     return {"ok": False, "error": last_error or "Could not fetch accounts", "accounts": []}
+
+
+# ----------------------------------------------------------------------------
+# Read-only REST helpers used by the live monitor. All are defensive: they
+# never raise, returning [] / None on any failure so the dashboard stays up.
+# ----------------------------------------------------------------------------
+
+def _rest_base(env: str) -> str:
+    return REST_DEMO if env == "demo" else REST_LIVE
+
+
+def _get(env: str, token: str, path: str, params: dict | None = None):
+    try:
+        r = requests.get(
+            f"{_rest_base(env)}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=15,
+        )
+        return r.json()
+    except Exception:
+        return None
+
+
+def _post(env: str, token: str, path: str, body: dict):
+    try:
+        r = requests.post(
+            f"{_rest_base(env)}{path}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=15,
+        )
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_positions(env: str, token: str) -> list:
+    data = _get(env, token, "/position/list")
+    return data if isinstance(data, list) else []
+
+
+def get_fills(env: str, token: str) -> list:
+    data = _get(env, token, "/fill/list")
+    return data if isinstance(data, list) else []
+
+
+def get_cash_snapshot(env: str, token: str, account_id):
+    try:
+        return _post(env, token, "/cashBalance/getCashBalanceSnapshot", {"accountId": int(account_id)})
+    except Exception:
+        return None
+
+
+def get_contract(env: str, token: str, contract_id):
+    return _get(env, token, "/contract/item", {"id": contract_id})
