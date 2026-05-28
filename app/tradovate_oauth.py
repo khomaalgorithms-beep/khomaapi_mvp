@@ -176,3 +176,22 @@ def get_cash_snapshot(env: str, token: str, account_id):
 
 def get_contract(env: str, token: str, contract_id):
     return _get(env, token, "/contract/item", {"id": contract_id})
+
+
+def place_order(env: str, token: str, account_spec, account_id, action: str, symbol: str, qty: int):
+    """Place a market order on a specific account using its OAuth token.
+
+    Returns the parsed Tradovate response dict, or {"error": ...} on transport failure.
+    """
+    body = {
+        "accountSpec": str(account_spec),
+        "accountId": int(account_id),
+        "action": "Buy" if str(action).lower() == "buy" else "Sell",
+        "symbol": str(symbol).upper(),
+        "orderQty": int(qty),
+        "orderType": "Market",
+        "isAutomated": True,
+        "timeInForce": "Day",
+    }
+    resp = _post(env, token, "/order/placeorder", body)
+    return resp if resp is not None else {"error": "request failed"}

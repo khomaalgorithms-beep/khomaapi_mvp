@@ -4,3 +4,4 @@ __pycache__/
 *.db
 .khoma_secret_v31
 .env
+uploads/
