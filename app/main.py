@@ -61,8 +61,6 @@ if not KEY_PATH.exists():
     KEY_PATH.write_text(Fernet.generate_key().decode(), encoding="utf-8")
 FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 
-SESSIONS: Dict[str, int] = {}
-
 # Maps a short-lived OAuth `state` value -> user_id, so the Tradovate
 # callback can be tied back to the user who started the connect flow.
 OAUTH_STATES: Dict[str, int] = {}
@@ -320,6 +318,16 @@ def init_db():
     )
     """)
 
+    # Persistent login sessions so a Railway restart / redeploy does not log
+    # everyone out (previously sessions lived in an in-memory dict).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions(
+        sid TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        created_at TEXT
+    )
+    """)
+
     con.commit()
     con.close()
 
@@ -336,9 +344,39 @@ def test():
 # SESSION HELPERS
 # ============================================================
 
+def create_session(user_id: int) -> str:
+    sid = secrets.token_urlsafe(32)
+    con = db()
+    con.execute(
+        "INSERT INTO sessions(sid, user_id, created_at) VALUES(?,?,?)",
+        (sid, user_id, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit()
+    con.close()
+    return sid
+
+
+def get_session_user_id(sid: Optional[str]) -> Optional[int]:
+    if not sid:
+        return None
+    con = db()
+    row = con.execute("SELECT user_id FROM sessions WHERE sid=?", (sid,)).fetchone()
+    con.close()
+    return row["user_id"] if row else None
+
+
+def destroy_session(sid: Optional[str]) -> None:
+    if not sid:
+        return
+    con = db()
+    con.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+    con.commit()
+    con.close()
+
+
 def current_user(request: Request):
     sid = request.cookies.get("khoma_session")
-    uid = SESSIONS.get(sid)
+    uid = get_session_user_id(sid)
     if not uid:
         return None
 
@@ -1113,14 +1151,10 @@ def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: st
     side = normalize_side(side)
     qty = clean_qty(qty)
 
-    allowed = [item.strip().upper() for item in user["allowed_symbols"].split(",") if item.strip()]
-    allow_all = "*" in allowed or "ALL" in allowed
-
-    if not allow_all and symbol not in allowed:
-        raise Exception(f"Symbol {symbol} not allowed.")
-
-    if qty < 1 or qty > int(user["max_contracts"]):
-        raise Exception(f"Qty violates max contract limit: {user['max_contracts']}.")
+    # Every symbol is allowed — KhomaAPI trades exactly what the TradingView
+    # alert sends, at the quantity the alert specifies.
+    if qty < 1:
+        raise Exception("Invalid quantity from alert.")
 
     if today_order_count(user["id"]) >= int(user["max_orders"]):
         raise Exception("Daily order limit reached.")
@@ -1426,8 +1460,9 @@ def signup_page():
     <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
     <a class="btn google" href="/auth/google">Continue with Google</a>
     <form method="post" action="/signup">
-      <input name="email" placeholder="Email" required>
-      <input name="password" type="password" placeholder="Password" required>
+      <input name="email" type="email" placeholder="Email" required>
+      <input name="password" type="password" placeholder="Password" minlength="8" required>
+      <p style="color:#6b7280;font-size:13px;margin:-6px 0 14px;">At least 8 characters, with an uppercase letter, a number, and a special character.</p>
       <button>Create Account</button>
     </form>
     <p>Already have an account? <a href="/login">Login</a></p>
@@ -1498,8 +1533,7 @@ def login(email: str = Form(...), password: str = Form(...)):
     if not user or not verify_password(password, user["password_hash"]):
         return login_layout("<h1>Invalid login</h1><p>Email or password is wrong.</p><a href='/login'>Try again</a>")
 
-    sid = secrets.token_urlsafe(32)
-    SESSIONS[sid] = user["id"]
+    sid = create_session(user["id"])
     response = RedirectResponse("/dashboard", status_code=302)
     response.set_cookie(
         "khoma_session",
@@ -1513,8 +1547,7 @@ def login(email: str = Form(...), password: str = Form(...)):
 
 @app.get("/logout")
 def logout(request: Request):
-    sid = request.cookies.get("khoma_session")
-    SESSIONS.pop(sid, None)
+    destroy_session(request.cookies.get("khoma_session"))
     response = RedirectResponse("/login")
     response.delete_cookie("khoma_session")
     return response
@@ -1613,8 +1646,7 @@ def auth_google_callback(code: str = ""):
 
     con.close()
 
-    sid = secrets.token_urlsafe(32)
-    SESSIONS[sid] = user["id"]
+    sid = create_session(user["id"])
     response = RedirectResponse("/dashboard", status_code=302)
     response.set_cookie(
         "khoma_session",
@@ -1925,35 +1957,34 @@ def risk_page(request: Request):
         return RedirectResponse("/login")
 
     content = f'''
-    <div class="header"><div><h2>Risk Engine</h2><p>Control max size, allowed symbols, daily order limits, duplicate locks, and execution mode.</p></div></div>
+    <div class="header"><div><h2>Risk Engine</h2><p>Daily order limits and duplicate protection. KhomaAPI trades exactly the symbol and quantity each TradingView alert sends — no symbol list or size cap to maintain.</p></div></div>
+    <div class="card span6"><h3>Webhook Secret</h3><p class="muted">This is your account's signing key. It is included automatically in the Webhooks JSON you copy — you don't set it and can't change it.</p><div class="keybox"><span>{user['webhook_secret']}</span></div></div>
     <div class="card"><form method="post" action="/risk/save"><div class="formgrid">
-      <div><label>Webhook Secret</label><input name="webhook_secret" value="{user['webhook_secret']}"></div>
-      <div><label>Allowed Symbols</label><input name="allowed_symbols" value="{user['allowed_symbols']}"><p class="muted">Use * to allow any TradingView symbol.</p></div>
-      <div><label>Max Contracts Per Order</label><input name="max_contracts" value="{user['max_contracts']}"></div>
-      <div><label>Max Orders Per Day</label><input name="max_orders" value="{user['max_orders']}"></div>
-      <div><label>Duplicate Lock Seconds</label><input name="duplicate_seconds" value="{user['duplicate_seconds']}"></div>
-      <div><label>Max Rejections Per Day</label><input name="max_rejections_per_day" value="{user['max_rejections_per_day']}"></div>
-      <div><label>Execution Mode</label><select name="live_mode"><option value="simulation" {'selected' if user['live_mode']=='simulation' else ''}>Simulation Only</option><option value="live" {'selected' if user['live_mode']=='live' else ''}>Live Broker Orders</option></select></div>
+      <div><label>Max Orders Per Day</label><input name="max_orders" value="{user['max_orders']}"><p class="muted">Hard daily cap across all symbols.</p></div>
+      <div><label>Duplicate Lock Seconds</label><input name="duplicate_seconds" value="{user['duplicate_seconds']}"><p class="muted">Blocks identical repeat alerts within this window.</p></div>
+      <div><label>Max Rejections Per Day</label><input name="max_rejections_per_day" value="{user['max_rejections_per_day']}"><p class="muted">Auto-locks automation after this many broker rejections.</p></div>
     </div><button>Save Risk Settings</button></form></div>
     '''
     return layout(content, user, "risk")
 
 
 @app.post("/risk/save")
-def risk_save(request: Request, webhook_secret: str = Form(...), allowed_symbols: str = Form(...), max_contracts: int = Form(...), max_orders: int = Form(...), duplicate_seconds: int = Form(...), max_rejections_per_day: int = Form(...), live_mode: str = Form(...)):
+def risk_save(request: Request, max_orders: int = Form(...), duplicate_seconds: int = Form(...), max_rejections_per_day: int = Form(...)):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
+    # webhook_secret, symbols, contract size and execution mode are intentionally
+    # NOT user-editable: the secret is fixed, every symbol is allowed, and size
+    # comes from the alert.
     con = db()
     con.execute(
         """
         UPDATE users
-        SET webhook_secret=?, allowed_symbols=?, max_contracts=?, max_orders=?,
-            duplicate_seconds=?, max_rejections_per_day=?, live_mode=?
+        SET max_orders=?, duplicate_seconds=?, max_rejections_per_day=?
         WHERE id=?
         """,
-        (webhook_secret, allowed_symbols, max_contracts, max_orders, duplicate_seconds, max_rejections_per_day, live_mode, user["id"]),
+        (max(1, int(max_orders)), max(0, int(duplicate_seconds)), max(1, int(max_rejections_per_day)), user["id"]),
     )
     con.commit()
     con.close()
@@ -2039,40 +2070,9 @@ def settings_page(request: Request):
       
 <div class="card span6">
   <h3>Account Management</h3>
-
-  <div class="google-box">
-
-    <div style="margin-bottom:22px;">
-      <p class="muted" style="margin-bottom:8px;"><b>Current Plan</b></p>
-      <div class="pill">KhomaAPI Professional</div>
-    </div>
-
-    <div style="margin-bottom:22px;">
-      <p class="muted" style="margin-bottom:8px;"><b>Subscription Status</b></p>
-      <div class="pill good">Active</div>
-    </div>
-
-    <div style="margin-bottom:22px;">
-      <p class="muted" style="margin-bottom:8px;"><b>Automation Status</b></p>
-      <div class="pill">{user['automation_status']}</div>
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:10px;">
-
-      <a class="btn secondary" href="/billing">
-        Change Payment Method
-      </a>
-
-      <a class="btn secondary" href="/subscription/cancel">
-        Cancel Subscription
-      </a>
-
-      <a class="btn secondary" href="/logout">
-        Logout From Account
-      </a>
-
-    </div>
-
+  <p class="muted">You're signed in as <b>{user['email']}</b>.</p>
+  <div style="margin-top:18px;">
+    <a class="btn danger" href="/logout">Log Out</a>
   </div>
 </div>
 
