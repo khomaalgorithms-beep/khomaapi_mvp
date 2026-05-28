@@ -355,8 +355,15 @@ def init_db():
     ensure_column("email_verifications", "kind", "TEXT DEFAULT 'change_email'")
     ensure_column("email_verifications", "payload", "TEXT")
     ensure_column("broker_accounts", "in_copy_box", "INTEGER DEFAULT 0")
+    # Account grouping: 'independent' (Available — traded per-account) or
+    # 'copy' (Copy Trading — every master signal mirrored across the group).
+    ensure_column("broker_accounts", "group_type", "TEXT DEFAULT 'independent'")
     ensure_column("trades", "fill_price", "REAL")
     ensure_column("trades", "pnl", "REAL")
+
+    # Backfill group_type from the legacy in_copy_box flag, then normalize nulls.
+    cur.execute("UPDATE broker_accounts SET group_type='copy' WHERE in_copy_box=1 AND (group_type IS NULL OR group_type='independent')")
+    cur.execute("UPDATE broker_accounts SET group_type='independent' WHERE group_type IS NULL OR group_type=''")
 
     con.commit()
     con.close()
@@ -628,15 +635,32 @@ def upsert_trade_note(user_id: int, trade_id: int, note: str, image_path: Option
 # ============================================================
 
 def get_copy_accounts(user_id: int):
-    """Connected accounts the user dragged into the Copy Trading box."""
-    return [a for a in get_broker_accounts(user_id, connected_only=True) if a.get("in_copy_box")]
+    """Connected accounts in the Copy Trading group (group_type='copy').
+
+    Every master signal is mirrored 1:1 across all of these accounts.
+    """
+    return [a for a in get_broker_accounts(user_id, connected_only=True)
+            if (a.get("group_type") or "independent") == "copy"]
 
 
-def set_copy_box(user_id: int, account_db_id: int, in_box: bool) -> None:
+def get_independent_accounts(user_id: int):
+    """Connected accounts in the Available group (group_type='independent').
+
+    These trade only signals explicitly routed to them by account name, so
+    different strategies can run on different accounts independently.
+    """
+    return [a for a in get_broker_accounts(user_id, connected_only=True)
+            if (a.get("group_type") or "independent") != "copy"]
+
+
+def set_account_group(user_id: int, account_db_id: int, group_type: str) -> None:
+    """Move one account into 'independent' (Available) or 'copy' (Copy Trading)."""
+    group_type = "copy" if str(group_type).lower() == "copy" else "independent"
     con = db()
+    # Keep the legacy in_copy_box flag in sync so older reads stay consistent.
     con.execute(
-        "UPDATE broker_accounts SET in_copy_box=? WHERE id=? AND user_id=?",
-        (1 if in_box else 0, account_db_id, user_id),
+        "UPDATE broker_accounts SET group_type=?, in_copy_box=? WHERE id=? AND user_id=?",
+        (group_type, 1 if group_type == "copy" else 0, account_db_id, user_id),
     )
     con.commit()
     con.close()
@@ -686,17 +710,57 @@ def flatten_on_account(account: dict, symbol: str) -> list:
     return results
 
 
-def copy_trade_execute(user_id: int, symbol: str, side: str, qty: int) -> dict:
-    """Mirror a signal one-to-one to every account in the Copy Trading box."""
-    boxed = get_copy_accounts(user_id)
+def reverse_on_account(account: dict, symbol: str, qty: int) -> dict:
+    """Flip the current position on one account to the opposite side in a single
+    order: a long becomes short (and vice-versa) with `qty` contracts. If the
+    account is flat there is nothing to reverse, so this is a no-op."""
+    token = dec(account["access_token_enc"]) if account.get("access_token_enc") else ""
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return {"account": account.get("account_name"), "ok": False, "error": "Reconnect required"}
+
+    root = symbol_root(str(symbol).upper())
+    for p in (tvo.get_positions(env, token) or []):
+        if str(p.get("accountId")) != str(acct_id):
+            continue
+        net = int(p.get("netPos") or 0)
+        if net == 0:
+            continue
+        cname = ((tvo.get_contract(env, token, p.get("contractId")) or {}).get("name") or "").upper()
+        if root and symbol_root(cname) != root:
+            continue
+        # Close the existing position AND open the same qty the opposite way.
+        action = "Sell" if net > 0 else "Buy"
+        order_qty = abs(net) + max(1, int(qty))
+        resp = tvo.place_order(env, token, account.get("account_name"), acct_id, action, cname or symbol, order_qty)
+        return {"account": account.get("account_name"), "ok": _order_ok(resp), "response": resp}
+
+    return {"account": account.get("account_name"), "ok": False, "skipped": True,
+            "error": "No open position to reverse."}
+
+
+def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
+    """Place (flatten / reverse / buy / sell) the same order on each account."""
     results = []
-    for a in boxed:
+    for a in accounts:
         if side == "flatten":
             results += flatten_on_account(a, symbol)
+        elif side == "reverse":
+            results.append(reverse_on_account(a, symbol, qty))
         else:
             results.append(place_order_on_account(a, side, symbol, qty))
     placed = sum(1 for r in results if r.get("ok"))
-    return {"results": results, "placed": placed, "total": len(results), "accounts": len(boxed)}
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
+def find_connected_account(user_id: int, account_name: str):
+    """Resolve a connected account by its (case-insensitive) Tradovate name."""
+    name = (account_name or "").strip().lower()
+    for a in get_broker_accounts(user_id, connected_only=True):
+        if (a.get("account_name") or "").strip().lower() == name:
+            return a
+    return None
 
 
 # ============================================================
@@ -1422,6 +1486,9 @@ def normalize_side(side: str) -> str:
     if s in ["flat", "flatten", "close", "exit", "close_all", "strategy.close", "strategy.exit"]:
         return "flatten"
 
+    if s in ["reverse", "flip", "reverse_position"]:
+        return "reverse"
+
     raise Exception(f"Unsupported side/action: {side}")
 
 
@@ -1513,7 +1580,9 @@ def layout(content, user=None, active="dashboard"):
     email = user["email"] if user else "Guest"
     initials = email[:1].upper() if email else "K"
     status = user["automation_status"] if user else "Paused"
-    mode = user["live_mode"].upper() if user else "SIMULATION"
+    live = status == "Running"
+    status_label = "Live" if live else "Paused"
+    status_pill_cls = "pill" if live else "pill gray"
 
     return f"""
 <!DOCTYPE html>
@@ -1618,8 +1687,8 @@ document.addEventListener("click", function(event) {{
 </aside>
 <main class="main">
   <div class="topbar">
-    <div class="top-left"><b>{email}</b><span>KhomaAlgorithms client workspace</span></div>
-    <div class="top-actions"><span class="pill">● {status}</span><span class="pill gray">{mode}</span>
+    <div class="top-left"><b>{email}</b><span>TradingView automation workspace</span></div>
+    <div class="top-actions"><span class="{status_pill_cls}">● {status_label}</span>
 <div style="position:relative;">
   <div class="avatar" onclick="toggleProfileMenu()" style="cursor:pointer;">{initials}</div>
 
@@ -2073,7 +2142,6 @@ def dashboard(request: Request):
     running = user["automation_status"] == "Running"
     state_label = "ON" if running else "OFF"
     state_class = "good" if running else "bad"
-    mode = user["live_mode"].upper()
 
     trade_rows = "".join([
         f"<tr><td>{t['ts'][:19]}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['status']}</td><td>{t['mode']}</td><td>{t['latency_ms']}ms</td></tr>"
@@ -2090,7 +2158,7 @@ def dashboard(request: Request):
 
     content = f'''
     <div class="header">
-      <div><h2>Execution Dashboard</h2><p>System is <b class="{state_class}">{state_label}</b> · Mode: <b>{mode}</b> · Orders today: <b>{today_order_count(user['id'])}</b></p></div>
+      <div><h2>Execution Dashboard</h2><p>System is <b class="{state_class}">{state_label}</b> · Orders today: <b>{today_order_count(user['id'])}</b></p></div>
       <div>{start_btn}{pause_btn}</div>
     </div>
 
@@ -2176,10 +2244,14 @@ def broker_page(request: Request):
             f'</div>'
         )
 
-    available_chips = "".join(chip(a) for a in accounts if not a.get("in_copy_box"))
-    box_chips = "".join(chip(a) for a in accounts if a.get("in_copy_box"))
+    def is_copy(a):
+        return (a.get("group_type") or "independent") == "copy"
+
+    available_chips = "".join(chip(a) for a in accounts if not is_copy(a))
+    box_chips = "".join(chip(a) for a in accounts if is_copy(a))
     connected_count = len(accounts)
-    box_count = sum(1 for a in accounts if a.get("in_copy_box"))
+    box_count = sum(1 for a in accounts if is_copy(a))
+    available_count = connected_count - box_count
 
     if not accounts:
         zones_html = "<p class='muted'>No accounts connected yet. Click \"Connect with Tradovate\" to log in and import your accounts.</p>"
@@ -2187,33 +2259,33 @@ def broker_page(request: Request):
         zones_html = f'''
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
           <div>
-            <h4 style="margin:0 0 6px">Available Accounts</h4>
+            <h4 style="margin:0 0 6px">Available Accounts <span class="pill gray">INDEPENDENT</span></h4>
             <div id="zone-available" class="dropzone" data-box="0" style="min-height:120px;border:2px dashed #e5e7eb;border-radius:16px;padding:10px;">
               <div class="chips">{available_chips}</div>
-              <p class="empty muted" style="text-align:center;padding:18px 0;">Drag accounts here to remove from copy trading.</p>
+              <p class="empty muted" style="text-align:center;padding:18px 0;">Tradable accounts that run independently. Each one executes only alerts routed to it by name, so different strategies can run on different accounts. Drag an account here to remove it from copy trading.</p>
             </div>
           </div>
           <div>
-            <h4 style="margin:0 0 6px">Copy Trading Box <span class="pill" style="background:#fee2e2;color:#b91c1c;border-color:#fecaca;">LIVE</span></h4>
+            <h4 style="margin:0 0 6px">Copy Trading Accounts <span class="pill" style="background:#fee2e2;color:#b91c1c;border-color:#fecaca;">LIVE</span></h4>
             <div id="zone-box" class="dropzone" data-box="1" style="min-height:120px;border:2px dashed #cdebd8;border-radius:16px;padding:10px;background:#f7fdf9;">
               <div class="chips">{box_chips}</div>
-              <p class="empty muted" style="text-align:center;padding:18px 0;">Drag accounts here. Every TradingView signal is mirrored 1:1 to these accounts as real market orders.</p>
+              <p class="empty muted" style="text-align:center;padding:18px 0;">Every master signal (an alert with no specific account) is mirrored 1:1 across all accounts here as real market orders. Independent accounts are unaffected.</p>
             </div>
           </div>
         </div>
         '''
 
     content = f'''
-    <div class="header"><div><h2>Broker Connection</h2><p>Log in with Tradovate to connect your cash, live, and prop firm accounts, then drag the ones you want traded into the Copy Trading box.</p></div></div>
+    <div class="header"><div><h2>Broker Connection</h2><p>Log in with Tradovate to connect your cash, live, and prop firm accounts, then organize them into Available Accounts (independent execution) or Copy Trading Accounts (mirrored master signals).</p></div></div>
     <div class="grid">
       {banner}
       <div class="card span5"><h3>Connection Status</h3>
         <div class="metric {'good' if connected_count else 'bad'}">{connected_count} Connected</div>
-        <p class="muted">{box_count} account(s) in the Copy Trading box. Connect through Tradovate's secure login — KhomaAPI never sees your password.</p>
+        <p class="muted">{available_count} available (independent) · {box_count} in copy trading. Connect through Tradovate's secure login — KhomaAPI never sees your password.</p>
         <a class="btn" href="/auth/tradovate/connect">Connect with Tradovate</a>
       </div>
-      <div class="card span7"><h3>Accounts &amp; Copy Trading</h3>
-        <p class="muted">Accounts in the <b>LIVE</b> box receive real orders mirrored from your TradingView alerts. Empty box = simulation only.</p>
+      <div class="card span7"><h3>Account Groups</h3>
+        <p class="muted">Drag accounts between the two groups. <b>Available Accounts</b> trade independently; <b>Copy Trading Accounts</b> all receive the same master signal. The two systems run simultaneously and never interfere.</p>
         {zones_html}
       </div>
     </div>
@@ -2226,7 +2298,8 @@ def broker_copy_set(request: Request, account_id: int = Form(...), in_box: str =
     user = require_user(request)
     if not user:
         return JSONResponse(status_code=401, content={"ok": False, "error": "Not logged in"})
-    set_copy_box(user["id"], account_id, in_box in ("1", "true", "True", "on"))
+    group_type = "copy" if in_box in ("1", "true", "True", "on") else "independent"
+    set_account_group(user["id"], account_id, group_type)
     return {"ok": True}
 
 
@@ -2331,13 +2404,25 @@ def webhooks_page(request: Request):
         "request_id": "{{strategy.order.id}}"
     }, indent=2)
 
+    routed_example = json.dumps({
+        "client_id": user["email"],
+        "auth": user["webhook_secret"],
+        "symbol": "{{ticker}}",
+        "side": "{{strategy.order.action}}",
+        "qty": "{{strategy.order.contracts}}",
+        "request_id": "{{strategy.order.id}}",
+        "account": "YourTradovateAccountName"
+    }, indent=2)
+
     content = f'''
-    <div class="header"><div><h2>TradingView Webhooks</h2><p>Copy this URL and dynamic JSON into your TradingView alert.</p></div></div>
+    <div class="header"><div><h2>TradingView Webhooks</h2><p>Works with ANY TradingView Pine Script strategy — copy this URL and JSON into your alert.</p></div></div>
     <div class="grid">
       <div class="card span12"><h3>Webhook URL</h3><div class="keybox"><span id="webhook-url">{webhook_url}</span><button onclick="copyText('webhook-url')">Copy</button></div></div>
-      <div class="card span7"><h3>Dynamic TradingView JSON</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button></div>
-      <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste webhook URL.<br>4. Paste dynamic JSON.<br>5. Your strategy controls buy/sell/qty/symbol automatically.</p><div class="copy-note">Each client uses the same endpoint, but unique client_id + secret. Accounts do not intersect.</div></div>
-      <div class="card span12"><h3>Manual Alert Format</h3><p class="muted">For manual alerts, set side to buy, sell, or flatten. Symbol can be any exact Tradovate contract symbol like MNQM6, MESM6, MYMM6, etc.</p></div>
+      <div class="card span7"><h3>Dynamic TradingView JSON (master / copy signal)</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button><p class="muted">No <code>account</code> field = master signal, mirrored across all Copy Trading Accounts.</p></div>
+      <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open any TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste the webhook URL.<br>4. Paste the JSON below.<br>5. Your strategy controls action / qty / symbol automatically.</p><div class="copy-note">Each client uses the same endpoint with a unique client_id + secret. Accounts never intersect between clients.</div></div>
+      <div class="card span7"><h3>Route to one Independent account</h3><pre class="codebox" id="json-routed">{routed_example}</pre><button onclick="copyText('json-routed')">Copy JSON</button><p class="muted">Add an <code>account</code> field (exact Tradovate account name) to trade ONLY that Available account — different strategies can target different accounts.</p></div>
+      <div class="card span5"><h3>Supported Actions</h3><p class="muted"><b>side</b> accepts: <code>buy</code>, <code>sell</code>, <code>close</code> (flatten), and <code>reverse</code> (flip position). Common Pine synonyms like <code>long</code>, <code>short</code>, <code>strategy.close</code> also work.</p><p class="muted">Any extra strategy-specific fields you include are accepted and ignored — alerts are never rejected for unknown parameters.</p></div>
+      <div class="card span12"><h3>Manual Alert Format</h3><p class="muted">For manual alerts, set <b>side</b> to buy, sell, close, or reverse. Symbol can be any exact Tradovate contract symbol such as MNQM6, MESM6, MYMM6, etc.</p></div>
     </div>
     '''
     return layout(content, user, "webhooks")
@@ -2432,7 +2517,7 @@ def logs(request: Request):
     content = f'''
     <div class="header"><div><h2>Trade Logs</h2><p>Exact entry, exit and realized PnL per trade (from broker fills), plus the raw execution log.</p></div></div>
     {history_html}
-    <div class="card"><h3>Execution Log</h3><p class="muted">Every accepted, rejected, simulated, and live order request KhomaAPI routed.</p><table><tr><th>Time</th><th>Request ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Status</th><th>Latency</th><th>Message</th></tr>{rows}</table></div>
+    <div class="card"><h3>Execution Log</h3><p class="muted">Every order request KhomaAPI routed — executed, rejected, and unrouted.</p><table><tr><th>Time</th><th>Request ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Status</th><th>Latency</th><th>Message</th></tr>{rows}</table></div>
     '''
     return layout(content, user, "logs")
 
@@ -2630,8 +2715,6 @@ def flatten_post(request: Request, symbol: str = Form(...)):
 
     start_time = time.perf_counter()
     try:
-        if user["live_mode"] != "live":
-            raise Exception("Flatten blocked because account is in simulation mode.")
         broker_connection_check(user["id"])
         result = safe_flatten_symbol(user["id"], symbol.upper())
         latency = round((time.perf_counter() - start_time) * 1000, 3)
@@ -2651,12 +2734,21 @@ def flatten_post(request: Request, symbol: str = Form(...)):
 # ============================================================
 
 class WebhookTrade(BaseModel):
+    # Generic TradingView webhook contract — works with ANY Pine Script strategy.
+    # `side` accepts buy / sell / close / reverse (and common Pine synonyms).
+    # Any extra strategy-specific fields are accepted and ignored (not rejected).
+    model_config = {"extra": "allow"}
+
     client_id: str
     auth: str
     symbol: str
     side: str
     qty: Optional[Any] = 1
     request_id: Optional[str] = None
+    # Optional: route this alert to ONE specific connected account (independent
+    # strategy). When omitted, the alert is treated as a master signal and
+    # mirrored across every account in the Copy Trading group.
+    account: Optional[str] = None
 
 
 class WebhookFlatten(BaseModel):
@@ -2739,23 +2831,43 @@ def webhook_trade(payload: WebhookTrade):
         return JSONResponse(status_code=200, content={"ok": False, "error": "Client not found."})
 
     try:
-        symbol, side, qty = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, request_id)
+        target_name = (payload.account or "").strip()
 
-        # Execution is driven by the Copy Trading box: accounts dragged in get
-        # the order mirrored one-to-one. No boxed accounts => simulation only.
-        boxed = get_copy_accounts(user["id"])
-        if boxed:
-            response = copy_trade_execute(user["id"], symbol, side, qty)
-            mode = "live"
-            action = "COPIED"
-            status = "EXECUTED" if response["placed"] > 0 or response["total"] == 0 else "REJECTED"
-            message = f"Copied to {response['placed']}/{response['total']} order(s) across {response['accounts']} account(s)."
+        # Dedup is scoped per target so the same strategy alert can hit different
+        # accounts without one blocking the other.
+        dedup_id = f"{target_name}|{request_id}" if target_name else request_id
+        symbol, side, qty = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, dedup_id)
+
+        # Routing (independent and copy systems run side-by-side, never crossing):
+        #   - account specified  -> INDEPENDENT: trade ONLY that one account
+        #   - no account         -> MASTER signal: mirror to the Copy Trading group
+        # An account-routed alert never touches the copy group, and a master
+        # signal never touches independent accounts.
+        if target_name:
+            acct = find_connected_account(user["id"], target_name)
+            if not acct:
+                raise Exception(f"Account '{target_name}' is not connected.")
+            accounts = [acct]
+            route = "ROUTED"
         else:
-            response = {"simulated": True, "symbol": symbol, "side": side, "qty": qty}
-            action = "SIMULATED"
-            mode = "simulation"
-            status = "SIMULATED"
-            message = "No accounts in the Copy Trading box — simulated only."
+            accounts = get_copy_accounts(user["id"])
+            route = "COPIED"
+
+        if accounts:
+            response = execute_to_accounts(accounts, symbol, side, qty)
+            mode = "live"
+            action = route
+            status = "EXECUTED" if (response["placed"] > 0 or response["total"] == 0) else "REJECTED"
+            scope = f"account {target_name}" if target_name else f"{response['accounts']} copy account(s)"
+            message = f"{route.title()} {response['placed']}/{response['total']} order(s) to {scope}."
+        else:
+            # No destination: either an unrecognized account was named, or this
+            # was a master signal with an empty Copy Trading group.
+            response = {"routed": False, "symbol": symbol, "side": side, "qty": qty}
+            action = "NO_ROUTE"
+            mode = "live"
+            status = "NO_ROUTE"
+            message = "No destination account — add accounts to the Copy Trading group or route the alert to a specific account."
 
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], request_id, symbol, side, qty, mode, status, latency, message, response)
@@ -2800,8 +2912,6 @@ def webhook_flatten(payload: WebhookFlatten):
     try:
         if payload.auth != user["webhook_secret"]:
             raise Exception("Invalid webhook secret.")
-        if user["live_mode"] != "live":
-            raise Exception("Flatten blocked in simulation mode.")
         broker_connection_check(user["id"])
         result = safe_flatten_symbol(user["id"], payload.symbol.upper())
         latency = round((time.perf_counter() - start_time) * 1000, 3)
