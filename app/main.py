@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from cryptography.fernet import Fernet
 import os
 import httpx
@@ -18,7 +18,7 @@ import time
 
 import requests
 
-from app.tradovate_oauth import build_tradovate_login
+from app.tradovate_oauth import build_tradovate_login, exchange_code_for_token, fetch_accounts
 import re
 import smtplib
 
@@ -29,28 +29,6 @@ from email_validator import validate_email, EmailNotValidError
 
 
 app = FastAPI(title="KhomaAPI v5")
-
-# AUTO CREATE BROKER TABLE
-conn = sqlite3.connect("database.db")
-
-conn.executescript("""
-DROP TABLE IF EXISTS broker_connections;
-
-CREATE TABLE broker_connections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_username TEXT,
-    broker_password TEXT,
-    access_token TEXT
-);
-""")
-
-conn.commit()
-conn.close()
-
-conn.commit()
-conn.close()
-
-
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -73,7 +51,9 @@ def debug_static():
         "files": os.listdir(STATIC_DIR) if os.path.exists(STATIC_DIR) else []
     }
 
-DB_PATH = BASE_DIR / "khomaapi_v31.db"
+# Allow overriding the DB location (e.g. a Railway persistent volume at /data)
+# so data survives redeploys. Defaults to the bundled file for local dev.
+DB_PATH = Path(os.getenv("KHOMA_DB_PATH", str(BASE_DIR / "khomaapi_v31.db")))
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
 
 if not KEY_PATH.exists():
@@ -81,6 +61,10 @@ if not KEY_PATH.exists():
 FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 
 SESSIONS: Dict[str, int] = {}
+
+# Maps a short-lived OAuth `state` value -> user_id, so the Tradovate
+# callback can be tied back to the user who started the connect flow.
+OAUTH_STATES: Dict[str, int] = {}
 
 APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
 
@@ -315,27 +299,28 @@ def init_db():
     )
     """)
 
+    # Tradovate OAuth connections. One row per connected brokerage account
+    # (a single OAuth login can expose several accounts: demo, live, prop).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS broker_accounts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        broker TEXT DEFAULT 'tradovate',
+        env TEXT DEFAULT 'live',
+        account_id TEXT,
+        account_name TEXT,
+        account_type TEXT,
+        access_token_enc TEXT,
+        token_expires_at TEXT,
+        status TEXT DEFAULT 'connected',
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(user_id, account_id)
+    )
+    """)
 
     con.commit()
     con.close()
-
-    try:
-        import asyncio
-
-        asyncio.create_task(
-            manager.broadcast({
-                "event": "trade",
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "status": status,
-                "latency_ms": latency_ms,
-                "message": message,
-                "time": datetime.now(timezone.utc).isoformat()
-            })
-        )
-    except Exception:
-        pass
 
 
 init_db()
@@ -422,6 +407,64 @@ def get_broker(user_id: int) -> Optional[Dict[str, Any]]:
     broker["sec"] = dec(broker.get("sec_enc"))
     broker["access_token"] = dec(broker.get("access_token_enc")) if broker.get("access_token_enc") else ""
     return broker
+
+
+def save_broker_account(user_id: int, env: str, account: Dict[str, Any], token: str, expires_at: str) -> None:
+    """Insert or update one Tradovate account for a user (idempotent on account_id)."""
+    account_id = str(account.get("id") or account.get("accountId") or "")
+    account_name = str(account.get("name") or account.get("nickname") or account_id)
+    account_type = str(account.get("accountType") or account.get("legalStatus") or "")
+    now = datetime.now(timezone.utc).isoformat()
+
+    con = db()
+    con.execute(
+        """
+        INSERT INTO broker_accounts
+            (user_id, broker, env, account_id, account_name, account_type,
+             access_token_enc, token_expires_at, status, created_at, updated_at)
+        VALUES (?, 'tradovate', ?, ?, ?, ?, ?, ?, 'connected', ?, ?)
+        ON CONFLICT(user_id, account_id) DO UPDATE SET
+            env=excluded.env,
+            account_name=excluded.account_name,
+            account_type=excluded.account_type,
+            access_token_enc=excluded.access_token_enc,
+            token_expires_at=excluded.token_expires_at,
+            status='connected',
+            updated_at=excluded.updated_at
+        """,
+        (user_id, env, account_id, account_name, account_type,
+         enc(token), expires_at, now, now),
+    )
+    con.commit()
+    con.close()
+
+
+def get_broker_accounts(user_id: int, connected_only: bool = False):
+    con = db()
+    if connected_only:
+        rows = con.execute(
+            "SELECT * FROM broker_accounts WHERE user_id=? AND status='connected' ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM broker_accounts WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def disconnect_broker_account(user_id: int, row_id: int) -> bool:
+    con = db()
+    cur = con.execute(
+        "DELETE FROM broker_accounts WHERE id=? AND user_id=?",
+        (row_id, user_id),
+    )
+    con.commit()
+    deleted = cur.rowcount > 0
+    con.close()
+    return deleted
 
 
 def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
@@ -1473,24 +1516,63 @@ def broker_page(request: Request):
     if not user:
         return RedirectResponse("/login")
 
-    con = db()
-    broker = con.execute("SELECT * FROM brokers WHERE user_id=?", (user["id"],)).fetchone()
-    con.close()
+    accounts = get_broker_accounts(user["id"])
+
+    banner = ""
+    if request.query_params.get("connected"):
+        banner = "<div class='card span12'><p class='good'>Tradovate accounts connected successfully.</p></div>"
+    elif request.query_params.get("error"):
+        err = request.query_params.get("error")
+        banner = f"<div class='card span12'><p class='bad'>OAuth error: {err}</p></div>"
+
+    if accounts:
+        rows = "".join([
+            f"""<tr>
+                <td><b>{a['account_name']}</b></td>
+                <td>{(a['account_type'] or '').upper() or '-'}</td>
+                <td>{(a['env'] or '').upper()}</td>
+                <td><span class="good">connected</span></td>
+                <td><form method="post" action="/broker/disconnect/{a['id']}" style="margin:0">
+                    <button class="btn secondary">Disconnect</button></form></td>
+            </tr>"""
+            for a in accounts
+        ])
+        accounts_table = f"""
+        <table>
+          <tr><th>Account</th><th>Type</th><th>Env</th><th>Status</th><th></th></tr>
+          {rows}
+        </table>"""
+    else:
+        accounts_table = "<p class='muted'>No accounts connected yet. Click \"Connect with Tradovate\" to log in and import your accounts.</p>"
+
+    connected_count = len(accounts)
 
     content = f'''
-    <div class="header"><div><h2>Broker Connection</h2><p>Client only enters Tradovate username and password. KhomaAPI handles all technical API fields automatically.</p></div></div>
+    <div class="header"><div><h2>Broker Connection</h2><p>Log in with Tradovate to connect your cash, live, and prop firm accounts. Each connected account can run automation.</p></div></div>
     <div class="grid">
-      <div class="card span5"><h3>Connection Status</h3><div class="metric {'good' if broker['connected'] else 'bad'}">{'Connected' if broker['connected'] else 'Disconnected'}</div><p class="muted">Last test: {broker['last_test'] or 'Not tested'}<br>Last error: {broker['last_error'] or 'None'}<br>Detected account: <b>{broker['account_spec'] or 'None yet'}</b></p><a class="btn secondary" href="/broker/test">Retest Connection</a></div>
-      <div class="card span7"><h3>Connect Tradovate</h3><p class="muted">Enter Tradovate login. KhomaAPI auto-detects account ID and account spec from Tradovate.</p>
-      <form method="post" action="/broker/connect"><div class="formgrid">
-        <div><label>Environment</label><select name="env"><option value="demo" {'selected' if broker['env']=='demo' else ''}>Demo</option><option value="live" {'selected' if broker['env']=='live' else ''}>Live</option></select></div>
-        <div><label>Tradovate Username</label><input name="username" placeholder="Tradovate username" required></div>
-        <div><label>Tradovate Password</label><input name="password" type="password" placeholder="Tradovate password" required></div>
-      </div><button>Connect Broker</button><a class="btn secondary" href="/auth/tradovate/connect">Test OAuth Connect</a></form>
-      <p class="muted">Live API accounts must have API access enabled. Prop/evaluation accounts may require vendor approval.</p></div>
+      {banner}
+      <div class="card span5"><h3>Connection Status</h3>
+        <div class="metric {'good' if connected_count else 'bad'}">{connected_count} Connected</div>
+        <p class="muted">Connect through Tradovate's secure login. KhomaAPI never sees your Tradovate password.</p>
+        <a class="btn" href="/auth/tradovate/connect">Connect with Tradovate</a>
+      </div>
+      <div class="card span7"><h3>Connected Accounts</h3>
+        <p class="muted">All Tradovate accounts imported from your login appear here.</p>
+        {accounts_table}
+      </div>
     </div>
     '''
     return layout(content, user, "broker")
+
+
+@app.post("/broker/disconnect/{account_id}")
+def broker_disconnect(request: Request, account_id: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    disconnect_broker_account(user["id"], account_id)
+    return RedirectResponse("/broker", status_code=302)
 
 
 @app.post("/broker/connect")
@@ -1841,73 +1923,61 @@ class WebhookFlatten(BaseModel):
 
 
 @app.get("/auth/tradovate/connect")
-def tradovate_connect():
+def tradovate_connect(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
 
-    login_url = build_tradovate_login()
+    # Tie this OAuth attempt to the logged-in user via an unguessable state token.
+    state = secrets.token_urlsafe(24)
+    OAUTH_STATES[state] = user["id"]
 
-    return RedirectResponse(login_url)
-
+    return RedirectResponse(build_tradovate_login(state))
 
 
 @app.get("/oauth/callback")
-def oauth_callback(request: Request, code: str = ""):
+def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error:
+        return RedirectResponse(f"/broker?error={error}", status_code=302)
 
-    try:
-        if not code:
-            return {"ok": False, "error": "Missing OAuth code"}
+    if not code:
+        return RedirectResponse("/broker?error=missing_code", status_code=302)
 
-        conn = db()
-        conn.execute("""
-        DROP TABLE IF EXISTS broker_connections;
+    # Resolve which user started this flow: state map first, session cookie as fallback.
+    user_id = OAUTH_STATES.pop(state, None)
+    if user_id is None:
+        user = current_user(request)
+        if user:
+            user_id = user["id"]
+    if user_id is None:
+        return RedirectResponse("/login", status_code=302)
 
-CREATE TABLE broker_connections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_username TEXT,
-    broker_password TEXT,
-    access_token TEXT
-)
-        """)
-        conn.commit()
-        conn.close()
+    token_result = exchange_code_for_token(code)
+    if not token_result.get("ok"):
+        return JSONResponse(status_code=400, content=token_result)
 
-        payload = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": os.getenv("TRADOVATE_REDIRECT_URI"),
-            "client_id": os.getenv("TRADOVATE_CLIENT_ID") or os.getenv("TV_CID"),
-            "client_secret": os.getenv("TRADOVATE_CLIENT_SECRET") or os.getenv("TV_SECRET")
-        }
+    access_token = token_result["access_token"]
+    expires_in = token_result.get("expires_in", 0)
+    expires_at = (
+        (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+        if expires_in else ""
+    )
 
-        response = requests.post(
-            "https://live.tradovateapi.com/v1/auth/oauthtoken",
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20
+    accounts_result = fetch_accounts(access_token)
+    accounts = accounts_result.get("accounts") or []
+    env = accounts_result.get("env", "live")
+
+    if not accounts:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Connected, but no accounts returned.",
+                     "detail": accounts_result.get("error")},
         )
 
-        try:
-            data = response.json()
-        except Exception:
-            return {"ok": False, "error": "OAuth response not JSON", "raw": response.text}
+    for account in accounts:
+        save_broker_account(user_id, env, account, access_token, expires_at)
 
-        access_token = data.get("access_token") or data.get("accessToken")
-
-        if not access_token:
-            return {"ok": False, "error": "No access token returned", "response": data}
-
-        conn = db()
-        conn.execute("DELETE FROM broker_connections")
-        conn.execute(
-            "INSERT INTO broker_connections(access_token) VALUES(?)",
-            (access_token,)
-        )
-        conn.commit()
-        conn.close()
-
-        return RedirectResponse(url="/broker", status_code=302)
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return RedirectResponse(url="/broker?connected=1", status_code=302)
 
 
 @app.post("/webhook/trade")
@@ -2326,266 +2396,82 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-@app.get("/connected-accounts", response_class=HTMLResponse)
 
 
-@app.get("/connected-accounts", response_class=HTMLResponse)
-def connected_accounts():
+@app.get("/connected-accounts")
+def connected_accounts(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    return RedirectResponse("/broker")
 
-    login_url = build_tradovate_login()
-
-    return f"""
-    <html>
-
-    <head>
-    <title>KhomaAPI Accounts</title>
-
-    <style>
-
-    body {{
-        background:#0b1120;
-        color:white;
-        font-family:Arial;
-        padding:40px;
-    }}
-
-    .card {{
-        background:#111827;
-        border-radius:20px;
-        padding:30px;
-        max-width:900px;
-        margin:auto;
-    }}
-
-    .btn {{
-        background:#2563eb;
-        color:white;
-        padding:15px 25px;
-        border-radius:12px;
-        text-decoration:none;
-        display:inline-block;
-        margin-top:20px;
-        font-weight:bold;
-        border:none;
-        cursor:pointer;
-    }}
-
-    .metric {{
-        font-size:40px;
-        font-weight:bold;
-        margin-top:20px;
-    }}
-
-    </style>
-
-    </head>
-
-    <body>
-
-    <div class="card">
-
-    <h1>KhomaAPI Copy Trading</h1>
-
-    <p>
-    Connect multiple Tradovate accounts and execute trades across all accounts simultaneously.
-    </p>
-
-    <div class="metric">
-    0 Connected Accounts
-    </div>
-
-    <a class="btn" href="{login_url}">
-    Connect Tradovate
-    </a>
-
-    <br><br>
-
-    <button class="btn">
-    Start Copy Trading
-    </button>
-
-    </div>
-
-    </body>
-
-    </html>
-    """
-@app.get("/api/tradovate/accounts")
-async def get_tradovate_accounts():
-
-    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
-
-    if not access_token:
-        return {
-            "ok": False,
-            "error": "No Tradovate access token"
-        }
-
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-
-    async with httpx.AsyncClient() as client:
-
-        response = await client.get(
-            "https://demo-api.tradovate.com/v1/account/list",
-            headers=headers
-        )
-
-        return response.json()
-
-import os
-import httpx
 
 @app.get("/api/tradovate/accounts")
-async def get_tradovate_accounts():
+def api_tradovate_accounts(request: Request):
+    user = require_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Not logged in"})
 
-    access_token = os.getenv("TRADOVATE_ACCESS_TOKEN")
-
-    if not access_token:
-        return {
-            "ok": False,
-            "error": "No Tradovate token"
-        }
-
-    headers = {
-        "Authorization": f"Bearer {access_token}"
+    accounts = get_broker_accounts(user["id"])
+    return {
+        "ok": True,
+        "count": len(accounts),
+        "accounts": [
+            {
+                "id": a["id"],
+                "account_id": a["account_id"],
+                "name": a["account_name"],
+                "type": a["account_type"],
+                "env": a["env"],
+                "status": a["status"],
+            }
+            for a in accounts
+        ],
     }
-
-    async with httpx.AsyncClient() as client:
-
-        response = await client.get(
-            "https://demo-api.tradovate.com/v1/account/list",
-            headers=headers
-        )
-
-        return response.json()
-
 
 
 @app.get("/debug/accounts")
-def debug_accounts():
-
-    try:
-        token, cfg = tradovate_login(1)
-
-        response = requests.get(
-            f"{tradovate_base('live')}/account/list",
-            headers=tv_headers(token),
-            timeout=15,
-        )
-
-        try:
-            data = response.json()
-        except:
-            data = {"raw": response.text}
-
-        return {
-            "status": response.status_code,
-            "list": data
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-
-@app.get("/debug/accounts")
-def debug_accounts():
-
-    try:
-        token, cfg = tradovate_login(1)
-
-        response = requests.get(
-            f"{tradovate_base('live')}/account/list",
-            headers=tv_headers(token),
-            timeout=15,
-        )
-
-        try:
-            data = response.json()
-        except Exception:
-            data = {"raw": response.text}
-
-        return {
-            "status": response.status_code,
-            "data": data
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
+def debug_accounts(request: Request):
+    user = require_user(request)
+    if not user:
+        return {"ok": False, "error": "Not logged in"}
+    return {"ok": True, "accounts": get_broker_accounts(user["id"])}
 
 
 @app.get("/create-broker-table")
 def create_broker_table():
-
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("""
-    DROP TABLE IF EXISTS broker_connections;
-
-CREATE TABLE broker_connections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_username TEXT,
-    broker_password TEXT,
-    access_token TEXT
-)
-    """)
-
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "table": "broker_connections created"}
+    # Safe + idempotent: ensures the table exists without ever dropping data.
+    init_db()
+    return {"ok": True, "table": "broker_accounts ensured"}
 
 
 @app.get("/oauth-test")
-def oauth_test():
+def oauth_test(request: Request):
+    user = require_user(request)
+    if not user:
+        return {"ok": False, "has_token": False, "error": "Not logged in"}
 
-    try:
+    accounts = get_broker_accounts(user["id"], connected_only=True)
+    has_token = any(a.get("access_token_enc") for a in accounts)
 
-        conn = db()
+    return {
+        "ok": True,
+        "has_token": has_token,
+        "connected_accounts": len(accounts),
+    }
 
-        row = conn.execute(
-            "SELECT * FROM broker_connections ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-        conn.close()
-
-        if not row:
-            return {"ok": False, "error": "No broker connection found"}
-
-        return {
-            "ok": True,
-            "access_token": row["access_token"][:25],
-            "environment": row["environment"]
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-
-
-
-import os
 
 @app.get("/debug/db-path")
 def debug_db_path():
-
     try:
-
-        db_path = os.path.abspath("database.db")
-
-        exists = os.path.exists(db_path)
-
+        con = db()
+        count = con.execute("SELECT COUNT(*) AS c FROM broker_accounts").fetchone()["c"]
+        con.close()
         return {
-            "db_path": db_path,
-            "exists": exists
+            "db_path": str(DB_PATH),
+            "exists": Path(DB_PATH).exists(),
+            "broker_accounts_rows": count,
         }
-
     except Exception as e:
-        return {
-            "error": str(e)
-        }
+        return {"db_path": str(DB_PATH), "error": str(e)}
 
