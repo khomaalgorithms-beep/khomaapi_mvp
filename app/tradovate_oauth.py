@@ -97,6 +97,30 @@ def exchange_code_for_token(code: str) -> dict:
     }
 
 
+def renew_access_token(env: str, token: str) -> dict:
+    """Renew a still-valid Tradovate access token. Must be called BEFORE the
+    current token expires — an already-expired token cannot be renewed and the
+    user must reconnect. Returns {"ok", "access_token", "expiration"} or error."""
+    try:
+        r = requests.get(
+            f"{_rest_base(env)}/auth/renewAccessToken",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"renew failed: {e}"}
+
+    new_token = data.get("accessToken") or data.get("access_token")
+    if not new_token:
+        return {"ok": False, "error": data}
+    return {
+        "ok": True,
+        "access_token": new_token,
+        "expiration": data.get("expirationTime") or data.get("expiration") or "",
+    }
+
+
 def fetch_accounts(access_token: str) -> dict:
     """List all Tradovate accounts visible to this token.
 

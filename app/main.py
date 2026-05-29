@@ -695,18 +695,82 @@ def _order_ok(resp) -> bool:
     )
 
 
-def place_order_on_account(account: dict, action: str, symbol: str, qty: int) -> dict:
+def _broker_error_text(resp) -> str:
+    """Human-readable reason an order was not placed. Detects auth failures so
+    the user is told to reconnect."""
+    if not isinstance(resp, dict):
+        return "No broker response."
+    for k in ("failureText", "failureReason", "errorText", "error", "message"):
+        v = resp.get(k)
+        if v:
+            text = str(v)
+            low = text.lower()
+            if "auth" in low or "token" in low or "unauthor" in low or "401" in low or "access" in low:
+                return f"Tradovate authorization expired — reconnect on the Broker page. ({text})"
+            return text
+    return "Order rejected by Tradovate."
+
+
+def _parse_iso(s: str):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def ensure_fresh_token(account: dict) -> str:
+    """Return a valid decrypted access token for the account, renewing it with
+    Tradovate when it is near expiry and persisting the new token. Returns "" if
+    there is no token. A renewal failure (e.g. already expired) returns the
+    existing token so the caller surfaces a clear reconnect error."""
     token = dec(account["access_token_enc"]) if account.get("access_token_enc") else ""
+    if not token:
+        return ""
+    env = account.get("env") or "live"
+
+    exp_dt = _parse_iso(account.get("token_expires_at") or "")
+    if exp_dt is not None:
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        # Not near expiry yet -> reuse as-is.
+        if exp_dt - datetime.now(timezone.utc) > timedelta(minutes=10):
+            return token
+
+    res = tvo.renew_access_token(env, token)
+    if not res.get("ok"):
+        return token  # renewal failed; caller will get an auth error -> reconnect
+
+    new_token = res["access_token"]
+    new_exp = res.get("expiration") or ""
+    con = db()
+    con.execute(
+        "UPDATE broker_accounts SET access_token_enc=?, token_expires_at=?, updated_at=? WHERE id=?",
+        (enc(new_token), new_exp, datetime.now(timezone.utc).isoformat(), account.get("id")),
+    )
+    con.commit()
+    con.close()
+    # Keep the in-memory dict consistent for the rest of this request.
+    account["access_token_enc"] = enc(new_token)
+    account["token_expires_at"] = new_exp
+    return new_token
+
+
+def place_order_on_account(account: dict, action: str, symbol: str, qty: int) -> dict:
+    token = ensure_fresh_token(account)
     env = account.get("env") or "live"
     if not token or not account.get("account_id"):
         return {"account": account.get("account_name"), "ok": False, "error": "Reconnect required"}
     resp = tvo.place_order(env, token, account.get("account_name"), account.get("account_id"), action, symbol, qty)
-    return {"account": account.get("account_name"), "ok": _order_ok(resp), "response": resp}
+    ok = _order_ok(resp)
+    out = {"account": account.get("account_name"), "ok": ok, "response": resp}
+    if not ok:
+        out["error"] = _broker_error_text(resp)
+    return out
 
 
 def flatten_on_account(account: dict, symbol: str) -> list:
     """Close any open position matching `symbol` on one account."""
-    token = dec(account["access_token_enc"]) if account.get("access_token_enc") else ""
+    token = ensure_fresh_token(account)
     env = account.get("env") or "live"
     acct_id = account.get("account_id")
     if not token or not acct_id:
@@ -733,7 +797,7 @@ def reverse_on_account(account: dict, symbol: str, qty: int) -> dict:
     """Flip the current position on one account to the opposite side in a single
     order: a long becomes short (and vice-versa) with `qty` contracts. If the
     account is flat there is nothing to reverse, so this is a no-op."""
-    token = dec(account["access_token_enc"]) if account.get("access_token_enc") else ""
+    token = ensure_fresh_token(account)
     env = account.get("env") or "live"
     acct_id = account.get("account_id")
     if not token or not acct_id:
@@ -905,7 +969,7 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
     today = date.today().isoformat()
 
     for a in accounts:
-        token = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+        token = ensure_fresh_token(a)
         env = a.get("env") or "live"
         acct_id = a.get("account_id")
 
@@ -1107,7 +1171,7 @@ def account_trade_history(user_id: int):
     all_trips, all_open = [], []
 
     for a in accounts:
-        token = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+        token = ensure_fresh_token(a)
         env = a.get("env") or "live"
         acct_id = a.get("account_id")
         if not token or not acct_id:
@@ -3019,6 +3083,12 @@ def webhook_trade(payload: WebhookTrade):
             else:
                 scope = f"{response['accounts']} copy account(s)"
             message = f"{route.title()} {response['placed']}/{response['total']} order(s) to {scope}."
+            # If nothing was placed, surface the broker's reason (e.g. token
+            # expired -> reconnect) so the failure isn't silent.
+            if response["placed"] == 0 and response["total"] > 0:
+                errors = [r.get("error") for r in response.get("results", []) if r.get("error")]
+                if errors:
+                    message += " " + errors[0]
         else:
             # Only reached when the user has zero connected accounts at all.
             response = {"routed": False, "symbol": symbol, "side": side, "qty": qty}
@@ -3031,9 +3101,10 @@ def webhook_trade(payload: WebhookTrade):
         log_trade(user["id"], request_id, symbol, side, qty, mode, status, latency, message, response)
 
         return {
-            "ok": True,
+            "ok": status == "EXECUTED",
             "action": action,
             "status": status,
+            "message": message,
             "mode": mode,
             "symbol": symbol,
             "side": side,
@@ -3405,7 +3476,7 @@ def debug_tradovate_raw(request: Request):
     if not accts:
         return {"ok": False, "error": "No connected account"}
     a = accts[0]
-    token = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+    token = ensure_fresh_token(a)
     env = a.get("env") or "live"
     return {
         "ok": True,
