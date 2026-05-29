@@ -919,6 +919,21 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
                 "avg_price": p.get("netPrice"),
             })
 
+        # Resilience: if the realtime position endpoint returns nothing (it can
+        # be briefly empty or flaky right after a fill), reconstruct open
+        # positions from this account's fills instead.
+        if not positions:
+            _trips, open_from_fills = build_round_trips(
+                [f for f in (fills_all or []) if belongs(f)], name_for
+            )
+            for o in open_from_fills:
+                positions.append({
+                    "symbol": o["symbol"],
+                    "side": o["side"],
+                    "qty": o["qty"],
+                    "avg_price": o.get("entry_price"),
+                })
+
         acct_fills = [
             f for f in (fills_all or [])
             if belongs(f) and str(f.get("timestamp", ""))[:10] == today
@@ -1356,20 +1371,26 @@ def estimate_trade_pnl(row) -> float:
     return 0.0
 
 
-def dashboard_metrics(user_id: int):
-    rows = list(reversed(get_user_trades(user_id, 500)))
-    executed = [r for r in rows if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED")]
-    rejected = [r for r in rows if r["status"] == "REJECTED"]
+def dashboard_metrics(user_id: int, trips: Optional[list] = None):
+    """Win rate / drawdown / realized PnL from REAL broker fills (closed
+    round-trips), not the order-placement log (which carries no PnL). Counts and
+    latency still come from the execution log. Pass `trips` to reuse an already
+    fetched account_trade_history result and avoid a second broker call."""
+    if trips is None:
+        try:
+            trips, _open = account_trade_history(user_id)
+        except Exception:
+            trips = []
 
-    pnl_values = []
+    # Round-trips ordered chronologically build the realized equity curve.
+    chron = sorted(trips, key=lambda t: str(t.get("closed_at", "")))
+    pnl_values = [float(t.get("pnl") or 0) for t in chron]
+
     equity = []
     running = 0.0
     peak = 0.0
     max_dd = 0.0
-
-    for r in executed:
-        pnl = estimate_trade_pnl(r)
-        pnl_values.append(pnl)
+    for pnl in pnl_values:
         running += pnl
         equity.append(round(running, 2))
         peak = max(peak, running)
@@ -1380,23 +1401,31 @@ def dashboard_metrics(user_id: int):
     closed_with_pnl = wins + losses
     win_rate = round((wins / closed_with_pnl) * 100, 1) if closed_with_pnl else 0.0
 
+    # Execution counts + latency from the local trade log.
+    rows = get_user_trades(user_id, 500)
+    executed = [r for r in rows if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED")]
+    rejected = [r for r in rows if r["status"] == "REJECTED"]
     latencies = [float(r["latency_ms"] or 0) for r in rows if r["latency_ms"]]
     avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else 0
 
     return {
         "total_trades": len(executed),
         "rejected": len(rejected),
+        "closed_trades": closed_with_pnl,
         "win_rate": win_rate,
         "wins": wins,
         "losses": losses,
         "total_pnl": round(running, 2),
+        "realized_pnl": round(running, 2),
         "max_drawdown": round(abs(max_dd), 2),
         "avg_latency": avg_latency,
         "equity": equity[-40:] if equity else [0, 0, 0, 0, 0],
     }
 
 
-def daily_journal(user_id: int):
+def daily_journal(user_id: int, trips: Optional[list] = None):
+    """Per-day execution counts (from the log) and realized PnL (from real broker
+    round-trips). Pass `trips` to reuse a fetched account_trade_history result."""
     rows = get_user_trades(user_id, 500)
     days: Dict[str, Dict[str, Any]] = {}
 
@@ -1410,7 +1439,19 @@ def daily_journal(user_id: int):
             days[day]["rejected"] += 1
         if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED"):
             days[day]["executed"] += 1
-        days[day]["pnl"] += estimate_trade_pnl(r)
+
+    # Realized PnL per day from actual broker fills (closed round-trips).
+    if trips is None:
+        try:
+            trips, _open = account_trade_history(user_id)
+        except Exception:
+            trips = []
+    for t in trips:
+        day = str(t.get("closed_at") or "")[:10]
+        if not day:
+            continue
+        days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})
+        days[day]["pnl"] += float(t.get("pnl") or 0)
 
     return sorted(days.items(), reverse=True)[:10]
 
@@ -2155,8 +2196,13 @@ def dashboard(request: Request):
     trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10", (user["id"],)).fetchall()
     con.close()
 
-    m = dashboard_metrics(user["id"])
-    journal = daily_journal(user["id"])
+    # Fetch real broker round-trips once and reuse for both metrics + journal.
+    try:
+        trips, _open = account_trade_history(user["id"])
+    except Exception:
+        trips = []
+    m = dashboard_metrics(user["id"], trips=trips)
+    journal = daily_journal(user["id"], trips=trips)
 
     running = user["automation_status"] == "Running"
     state_label = "ON" if running else "OFF"
@@ -2183,8 +2229,8 @@ def dashboard(request: Request):
 
     <div class="grid">
       <div class="card span3"><h3>Total PnL (live)</h3><div class="metric good" id="totalPnl">—</div><p class="muted">Open + realized from connected accounts.</p></div>
-      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses (from trade log)</p></div>
-      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">From stored trade log.</p></div>
+      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses • {m['closed_trades']} closed (broker fills)</p></div>
+      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Realized: <b>${m['realized_pnl']}</b> from closed trades.</p></div>
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
       <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Open positions from your connected Tradovate accounts. Refreshes automatically.</p><div id="liveMonitor"><p class="muted">Loading live positions…</p></div></div>
