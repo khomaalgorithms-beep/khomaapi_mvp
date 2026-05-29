@@ -15,6 +15,7 @@ import os
 import secrets
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -824,17 +825,64 @@ def reverse_on_account(account: dict, symbol: str, qty: int) -> dict:
 
 
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
-    """Place (flatten / reverse / buy / sell) the same order on each account."""
-    results = []
+    """Copy-trade engine: place the SAME order on every account simultaneously.
+
+    For top-tier copy trading every account must hit the market at the same
+    instant so they fill at (essentially) the same price. We therefore:
+      1. Refresh tokens sequentially first (renewal is not thread-safe).
+      2. Resolve the contract ONCE so every account trades the identical symbol.
+      3. Fan the orders out in parallel threads — all submitted together.
+    """
+    accounts = list(accounts or [])
+    if not accounts:
+        return {"results": [], "placed": 0, "total": 0, "accounts": 0}
+
+    # 1. Refresh every token up front (serialized) so the parallel phase below
+    #    never triggers concurrent token renewals.
     for a in accounts:
-        if side == "flatten":
-            results += flatten_on_account(a, symbol)
-        elif side == "reverse":
-            results.append(reverse_on_account(a, symbol, qty))
-        else:
-            results.append(place_order_on_account(a, side, symbol, qty))
+        try:
+            ensure_fresh_token(a)
+        except Exception:
+            pass
+
+    # 2. Resolve the contract a single time so all accounts trade the same
+    #    contract month (e.g. MNQ1! -> MNQM6) — no per-account drift.
+    resolved = symbol
+    if side != "flatten":
+        for a in accounts:
+            tok = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+            if tok:
+                try:
+                    resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+                    break
+                except Exception:
+                    pass
+
+    # 3. Submit to all accounts in parallel — same instant, same price.
+    def run(a):
+        try:
+            if side == "flatten":
+                return flatten_on_account(a, symbol)
+            elif side == "reverse":
+                return [reverse_on_account(a, resolved, qty)]
+            else:
+                return [place_order_on_account(a, side, resolved, qty)]
+        except Exception as e:
+            return [{"account": a.get("account_name"), "ok": False, "error": str(e)}]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(accounts), 16)) as pool:
+        for r in pool.map(run, accounts):
+            results += r
+
     placed = sum(1 for r in results if r.get("ok"))
-    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+    return {
+        "results": results,
+        "placed": placed,
+        "total": len(results),
+        "accounts": len(accounts),
+        "contract": resolved,
+    }
 
 
 def find_connected_account(user_id: int, account_name: str):
