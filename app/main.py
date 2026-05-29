@@ -223,17 +223,20 @@ def email_from() -> str:
     )
 
 
-def _send_via_resend(to_email, subject, body) -> bool:
+def _send_via_resend(to_email, subject, body, html=None) -> bool:
     """Send through Resend's HTTP API. One API key, no SMTP, no app passwords."""
     global LAST_EMAIL_ERROR
     key = os.getenv("RESEND_API_KEY")
     if not key:
         return False
+    payload = {"from": email_from(), "to": [to_email], "subject": subject, "text": body}
+    if html:
+        payload["html"] = html
     try:
         r = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"from": email_from(), "to": [to_email], "subject": subject, "text": body},
+            json=payload,
             timeout=15,
         )
         if r.status_code < 300:
@@ -248,7 +251,7 @@ def _send_via_resend(to_email, subject, body) -> bool:
     return False
 
 
-def _send_via_smtp(to_email, subject, body) -> bool:
+def _send_via_smtp(to_email, subject, body, html=None) -> bool:
     global LAST_EMAIL_ERROR
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "587"))
@@ -257,7 +260,13 @@ def _send_via_smtp(to_email, subject, body) -> bool:
     if not host or not user or not password:
         return False
 
-    msg = MIMEText(body)
+    if html:
+        from email.mime.multipart import MIMEMultipart
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html, "html"))
+    else:
+        msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = email_from()
     msg["To"] = to_email
@@ -281,20 +290,69 @@ def _send_via_smtp(to_email, subject, body) -> bool:
         return False
 
 
-def send_email(to_email, subject, body):
+def send_email(to_email, subject, body, html=None):
     """Send an email via the configured provider. Tries Resend first (operator
     sets ONE api key — clients never configure anything), then SMTP."""
     global LAST_EMAIL_ERROR
     if os.getenv("RESEND_API_KEY"):
-        if _send_via_resend(to_email, subject, body):
+        if _send_via_resend(to_email, subject, body, html):
             return True
         # Resend failed — try SMTP if it's also configured.
-    if _send_via_smtp(to_email, subject, body):
+    if _send_via_smtp(to_email, subject, body, html):
         return True
     if not email_enabled():
         LAST_EMAIL_ERROR = "No email provider configured — set RESEND_API_KEY (recommended) or SMTP_HOST/SMTP_USER/SMTP_PASS."
         print("EMAIL ERROR:", LAST_EMAIL_ERROR)
     return False
+
+
+def email_html(heading: str, message_html: str, button_label: str = "", button_url: str = "") -> str:
+    """Branded HTML email — logo banner, body, optional CTA button, footer."""
+    logo = f"{APP_URL.rstrip('/')}/static/logo.png"
+    button = ""
+    if button_label and button_url:
+        button = f"""
+        <table cellpadding="0" cellspacing="0" border="0" style="margin:26px 0 8px;">
+          <tr><td align="center" style="border-radius:12px;background-color:#0f8f45;">
+            <a href="{button_url}" style="display:inline-block;padding:14px 30px;color:#ffffff;font-weight:700;font-size:15px;text-decoration:none;border-radius:12px;">{button_label}</a>
+          </td></tr>
+        </table>
+        <p style="color:#9ca3af;font-size:13px;line-height:1.6;margin:6px 0 0;">Or paste this link into your browser:<br>
+          <a href="{button_url}" style="color:#0f8f45;word-break:break-all;">{button_url}</a></p>
+        """
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#f4f6f5;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f6f5;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;">
+    <tr><td align="center">
+      <table width="540" cellpadding="0" cellspacing="0" border="0" style="max-width:540px;width:100%;background:#ffffff;border:1px solid #e8eae9;border-radius:18px;overflow:hidden;">
+        <tr><td style="background-color:#0f8f45;background:linear-gradient(135deg,#16a34a,#064e2a);padding:26px 32px;" align="left">
+          <img src="{logo}" width="40" height="40" alt="KhomaAPI" style="border-radius:10px;vertical-align:middle;">
+          <span style="color:#ffffff;font-size:21px;font-weight:800;letter-spacing:-0.4px;vertical-align:middle;margin-left:12px;">KhomaAPI</span>
+        </td></tr>
+        <tr><td style="padding:34px 36px 8px;">
+          <h1 style="margin:0 0 14px;font-size:22px;line-height:1.3;color:#111827;">{heading}</h1>
+          <div style="color:#4b5563;font-size:15px;line-height:1.65;">{message_html}</div>
+          {button}
+        </td></tr>
+        <tr><td style="padding:22px 36px 28px;"></td></tr>
+        <tr><td style="padding:20px 36px;border-top:1px solid #eef0ef;background:#fafbfa;">
+          <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.7;">
+            <b style="color:#6b7280;">KhomaAlgorithms</b> — automated TradingView → broker execution.<br>
+            Questions? <a href="mailto:support@khomaalgorithms.net" style="color:#0f8f45;text-decoration:none;">support@khomaalgorithms.net</a>
+          </p>
+        </td></tr>
+      </table>
+      <p style="color:#b6bbc0;font-size:11px;margin:16px 0 0;">© KhomaAlgorithms · You received this because this email was used on KhomaAPI.</p>
+    </td></tr>
+  </table>
+</body></html>"""
+
+
+def send_branded_email(to_email, subject, heading, message_html, button_label="", button_url="", text_fallback="") -> bool:
+    """Send a branded HTML email (with plain-text fallback)."""
+    html = email_html(heading, message_html, button_label, button_url)
+    text = text_fallback or f"{heading}\n\n{button_url}".strip()
+    return send_email(to_email, subject, text, html=html)
 
 
 
@@ -2223,10 +2281,15 @@ def signup(email: str = Form(...), password: str = Form(...)):
 
     if email_enabled():
         token = create_email_token(uid, "signup")
-        sent = send_email(
+        link = f"{APP_URL}/verify-email/{token}"
+        sent = send_branded_email(
             email.lower().strip(),
             "Verify your KhomaAPI account",
-            f"Welcome to KhomaAPI. Confirm your email to activate your account:\n\n{APP_URL}/verify-email/{token}\n\nThis link expires in 1 hour.",
+            "Welcome to KhomaAPI 👋",
+            "Thanks for signing up. Confirm your email address to activate your account and start automating your TradingView strategies.<br><br>This link expires in 1 hour.",
+            button_label="Verify my email",
+            button_url=link,
+            text_fallback=f"Welcome to KhomaAPI. Confirm your email to activate your account:\n\n{link}\n\nThis link expires in 1 hour.",
         )
         if sent:
             return login_layout("<h1>Check your email</h1><p>We sent a verification link to confirm your account. Click it, then log in.</p><a class='btn' href='/login'>Go to login</a>")
@@ -2284,10 +2347,15 @@ def login(email: str = Form(...), password: str = Form(...)):
         # Re-send the verification link. If email delivery is failing, activate
         # the account instead of locking the user out permanently.
         token = create_email_token(user["id"], "signup")
-        sent = send_email(
+        link = f"{APP_URL}/verify-email/{token}"
+        sent = send_branded_email(
             user["email"],
             "Verify your KhomaAPI account",
-            f"Confirm your email to activate your KhomaAPI account:\n\n{APP_URL}/verify-email/{token}\n\nThis link expires in 1 hour.",
+            "Confirm your email",
+            "Please confirm your email address to activate your KhomaAPI account.<br><br>This link expires in 1 hour.",
+            button_label="Verify my email",
+            button_url=link,
+            text_fallback=f"Confirm your email to activate your KhomaAPI account:\n\n{link}\n\nThis link expires in 1 hour.",
         )
         if sent:
             return login_layout("<h1>Verify your email</h1><p>We just re-sent your verification link — click it, then log in.</p><a href='/login'>Back to login</a>")
@@ -3393,10 +3461,15 @@ def change_email(request: Request, new_email: str = Form(...)):
 
     # Step 1 of 2: confirm at the CURRENT email address.
     token = create_email_token(user["id"], "email_old", new_email)
-    sent = send_email(
+    link = f"{APP_URL}/confirm-email-change/{token}"
+    sent = send_branded_email(
         user["email"],
         "Confirm your KhomaAPI email change",
-        f"You requested to change your email to {new_email}.\n\nConfirm from your current address:\n{APP_URL}/confirm-email-change/{token}\n\nIf this wasn't you, ignore this email.",
+        "Confirm your email change",
+        f"You requested to change your KhomaAPI email to <b>{new_email}</b>. Confirm from your current address to continue.<br><br>If this wasn't you, you can safely ignore this email.",
+        button_label="Confirm email change",
+        button_url=link,
+        text_fallback=f"You requested to change your email to {new_email}.\n\nConfirm from your current address:\n{link}\n\nIf this wasn't you, ignore this email.",
     )
     if sent:
         return login_layout("<h1>Confirm at your current email</h1><p>We sent a confirmation link to your current address. After you confirm, we'll email the new address to verify it.</p><a class='btn' href='/settings'>Back to Settings</a>")
@@ -3416,10 +3489,15 @@ def confirm_email_change(token: str):
     new_email = row["payload"]
     # Step 2 of 2: verify at the NEW email address.
     token2 = create_email_token(row["user_id"], "email_new", new_email)
-    send_email(
+    link = f"{APP_URL}/verify-email-change/{token2}"
+    send_branded_email(
         new_email,
         "Verify your new KhomaAPI email",
-        f"Verify this address to finish your KhomaAPI email change:\n\n{APP_URL}/verify-email-change/{token2}\n\nThis link expires in 1 hour.",
+        "Verify your new email",
+        "Verify this address to finish your KhomaAPI email change.<br><br>This link expires in 1 hour.",
+        button_label="Verify this email",
+        button_url=link,
+        text_fallback=f"Verify this address to finish your KhomaAPI email change:\n\n{link}\n\nThis link expires in 1 hour.",
     )
     return login_layout("<h1>Now check your new email</h1><p>We've emailed the new address. Click that link to finish the change.</p>")
 
@@ -3463,10 +3541,15 @@ def change_password(request: Request, current_password: str = Form(...), new_pas
 
     # Email confirmation required: store the pending hash in the token payload.
     token = create_email_token(user["id"], "password", hash_password(new_password))
-    sent = send_email(
+    link = f"{APP_URL}/confirm-password-change/{token}"
+    sent = send_branded_email(
         user["email"],
         "Confirm your KhomaAPI password change",
-        f"Confirm your password change:\n\n{APP_URL}/confirm-password-change/{token}\n\nIf this wasn't you, change your password immediately and ignore this link.",
+        "Confirm your password change",
+        "Click below to confirm your new KhomaAPI password.<br><br>If this wasn't you, change your password immediately and ignore this email.",
+        button_label="Confirm password change",
+        button_url=link,
+        text_fallback=f"Confirm your password change:\n\n{link}\n\nIf this wasn't you, change your password immediately and ignore this link.",
     )
     if sent:
         return login_layout("<h1>Confirm via email</h1><p>We emailed you a link to confirm the password change.</p><a class='btn' href='/settings'>Back to Settings</a>")
@@ -3519,10 +3602,15 @@ def forgot_password(email: str = Form(...)):
             (token, user["id"], datetime.now(timezone.utc).isoformat()),
         )
         con.commit()
-        send_email(
+        link = f"{APP_URL}/reset-password/{token}"
+        send_branded_email(
             email,
-            "Reset Your KhomaAPI Password",
-            f"Reset your password (link expires in 1 hour):\n\n{APP_URL}/reset-password/{token}",
+            "Reset your KhomaAPI password",
+            "Reset your password",
+            "We received a request to reset your KhomaAPI password. Click below to choose a new one.<br><br>This link expires in 1 hour. If you didn't request this, you can safely ignore this email.",
+            button_label="Reset my password",
+            button_url=link,
+            text_fallback=f"Reset your password (link expires in 1 hour):\n\n{link}",
         )
     con.close()
 
@@ -3680,10 +3768,14 @@ def debug_email(request: Request):
         "SMTP_USER": bool(os.getenv("SMTP_USER")),
         "SMTP_PASS": bool(os.getenv("SMTP_PASS")),
     }
-    sent = send_email(
+    sent = send_branded_email(
         user["email"],
         "KhomaAPI email test",
-        "This is a KhomaAPI email test. If you received this, outbound email works.",
+        "Your email is working 🎉",
+        "This is a branded KhomaAPI test email. If you can see the logo banner and this styled layout, outbound email and HTML rendering are both working.",
+        button_label="Open KhomaAPI",
+        button_url=f"{APP_URL}/dashboard",
+        text_fallback="This is a KhomaAPI email test. If you received this, outbound email works.",
     )
     return {
         "ok": sent,
