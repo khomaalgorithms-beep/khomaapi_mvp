@@ -3319,12 +3319,19 @@ def change_email(request: Request, new_email: str = Form(...)):
 
     # Step 1 of 2: confirm at the CURRENT email address.
     token = create_email_token(user["id"], "email_old", new_email)
-    send_email(
+    sent = send_email(
         user["email"],
         "Confirm your KhomaAPI email change",
         f"You requested to change your email to {new_email}.\n\nConfirm from your current address:\n{APP_URL}/confirm-email-change/{token}\n\nIf this wasn't you, ignore this email.",
     )
-    return login_layout("<h1>Confirm at your current email</h1><p>We sent a confirmation link to your current address. After you confirm, we'll email the new address to verify it.</p><a class='btn' href='/settings'>Back to Settings</a>")
+    if sent:
+        return login_layout("<h1>Confirm at your current email</h1><p>We sent a confirmation link to your current address. After you confirm, we'll email the new address to verify it.</p><a class='btn' href='/settings'>Back to Settings</a>")
+    # Email delivery failed — you're already authenticated, so apply directly.
+    con = db()
+    con.execute("UPDATE users SET email=? WHERE id=?", (new_email, user["id"]))
+    con.commit()
+    con.close()
+    return login_layout(f"<h1>Email Updated</h1><p>We couldn't send the confirmation email, so the change was applied directly. (Email error: {LAST_EMAIL_ERROR})</p><a class='btn' href='/settings'>Return to Settings</a>")
 
 
 @app.get("/confirm-email-change/{token}", response_class=HTMLResponse)
@@ -3382,12 +3389,19 @@ def change_password(request: Request, current_password: str = Form(...), new_pas
 
     # Email confirmation required: store the pending hash in the token payload.
     token = create_email_token(user["id"], "password", hash_password(new_password))
-    send_email(
+    sent = send_email(
         user["email"],
         "Confirm your KhomaAPI password change",
         f"Confirm your password change:\n\n{APP_URL}/confirm-password-change/{token}\n\nIf this wasn't you, change your password immediately and ignore this link.",
     )
-    return login_layout("<h1>Confirm via email</h1><p>We emailed you a link to confirm the password change.</p><a class='btn' href='/settings'>Back to Settings</a>")
+    if sent:
+        return login_layout("<h1>Confirm via email</h1><p>We emailed you a link to confirm the password change.</p><a class='btn' href='/settings'>Back to Settings</a>")
+    # Email delivery failed — you're authenticated (gave current password), so apply directly.
+    con = db()
+    con.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_password), user["id"]))
+    con.commit()
+    con.close()
+    return login_layout(f"<h1>Password Changed</h1><p>We couldn't send the confirmation email, so the change was applied directly. (Email error: {LAST_EMAIL_ERROR})</p><a class='btn' href='/settings'>Return to Settings</a>")
 
 
 @app.get("/confirm-password-change/{token}", response_class=HTMLResponse)
