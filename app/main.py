@@ -68,6 +68,25 @@ OAUTH_STATES: Dict[str, int] = {}
 APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
 
 
+def public_base_url(request: Request) -> str:
+    """Public base URL for building copy/paste links (webhook URL, emails).
+
+    Railway terminates TLS at its edge and forwards plain HTTP to the app, so
+    request.base_url can come back as http://. TradingView posting to an http://
+    URL gets 301-redirected to https, which downgrades POST -> GET and yields a
+    405. Force https for any non-local host to prevent that."""
+    if os.getenv("APP_URL"):
+        return os.getenv("APP_URL").strip().rstrip("/")
+    # Honor the proxy's forwarded protocol when present.
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    url = str(request.base_url).rstrip("/")
+    host = request.headers.get("host", "")
+    is_local = "localhost" in url or "127.0.0.1" in url
+    if (proto == "https" or not is_local) and url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
+
+
 # ============================================================
 # WEBSOCKET LIVE CONNECTIONS
 # ============================================================
@@ -2393,7 +2412,7 @@ def webhooks_page(request: Request):
     if not user:
         return RedirectResponse("/login")
 
-    domain = str(request.base_url).rstrip("/")
+    domain = public_base_url(request)
     webhook_url = f"{domain}/webhook/trade"
     example = json.dumps({
         "client_id": user["email"],
@@ -2850,24 +2869,34 @@ def webhook_trade(payload: WebhookTrade):
             accounts = [acct]
             route = "ROUTED"
         else:
+            # Master signal: prefer the Copy Trading group. If the user hasn't
+            # placed any accounts in that group yet, fall back to every connected
+            # account so a freshly-connected account still trades cleanly.
             accounts = get_copy_accounts(user["id"])
             route = "COPIED"
+            if not accounts:
+                accounts = get_broker_accounts(user["id"], connected_only=True)
+                route = "BROADCAST"
 
         if accounts:
             response = execute_to_accounts(accounts, symbol, side, qty)
             mode = "live"
             action = route
             status = "EXECUTED" if (response["placed"] > 0 or response["total"] == 0) else "REJECTED"
-            scope = f"account {target_name}" if target_name else f"{response['accounts']} copy account(s)"
+            if target_name:
+                scope = f"account {target_name}"
+            elif route == "BROADCAST":
+                scope = f"{response['accounts']} connected account(s)"
+            else:
+                scope = f"{response['accounts']} copy account(s)"
             message = f"{route.title()} {response['placed']}/{response['total']} order(s) to {scope}."
         else:
-            # No destination: either an unrecognized account was named, or this
-            # was a master signal with an empty Copy Trading group.
+            # Only reached when the user has zero connected accounts at all.
             response = {"routed": False, "symbol": symbol, "side": side, "qty": qty}
             action = "NO_ROUTE"
             mode = "live"
             status = "NO_ROUTE"
-            message = "No destination account — add accounts to the Copy Trading group or route the alert to a specific account."
+            message = "No connected accounts — connect a Tradovate account on the Broker Connection page."
 
         latency = round((time.perf_counter() - start_time) * 1000, 3)
         log_trade(user["id"], request_id, symbol, side, qty, mode, status, latency, message, response)
