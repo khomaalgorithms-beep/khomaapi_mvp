@@ -184,41 +184,46 @@ def valid_email(email: str):
 
 
 
+# Last SMTP error, surfaced by /debug/email so the exact failure is visible.
+LAST_EMAIL_ERROR = ""
+
+
 def send_email(to_email, subject, body):
+    global LAST_EMAIL_ERROR
+
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASS")
+    sender = os.getenv("SMTP_FROM", user)
+
+    if not host or not user or not password:
+        LAST_EMAIL_ERROR = "SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS (and optionally SMTP_PORT/SMTP_FROM)."
+        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
+        return False
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to_email
 
     try:
-        host = os.getenv("SMTP_HOST")
-        port = int(os.getenv("SMTP_PORT", "587"))
-        user = os.getenv("SMTP_USER")
-        password = os.getenv("SMTP_PASS")
-
-        if not host or not user or not password:
-            print("SMTP VARIABLES MISSING")
-            return False
-
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = user
-        msg["To"] = to_email
-
-        server = smtplib.SMTP(host, port, timeout=10)
-
-        server.starttls()
-
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            server = smtplib.SMTP(host, port, timeout=15)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
         server.login(user, password)
-
-        server.sendmail(user, [to_email], msg.as_string())
-
+        server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
-
-        
+        LAST_EMAIL_ERROR = ""
         print("EMAIL SENT TO:", to_email)
-
-
         return True
-
     except Exception as e:
-        print("EMAIL ERROR:", str(e))
+        LAST_EMAIL_ERROR = f"{type(e).__name__}: {e}"
+        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
         return False
 
 
@@ -2021,7 +2026,10 @@ socket.onclose = () => {{
 
 
 def login_layout(content):
-    return f"""
+    # Return an explicit HTMLResponse so routes WITHOUT response_class=HTMLResponse
+    # (e.g. the POST handlers for forgot/change email/password) still render as
+    # HTML instead of being JSON-encoded into raw text by FastAPI.
+    return HTMLResponse(f"""
 <!DOCTYPE html><html><head><title>KhomaAPI Login</title><style>
 body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#f8faf9;color:#111827;}}
 .wrap{{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 10% 10%,#dff5e7,transparent 30%),radial-gradient(circle at 90% 20%,#eefaf2,transparent 28%),#f8faf9;}}
@@ -2068,7 +2076,7 @@ socket.onclose = () => {{
 
 </body>
 </html>
-"""
+""")
 
 
 # ============================================================
@@ -2141,12 +2149,19 @@ def signup(email: str = Form(...), password: str = Form(...)):
 
     if email_enabled():
         token = create_email_token(uid, "signup")
-        send_email(
+        sent = send_email(
             email.lower().strip(),
             "Verify your KhomaAPI account",
             f"Welcome to KhomaAPI. Confirm your email to activate your account:\n\n{APP_URL}/verify-email/{token}\n\nThis link expires in 1 hour.",
         )
-        return login_layout("<h1>Check your email</h1><p>We sent a verification link to confirm your account. Click it, then log in.</p><a class='btn' href='/login'>Go to login</a>")
+        if sent:
+            return login_layout("<h1>Check your email</h1><p>We sent a verification link to confirm your account. Click it, then log in.</p><a class='btn' href='/login'>Go to login</a>")
+        # Email delivery failed — don't lock the user out: activate immediately.
+        con = db()
+        con.execute("UPDATE users SET is_verified=1 WHERE id=?", (uid,))
+        con.commit()
+        con.close()
+        return login_layout("<h1>Account created</h1><p>We couldn't send the verification email right now, so your account has been activated directly. You can log in.</p><a class='btn' href='/login'>Go to login</a>")
 
     return RedirectResponse("/login", status_code=302)
 
@@ -2192,7 +2207,20 @@ def login(email: str = Form(...), password: str = Form(...)):
         return login_layout("<h1>Invalid login</h1><p>Email or password is wrong.</p><a href='/login'>Try again</a>")
 
     if email_enabled() and not user["is_verified"]:
-        return login_layout("<h1>Verify your email</h1><p>Please click the verification link we emailed you before logging in.</p><a href='/login'>Back to login</a>")
+        # Re-send the verification link. If email delivery is failing, activate
+        # the account instead of locking the user out permanently.
+        token = create_email_token(user["id"], "signup")
+        sent = send_email(
+            user["email"],
+            "Verify your KhomaAPI account",
+            f"Confirm your email to activate your KhomaAPI account:\n\n{APP_URL}/verify-email/{token}\n\nThis link expires in 1 hour.",
+        )
+        if sent:
+            return login_layout("<h1>Verify your email</h1><p>We just re-sent your verification link — click it, then log in.</p><a href='/login'>Back to login</a>")
+        con = db()
+        con.execute("UPDATE users SET is_verified=1 WHERE id=?", (user["id"],))
+        con.commit()
+        con.close()
 
     sid = create_session(user["id"])
     response = RedirectResponse("/dashboard", status_code=302)
@@ -3546,6 +3574,34 @@ def debug_accounts(request: Request):
     if not user:
         return {"ok": False, "error": "Not logged in"}
     return {"ok": True, "accounts": get_broker_accounts(user["id"])}
+
+
+@app.get("/debug/email")
+def debug_email(request: Request):
+    """Send a test email to the logged-in user and report the exact result, so
+    SMTP misconfiguration is diagnosable without reading server logs."""
+    user = require_user(request)
+    if not user:
+        return {"ok": False, "error": "Not logged in"}
+    configured = {
+        "SMTP_HOST": bool(os.getenv("SMTP_HOST")),
+        "SMTP_PORT": os.getenv("SMTP_PORT", "587"),
+        "SMTP_USER": bool(os.getenv("SMTP_USER")),
+        "SMTP_PASS": bool(os.getenv("SMTP_PASS")),
+        "SMTP_FROM": os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "")) and True,
+    }
+    sent = send_email(
+        user["email"],
+        "KhomaAPI email test",
+        "This is a KhomaAPI SMTP test. If you received this, outbound email works.",
+    )
+    return {
+        "ok": sent,
+        "email_enabled": email_enabled(),
+        "sent_to": user["email"] if sent else None,
+        "error": None if sent else LAST_EMAIL_ERROR,
+        "smtp_configured": configured,
+    }
 
 
 @app.get("/api/live/monitor")
