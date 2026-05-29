@@ -959,9 +959,12 @@ def _fills_for_account(fills_all, orders_map, acct_id, single_account: bool = Fa
     return out
 
 
-def live_account_monitor(user_id: int) -> Dict[str, Any]:
-    """Aggregate live open positions + PnL across the user's connected accounts."""
+def live_account_monitor(user_id: int, only_account_id=None) -> Dict[str, Any]:
+    """Aggregate live open positions + PnL across the user's connected accounts.
+    Pass only_account_id (broker_accounts.id) to scope to a single account."""
     accounts = get_broker_accounts(user_id, connected_only=True)
+    if only_account_id not in (None, "", "all"):
+        accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
     out_accounts = []
     all_trips: list = []
     token_cache: Dict[tuple, tuple] = {}
@@ -1163,9 +1166,12 @@ def build_round_trips(fills, name_for):
     return trips, open_positions
 
 
-def account_trade_history(user_id: int):
-    """Closed round-trips + open positions across the user's connected accounts."""
+def account_trade_history(user_id: int, only_account_id=None):
+    """Closed round-trips + open positions across the user's connected accounts.
+    Pass only_account_id (broker_accounts.id) to scope to a single account."""
     accounts = get_broker_accounts(user_id, connected_only=True)
+    if only_account_id not in (None, "", "all"):
+        accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
     token_cache: Dict[tuple, list] = {}
     contract_names: Dict[Any, str] = {}
     all_trips, all_open = [], []
@@ -1728,6 +1734,24 @@ def risk_check(user, auth: str, symbol: str, side: str, qty: int, request_id: st
 def nav_item(active, key, href, icon, label):
     cls = "active" if active == key else ""
     return f'<a class="{cls}" href="{href}"><span>{icon}</span>{label}</a>'
+
+
+def account_tabs(user_id: int, active, base: str) -> str:
+    """Account switcher: 'All Accounts' + one tab per connected account, so the
+    user gets a separate per-account dashboard/journal view."""
+    accts = get_broker_accounts(user_id, connected_only=True)
+    if not accts:
+        return ""
+
+    def tab(aid, label):
+        cls = "btn" if str(active) == str(aid) else "btn secondary"
+        return f'<a class="{cls}" style="margin:0 8px 8px 0" href="{base}?account={aid}">{label}</a>'
+
+    html = tab("all", "All Accounts")
+    for a in accts:
+        label = f'{a["account_name"]} · {(a["env"] or "").upper()}'
+        html += tab(a["id"], label)
+    return f'<div style="margin:0 0 20px;display:flex;flex-wrap:wrap">{html}</div>'
 
 
 def chart_svg(values):
@@ -2321,7 +2345,8 @@ DASHBOARD_LIVE_SCRIPT = """
     }
   }
   function poll() {
-    fetch("/api/live/monitor", { credentials: "same-origin" })
+    var acct = (window.KHOMA_ACCT || "all");
+    fetch("/api/live/monitor?account=" + encodeURIComponent(acct), { credentials: "same-origin" })
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function () {});
@@ -2343,9 +2368,15 @@ def dashboard(request: Request):
     trades = con.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10", (user["id"],)).fetchall()
     con.close()
 
-    # Fetch real broker round-trips once and reuse for both metrics + journal.
+    # Per-account view: 'all' (combined) or a specific broker_accounts.id.
+    sel = request.query_params.get("account", "all") or "all"
+    only = None if sel in ("all", "") else sel
+    tabs = account_tabs(user["id"], sel, "/dashboard")
+
+    # Fetch real broker round-trips once (scoped to the selected account) and
+    # reuse for both metrics + journal.
     try:
-        trips, _open = account_trade_history(user["id"])
+        trips, _open = account_trade_history(user["id"], only_account_id=only)
     except Exception:
         trips = []
     m = dashboard_metrics(user["id"], trips=trips)
@@ -2361,7 +2392,8 @@ def dashboard(request: Request):
     ]) or "<tr><td colspan='7'>No execution events yet.</td></tr>"
 
     journal_rows = "".join([
-        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
+        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div>"
+        f"<div style='text-align:right'><b class='{'good' if vals['pnl']>0 else ('bad' if vals['pnl']<0 else '')}'>${vals['pnl']:.2f}</b><small>realized</small></div></div>"
         for day, vals in journal
     ]) or "<p class='muted'>No journal data yet.</p>"
 
@@ -2373,6 +2405,7 @@ def dashboard(request: Request):
       <div><h2>Execution Dashboard</h2><p>System is <b class="{state_class}">{state_label}</b> · Orders today: <b>{today_order_count(user['id'])}</b></p></div>
       <div>{start_btn}{pause_btn}</div>
     </div>
+    {tabs}
 
     <div class="grid">
       <div class="card span3"><h3>Total PnL (live)</h3><div class="metric good" id="totalPnl">${m['total_pnl']}</div><p class="muted">Live from Tradovate — open + realized.</p></div>
@@ -2384,10 +2417,11 @@ def dashboard(request: Request):
       <div class="card span4"><h3>Live Account PnL</h3><p class="muted">Per connected account.</p><div id="livePnl"><p class="muted">Loading…</p></div></div>
 
       <div class="card span8"><h3>Execution Log</h3><p class="muted">Recent order events routed by KhomaAPI.</p><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Mode</th><th>Latency</th></tr>{trade_rows}</table></div>
-      <div class="card span4"><h3>Trading Journal</h3><p class="muted">Trades grouped by day.</p>{journal_rows}<a class="btn secondary" href="/journal">Open Journal</a></div>
+      <div class="card span4"><h3>Trading Journal</h3><p class="muted">Realized PnL grouped by day (broker fills).</p>{journal_rows}<a class="btn secondary" href="/journal?account={sel}">Open Journal</a></div>
     </div>
     '''
-    return layout(content + DASHBOARD_LIVE_SCRIPT, user, "dashboard")
+    acct_script = f"<script>window.KHOMA_ACCT={json.dumps(sel)};</script>"
+    return layout(content + acct_script + DASHBOARD_LIVE_SCRIPT, user, "dashboard")
 
 
 BROKER_COPY_SCRIPT = """
@@ -2740,26 +2774,37 @@ def journal_page(request: Request):
     if not user:
         return RedirectResponse("/login")
 
-    journal = daily_journal(user["id"])
+    # Per-account view: 'all' (combined) or a specific broker_accounts.id.
+    sel = request.query_params.get("account", "all") or "all"
+    only = None if sel in ("all", "") else sel
+    tabs = account_tabs(user["id"], sel, "/journal")
+
+    try:
+        trips, _open = account_trade_history(user["id"], only_account_id=only)
+    except Exception:
+        trips = []
+
+    journal = daily_journal(user["id"], trips=trips)
     journal_html = "".join([
-        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div><div><b>${vals['pnl']:.2f}</b><small>{vals['trades']} total logs</small></div></div>"
+        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div>"
+        f"<div style='text-align:right'><b class='{'good' if vals['pnl']>0 else ('bad' if vals['pnl']<0 else '')}'>${vals['pnl']:.2f}</b><small>realized PnL</small></div></div>"
         for day, vals in journal
     ]) or "<p class='muted'>No journal data yet.</p>"
 
-    trades = get_user_trades(user["id"], 60)
-    notes = get_trade_notes_map(user["id"])
-    trade_rows = "".join([
-        f"<tr><td>{t['ts'][:19]}</td><td><b>{t['symbol']}</b></td><td>{t['side']}</td><td>{t['qty']}</td><td>{t['status']}</td>"
-        f"<td>{'📝' if notes.get(t['id']) and notes[t['id']].get('note') else ''}{' 🖼' if notes.get(t['id']) and notes[t['id']].get('image_path') else ''}</td>"
-        f"<td><a class='btn secondary' href='/journal/note/{t['id']}'>{'Edit Note' if notes.get(t['id']) else 'Add Note'}</a></td></tr>"
-        for t in trades
-    ]) or "<tr><td colspan='7'>No trades to journal yet.</td></tr>"
+    # Closed round-trips from real broker fills (scoped to the selected account).
+    trip_rows = "".join([
+        f"<tr><td>{str(t.get('closed_at') or '')[:19]}</td><td><b>{t['symbol']}</b></td><td>{t.get('account','')}</td>"
+        f"<td>{t['side']}</td><td>{t['qty']}</td><td>{t['entry_price']}</td><td>{t['exit_price']}</td>"
+        f"<td class=\"{'good' if t['pnl']>0 else ('bad' if t['pnl']<0 else '')}\">${t['pnl']:.2f}</td></tr>"
+        for t in trips
+    ]) or "<tr><td colspan='8'>No closed trades yet.</td></tr>"
 
     content = f'''
-    <div class="header"><div><h2>Trading Journal</h2><p>Daily breakdown plus per-trade notes — click a trade to write what happened and attach a screenshot.</p></div></div>
+    <div class="header"><div><h2>Trading Journal</h2><p>Per-account daily realized PnL and every closed trade — straight from your Tradovate fills.</p></div></div>
+    {tabs}
     <div class="grid">
       <div class="card span4"><h3>Daily Summary</h3>{journal_html}</div>
-      <div class="card span8"><h3>Trades</h3><table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Notes</th><th></th></tr>{trade_rows}</table></div>
+      <div class="card span8"><h3>Closed Trades</h3><table><tr><th>Closed</th><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>{trip_rows}</table></div>
     </div>
     '''
     return layout(content, user, "journal")
@@ -3460,8 +3505,10 @@ def api_live_monitor(request: Request):
     user = require_user(request)
     if not user:
         return JSONResponse(status_code=401, content={"ok": False, "error": "Not logged in"})
+    sel = request.query_params.get("account", "all") or "all"
+    only = None if sel in ("all", "") else sel
     try:
-        return live_account_monitor(user["id"])
+        return live_account_monitor(user["id"], only_account_id=only)
     except Exception as e:
         return {"ok": False, "connected": False, "accounts": [], "totals": {}, "error": str(e)}
 
