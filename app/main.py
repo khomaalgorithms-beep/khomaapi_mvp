@@ -27,6 +27,29 @@ import smtplib
 from email.mime.text import MIMEText
 from email_validator import validate_email, EmailNotValidError
 
+import socket
+
+# Railway containers have no IPv6 egress route. When a host (e.g. api.resend.com)
+# resolves to an IPv6 address, requests/urllib3 tries IPv6 first and fails with
+# "[Errno 101] Network is unreachable" instead of falling back to IPv4. Force
+# IPv4-only DNS resolution for all outbound HTTP so email + APIs always connect.
+try:
+    import urllib3.util.connection as _urllib3_conn
+    _urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
+
+
+def _ipv4_getaddrinfo(host, *args, **kwargs):
+    """smtplib/stdlib socket helper: return only IPv4 results."""
+    results = socket._orig_getaddrinfo(host, *args, **kwargs)
+    return [r for r in results if r[0] == socket.AF_INET] or results
+
+
+if not hasattr(socket, "_orig_getaddrinfo"):
+    socket._orig_getaddrinfo = socket.getaddrinfo
+    socket.getaddrinfo = _ipv4_getaddrinfo
+
 
 
 
