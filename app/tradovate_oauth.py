@@ -8,7 +8,10 @@ Flow (matches Tradovate's official example-api-oauth):
 """
 
 import os
+import re
+import calendar
 import urllib.parse
+from datetime import datetime, timezone, date, timedelta
 
 import requests
 
@@ -178,16 +181,123 @@ def get_contract(env: str, token: str, contract_id):
     return _get(env, token, "/contract/item", {"id": contract_id})
 
 
+# ----------------------------------------------------------------------------
+# Symbol resolution: TradingView sends continuous / root symbols (e.g. "MNQ1!"
+# or "MNQ") but Tradovate can only trade a specific dated contract (e.g.
+# "MNQM6"). resolve_contract() turns the former into the active contract.
+# ----------------------------------------------------------------------------
+
+_MONTH_CODE = {1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+               7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"}
+_CODE_MONTH = {v: k for k, v in _MONTH_CODE.items()}
+_QUARTERLY = (3, 6, 9, 12)  # Mar / Jun / Sep / Dec cycle
+
+# Roots that trade on the quarterly equity-index cycle (incl. CME micros).
+_QUARTERLY_ROOTS = {"ES", "NQ", "RTY", "YM", "MES", "MNQ", "M2K", "MYM", "EMD", "NKD"}
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _third_friday(year: int, month: int) -> date:
+    cal = calendar.monthcalendar(year, month)
+    fridays = [w[calendar.FRIDAY] for w in cal if w[calendar.FRIDAY]]
+    return date(year, month, fridays[2])
+
+
+def _front_quarter(today: date):
+    """Return (year, month) of the quarterly contract to trade today. Rolls to
+    the next contract about a week before expiry (third Friday)."""
+    cands = []
+    for y in (today.year, today.year + 1):
+        for m in _QUARTERLY:
+            roll = _third_friday(y, m) - timedelta(days=8)
+            cands.append((roll, y, m))
+    cands.sort()
+    for roll, y, m in cands:
+        if today <= roll:
+            return y, m
+    return cands[-1][1], cands[-1][2]
+
+
+def _is_full_contract(sym: str) -> bool:
+    # e.g. MNQM6 / ESZ25 — root + month code + 1-2 digit year.
+    return bool(re.fullmatch(r"[A-Z0-9]+[FGHJKMNQUVXZ]\d{1,2}", sym))
+
+
+def _root_of(sym: str) -> str:
+    # MNQ1! -> MNQ, MNQ! -> MNQ, MNQ -> MNQ
+    return re.sub(r"[0-9]*!*$", "", sym).strip() or sym
+
+
+def suggest_contracts(env: str, token: str, text: str, limit: int = 20) -> list:
+    data = _get(env, token, "/contract/suggest", {"t": text, "l": limit})
+    return data if isinstance(data, list) else []
+
+
+def _name_maturity(name: str, root: str):
+    m = re.fullmatch(re.escape(root) + r"([FGHJKMNQUVXZ])(\d{1,2})", name)
+    if not m:
+        return None
+    month = _CODE_MONTH[m.group(1)]
+    yr = int(m.group(2))
+    if yr < 100:  # 1-2 digit year -> nearest full year
+        base = _today().year
+        full = (base // 100) * 100 + yr
+        if full < base - 1:
+            full += 100
+        yr = full
+    try:
+        return _third_friday(yr, month)
+    except Exception:
+        return None
+
+
+def resolve_contract(env: str, token: str, raw_symbol: str) -> str:
+    """Map a TradingView symbol to a tradable Tradovate contract.
+
+    - Already a dated contract (MNQM6)        -> unchanged
+    - Quarterly index root / continuous (MNQ1!) -> deterministic front month
+    - Anything else                            -> nearest live contract from
+      Tradovate's /contract/suggest, else passed through unchanged.
+    """
+    raw = (raw_symbol or "").upper().strip()
+    if not raw:
+        return raw
+    if _is_full_contract(raw) and not raw.endswith("!"):
+        return raw
+
+    root = _root_of(raw)
+    if root in _QUARTERLY_ROOTS:
+        y, m = _front_quarter(_today())
+        return f"{root}{_MONTH_CODE[m]}{y % 10}"
+
+    # General fallback: pick the nearest non-expired live contract for this root.
+    today = _today()
+    best = None
+    for c in suggest_contracts(env, token, root):
+        name = str(c.get("name") or "").upper()
+        mat = _name_maturity(name, root)
+        if mat and mat >= today and (best is None or mat < best[0]):
+            best = (mat, name)
+    return best[1] if best else raw
+
+
 def place_order(env: str, token: str, account_spec, account_id, action: str, symbol: str, qty: int):
     """Place a market order on a specific account using its OAuth token.
 
+    The symbol is resolved to a tradable Tradovate contract first, so continuous
+    TradingView tickers like "MNQ1!" become the active contract (e.g. "MNQM6").
+
     Returns the parsed Tradovate response dict, or {"error": ...} on transport failure.
     """
+    contract = resolve_contract(env, token, symbol)
     body = {
         "accountSpec": str(account_spec),
         "accountId": int(account_id),
         "action": "Buy" if str(action).lower() == "buy" else "Sell",
-        "symbol": str(symbol).upper(),
+        "symbol": str(contract).upper(),
         "orderQty": int(qty),
         "orderType": "Market",
         "isAutomated": True,
