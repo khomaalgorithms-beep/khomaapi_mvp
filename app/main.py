@@ -2212,7 +2212,7 @@ def signup(email: str = Form(...), password: str = Form(...)):
         con.execute("UPDATE users SET is_verified=1 WHERE id=?", (uid,))
         con.commit()
         con.close()
-        return login_layout("<h1>Account created</h1><p>We couldn't send the verification email right now, so your account has been activated directly. You can log in.</p><a class='btn' href='/login'>Go to login</a>")
+        return login_layout(f"<h1>Account created</h1><p>We couldn't send the verification email, so your account has been activated directly — you can log in.</p><p class='muted' style='font-size:12px'>Email status: {LAST_EMAIL_ERROR}</p><a class='btn' href='/login'>Go to login</a>")
 
     return RedirectResponse("/login", status_code=302)
 
