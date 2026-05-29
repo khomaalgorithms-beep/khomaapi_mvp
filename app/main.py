@@ -188,25 +188,56 @@ def valid_email(email: str):
 LAST_EMAIL_ERROR = ""
 
 
-def send_email(to_email, subject, body):
-    global LAST_EMAIL_ERROR
+def email_from() -> str:
+    """The 'From' address. With Resend you can use onboarding@resend.dev to test
+    immediately (delivers to your own account email), or a verified-domain
+    address for production. Falls back to the SMTP user."""
+    return (
+        os.getenv("EMAIL_FROM")
+        or os.getenv("SMTP_FROM")
+        or os.getenv("SMTP_USER")
+        or "KhomaAPI <onboarding@resend.dev>"
+    )
 
+
+def _send_via_resend(to_email, subject, body) -> bool:
+    """Send through Resend's HTTP API. One API key, no SMTP, no app passwords."""
+    global LAST_EMAIL_ERROR
+    key = os.getenv("RESEND_API_KEY")
+    if not key:
+        return False
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"from": email_from(), "to": [to_email], "subject": subject, "text": body},
+            timeout=15,
+        )
+        if r.status_code < 300:
+            LAST_EMAIL_ERROR = ""
+            print("EMAIL SENT (resend) TO:", to_email)
+            return True
+        LAST_EMAIL_ERROR = f"Resend {r.status_code}: {r.text}"
+        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
+    except Exception as e:
+        LAST_EMAIL_ERROR = f"Resend error: {type(e).__name__}: {e}"
+        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
+    return False
+
+
+def _send_via_smtp(to_email, subject, body) -> bool:
+    global LAST_EMAIL_ERROR
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
     password = os.getenv("SMTP_PASS")
-    sender = os.getenv("SMTP_FROM", user)
-
     if not host or not user or not password:
-        LAST_EMAIL_ERROR = "SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS (and optionally SMTP_PORT/SMTP_FROM)."
-        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
         return False
 
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = sender
+    msg["From"] = email_from()
     msg["To"] = to_email
-
     try:
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=15)
@@ -216,15 +247,31 @@ def send_email(to_email, subject, body):
             server.starttls()
             server.ehlo()
         server.login(user, password)
-        server.sendmail(sender, [to_email], msg.as_string())
+        server.sendmail(user, [to_email], msg.as_string())
         server.quit()
         LAST_EMAIL_ERROR = ""
-        print("EMAIL SENT TO:", to_email)
+        print("EMAIL SENT (smtp) TO:", to_email)
         return True
     except Exception as e:
         LAST_EMAIL_ERROR = f"{type(e).__name__}: {e}"
         print("EMAIL ERROR:", LAST_EMAIL_ERROR)
         return False
+
+
+def send_email(to_email, subject, body):
+    """Send an email via the configured provider. Tries Resend first (operator
+    sets ONE api key — clients never configure anything), then SMTP."""
+    global LAST_EMAIL_ERROR
+    if os.getenv("RESEND_API_KEY"):
+        if _send_via_resend(to_email, subject, body):
+            return True
+        # Resend failed — try SMTP if it's also configured.
+    if _send_via_smtp(to_email, subject, body):
+        return True
+    if not email_enabled():
+        LAST_EMAIL_ERROR = "No email provider configured — set RESEND_API_KEY (recommended) or SMTP_HOST/SMTP_USER/SMTP_PASS."
+        print("EMAIL ERROR:", LAST_EMAIL_ERROR)
+    return False
 
 
 
@@ -398,8 +445,12 @@ init_db()
 
 
 def email_enabled() -> bool:
-    """True only when outbound SMTP is actually configured."""
-    return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS"))
+    """True when ANY outbound email provider is configured — Resend (one API
+    key, no SMTP) or classic SMTP."""
+    return bool(
+        os.getenv("RESEND_API_KEY")
+        or (os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS"))
+    )
 
 
 UPLOADS_DIR = os.getenv("KHOMA_UPLOADS_DIR", str(BASE_DIR / "uploads"))
@@ -3597,24 +3648,27 @@ def debug_email(request: Request):
     user = require_user(request)
     if not user:
         return {"ok": False, "error": "Not logged in"}
+    provider = "resend" if os.getenv("RESEND_API_KEY") else ("smtp" if os.getenv("SMTP_HOST") else "none")
     configured = {
+        "RESEND_API_KEY": bool(os.getenv("RESEND_API_KEY")),
+        "EMAIL_FROM": email_from(),
         "SMTP_HOST": bool(os.getenv("SMTP_HOST")),
         "SMTP_PORT": os.getenv("SMTP_PORT", "587"),
         "SMTP_USER": bool(os.getenv("SMTP_USER")),
         "SMTP_PASS": bool(os.getenv("SMTP_PASS")),
-        "SMTP_FROM": os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "")) and True,
     }
     sent = send_email(
         user["email"],
         "KhomaAPI email test",
-        "This is a KhomaAPI SMTP test. If you received this, outbound email works.",
+        "This is a KhomaAPI email test. If you received this, outbound email works.",
     )
     return {
         "ok": sent,
+        "provider": provider,
         "email_enabled": email_enabled(),
         "sent_to": user["email"] if sent else None,
         "error": None if sent else LAST_EMAIL_ERROR,
-        "smtp_configured": configured,
+        "configured": configured,
     }
 
 
