@@ -170,6 +170,13 @@ def get_fills(env: str, token: str) -> list:
     return data if isinstance(data, list) else []
 
 
+def get_orders(env: str, token: str) -> list:
+    # Tradovate Fill objects carry orderId (not accountId); orders carry the
+    # accountId, so we use this to attribute fills to the right account.
+    data = _get(env, token, "/order/list")
+    return data if isinstance(data, list) else []
+
+
 def get_cash_snapshot(env: str, token: str, account_id):
     try:
         return _post(env, token, "/cashBalance/getCashBalanceSnapshot", {"accountId": int(account_id)})

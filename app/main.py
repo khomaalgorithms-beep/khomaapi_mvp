@@ -862,10 +862,44 @@ def _snapshot_value(snap, keys):
     return None
 
 
+def _orders_account_map(orders) -> Dict[Any, Any]:
+    """orderId -> accountId, so fills (which only carry orderId) can be tied
+    back to the account that placed them."""
+    m: Dict[Any, Any] = {}
+    for o in orders or []:
+        oid = o.get("id")
+        aid = o.get("accountId")
+        if oid is not None and aid is not None:
+            m[str(oid)] = str(aid)
+    return m
+
+
+def _fills_for_account(fills_all, orders_map, acct_id, single_account: bool = False):
+    """Return the fills belonging to `acct_id`. Tradovate Fill objects don't
+    include accountId, so we resolve via the order -> account map. When the user
+    has a single connected account, unattributable fills default to it."""
+    aid = str(acct_id)
+    out = []
+    for f in fills_all or []:
+        fa = f.get("accountId")
+        if fa is not None and str(fa) == aid:
+            out.append(f)
+            continue
+        oid = f.get("orderId")
+        mapped = orders_map.get(str(oid)) if oid is not None else None
+        if mapped is not None:
+            if mapped == aid:
+                out.append(f)
+        elif single_account:
+            out.append(f)
+    return out
+
+
 def live_account_monitor(user_id: int) -> Dict[str, Any]:
     """Aggregate live open positions + PnL across the user's connected accounts."""
     accounts = get_broker_accounts(user_id, connected_only=True)
     out_accounts = []
+    all_trips: list = []
     token_cache: Dict[tuple, tuple] = {}
     contract_names: Dict[Any, str] = {}
     today = date.today().isoformat()
@@ -885,8 +919,10 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
 
         key = (token, env)
         if key not in token_cache:
-            token_cache[key] = (tvo.get_positions(env, token), tvo.get_fills(env, token))
-        positions_all, fills_all = token_cache[key]
+            token_cache[key] = (tvo.get_positions(env, token), tvo.get_fills(env, token), tvo.get_orders(env, token))
+        positions_all, fills_all, orders_all = token_cache[key]
+        orders_map = _orders_account_map(orders_all)
+        single_account = len(accounts) == 1
 
         def name_for(cid):
             if cid in contract_names:
@@ -922,11 +958,17 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
         # Resilience: if the realtime position endpoint returns nothing (it can
         # be briefly empty or flaky right after a fill), reconstruct open
         # positions from this account's fills instead.
+        # All closed round-trips for this account from broker fills. Used for
+        # win rate / drawdown / journal and as a realized-PnL fallback. Fills
+        # are attributed to the account via the order map (fills lack accountId).
+        acct_all_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
+        trips_acct, open_acct = build_round_trips(acct_all_fills, name_for)
+        all_trips.extend(trips_acct)
+
+        # If the realtime position endpoint is briefly empty after a fill, show
+        # the open positions reconstructed from fills instead.
         if not positions:
-            _trips, open_from_fills = build_round_trips(
-                [f for f in (fills_all or []) if belongs(f)], name_for
-            )
-            for o in open_from_fills:
+            for o in open_acct:
                 positions.append({
                     "symbol": o["symbol"],
                     "side": o["side"],
@@ -934,19 +976,28 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
                     "avg_price": o.get("entry_price"),
                 })
 
-        acct_fills = [
-            f for f in (fills_all or [])
-            if belongs(f) and str(f.get("timestamp", ""))[:10] == today
-        ]
-        realized = realized_pnl_from_fills(acct_fills, name_for) if acct_fills else 0.0
-
+        # PnL pulled DIRECTLY from Tradovate's account snapshot so KhomaAPI
+        # mirrors exactly what the Tradovate panel shows (Open P/L, Total P/L).
         snap = tvo.get_cash_snapshot(env, token, acct_id)
-        open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL", "totalPnL"))
-        total_cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
+        open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
+        total_pnl = _snapshot_value(snap, ("totalPnL", "totalPnl", "netPnL"))
+        snap_realized = _snapshot_value(snap, ("realizedPnL", "realizedPnl", "weekRealizedPnL", "dayRealizedPnL"))
+        total_cash = _snapshot_value(snap, ("totalCashValue", "netLiquidatingValue", "totalCashBalance", "cashBalance", "amount"))
+
+        fills_realized = round(sum(float(t.get("pnl") or 0) for t in trips_acct), 2)
+        if snap_realized is not None:
+            realized = snap_realized
+        elif total_pnl is not None and open_pnl is not None:
+            realized = round(total_pnl - open_pnl, 2)
+        else:
+            realized = fills_realized
+        if total_pnl is None:
+            total_pnl = round((open_pnl or 0) + (realized or 0), 2)
 
         out_accounts.append({
             "name": a["account_name"], "env": env,
-            "open_pnl": open_pnl, "realized_pnl": realized, "total_cash": total_cash,
+            "open_pnl": open_pnl, "realized_pnl": realized,
+            "total_pnl": total_pnl, "total_cash": total_cash,
             "positions": positions,
         })
 
@@ -954,17 +1005,40 @@ def live_account_monitor(user_id: int) -> Dict[str, Any]:
         vals = [acc[field] for acc in out_accounts if acc.get(field) is not None]
         return round(sum(vals), 2) if vals else None
 
-    totals = {"open_pnl": total("open_pnl"), "realized_pnl": total("realized_pnl")}
-    if totals["open_pnl"] is not None or totals["realized_pnl"] is not None:
+    totals = {
+        "open_pnl": total("open_pnl"),
+        "realized_pnl": total("realized_pnl"),
+        "total_pnl": total("total_pnl"),
+    }
+    if totals["total_pnl"] is None and (totals["open_pnl"] is not None or totals["realized_pnl"] is not None):
         totals["total_pnl"] = round((totals["open_pnl"] or 0) + (totals["realized_pnl"] or 0), 2)
-    else:
-        totals["total_pnl"] = None
+
+    # Live performance metrics from real closed round-trips (broker fills).
+    chron = sorted(all_trips, key=lambda t: str(t.get("closed_at", "")))
+    pnls = [float(t.get("pnl") or 0) for t in chron]
+    running = peak = max_dd = 0.0
+    for p in pnls:
+        running += p
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+    wins = len([p for p in pnls if p > 0])
+    losses = len([p for p in pnls if p < 0])
+    closed = wins + losses
+    metrics = {
+        "win_rate": round(wins / closed * 100, 1) if closed else 0.0,
+        "wins": wins,
+        "losses": losses,
+        "closed_trades": closed,
+        "realized_pnl": round(sum(pnls), 2),
+        "max_drawdown": round(abs(max_dd), 2),
+    }
 
     return {
         "ok": True,
         "connected": len(accounts) > 0,
         "accounts": out_accounts,
         "totals": totals,
+        "metrics": metrics,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1041,13 +1115,10 @@ def account_trade_history(user_id: int):
 
         key = (token, env)
         if key not in token_cache:
-            token_cache[key] = tvo.get_fills(env, token)
-        fills_all = token_cache[key]
-
-        try:
-            acct_id_int = int(acct_id)
-        except Exception:
-            acct_id_int = None
+            token_cache[key] = (tvo.get_fills(env, token), tvo.get_orders(env, token))
+        fills_all, orders_all = token_cache[key]
+        orders_map = _orders_account_map(orders_all)
+        single_account = len(accounts) == 1
 
         def name_for(cid):
             if cid in contract_names:
@@ -1057,10 +1128,7 @@ def account_trade_history(user_id: int):
             contract_names[cid] = nm or f"#{cid}"
             return contract_names[cid]
 
-        acct_fills = [
-            f for f in (fills_all or [])
-            if acct_id_int is None or f.get("accountId") == acct_id_int or str(f.get("accountId")) == str(acct_id)
-        ]
+        acct_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
         trips, openp = build_round_trips(acct_fills, name_for)
         for t in trips:
             t["account"] = a["account_name"]
@@ -2136,26 +2204,41 @@ DASHBOARD_LIVE_SCRIPT = """
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
     });
   }
+  function setMetric(id, value, suffix) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = value;
+    if (suffix !== undefined) el.textContent = value + suffix;
+  }
   function render(data) {
     var tp = document.getElementById("totalPnl");
     var lp = document.getElementById("livePnl");
     var lm = document.getElementById("liveMonitor");
     if (!data || !data.connected) {
-      if (tp) tp.textContent = "—";
       if (lp) lp.innerHTML = "<p class='muted'>Connect a Tradovate account to see live PnL.</p>";
       if (lm) lm.innerHTML = "<p class='muted'>No connected account yet. Go to Broker Connect to link your Tradovate accounts.</p>";
       return;
     }
+    // Total PnL (live) — straight from Tradovate.
     if (tp && data.totals && data.totals.total_pnl !== null && data.totals.total_pnl !== undefined) {
       tp.textContent = fmt(data.totals.total_pnl);
       tp.className = cls(data.totals.total_pnl);
     }
+    // Performance metrics from real closed round-trips — update live.
+    var mx = data.metrics || {};
+    if (mx.win_rate !== undefined && mx.win_rate !== null) setMetric("winRate", mx.win_rate, "%");
+    if (mx.max_drawdown !== undefined && mx.max_drawdown !== null) setMetric("maxDrawdown", "$" + Number(mx.max_drawdown).toFixed(2));
+    var wrs = document.getElementById("winRateSub");
+    if (wrs && mx.closed_trades !== undefined) wrs.innerHTML = (mx.wins || 0) + " wins • " + (mx.losses || 0) + " losses • " + (mx.closed_trades || 0) + " closed";
+    var dds = document.getElementById("drawdownSub");
+    if (dds && mx.realized_pnl !== undefined) dds.innerHTML = "Realized: <b>" + fmt(mx.realized_pnl) + "</b> from closed trades.";
+    // Per-account PnL — mirrors Tradovate's Open P/L and Total P/L.
     if (lp) {
       var h = "";
       (data.accounts || []).forEach(function (a) {
         h += "<div class='journal-day'><div><b>" + esc(a.name) + "</b><small>" + esc((a.env || "").toUpperCase()) + "</small></div>" +
-             "<div style='text-align:right'><b class='" + (Number(a.open_pnl) < 0 ? "bad" : "good") + "'>Open " + fmt(a.open_pnl) + "</b>" +
-             "<small>Realized " + fmt(a.realized_pnl) + "</small></div></div>";
+             "<div style='text-align:right'><b class='" + (Number(a.total_pnl) < 0 ? "bad" : "good") + "'>Total " + fmt(a.total_pnl) + "</b>" +
+             "<small>Open " + fmt(a.open_pnl) + " • Realized " + fmt(a.realized_pnl) + "</small></div></div>";
       });
       lp.innerHTML = h || "<p class='muted'>No accounts.</p>";
     }
@@ -2180,7 +2263,7 @@ DASHBOARD_LIVE_SCRIPT = """
       .catch(function () {});
   }
   poll();
-  setInterval(poll, 6000);
+  setInterval(poll, 4000);
 })();
 </script>
 """
@@ -2228,9 +2311,9 @@ def dashboard(request: Request):
     </div>
 
     <div class="grid">
-      <div class="card span3"><h3>Total PnL (live)</h3><div class="metric good" id="totalPnl">—</div><p class="muted">Open + realized from connected accounts.</p></div>
-      <div class="card span3"><h3>Win Rate</h3><div class="metric">{m['win_rate']}%</div><p class="muted">{m['wins']} wins • {m['losses']} losses • {m['closed_trades']} closed (broker fills)</p></div>
-      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn">${m['max_drawdown']}</div><p class="muted">Realized: <b>${m['realized_pnl']}</b> from closed trades.</p></div>
+      <div class="card span3"><h3>Total PnL (live)</h3><div class="metric good" id="totalPnl">${m['total_pnl']}</div><p class="muted">Live from Tradovate — open + realized.</p></div>
+      <div class="card span3"><h3>Win Rate</h3><div class="metric" id="winRate">{m['win_rate']}%</div><p class="muted" id="winRateSub">{m['wins']} wins • {m['losses']} losses • {m['closed_trades']} closed</p></div>
+      <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn" id="maxDrawdown">${m['max_drawdown']}</div><p class="muted" id="drawdownSub">Realized: <b>${m['realized_pnl']}</b> from closed trades.</p></div>
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
       <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Open positions from your connected Tradovate accounts. Refreshes automatically.</p><div id="liveMonitor"><p class="muted">Loading live positions…</p></div></div>
@@ -3330,6 +3413,7 @@ def debug_tradovate_raw(request: Request):
         "env": env,
         "positions": tvo.get_positions(env, token),
         "fills": tvo.get_fills(env, token),
+        "orders": tvo.get_orders(env, token),
         "cash_snapshot": tvo.get_cash_snapshot(env, token, a.get("account_id")),
     }
 
