@@ -93,7 +93,14 @@ FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 # callback can be tied back to the user who started the connect flow.
 OAUTH_STATES: Dict[str, int] = {}
 
-APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
+APP_URL = os.getenv("APP_URL", "https://khomaapi.com")
+
+
+def google_login_button() -> str:
+    """Render the Google sign-in button ONLY when Google OAuth is configured,
+    so launch never shows a button that 500s."""
+    return ('<a class="btn google" href="/auth/google">Continue with Google</a>'
+            if os.getenv("GOOGLE_CLIENT_ID") else "")
 
 # Process start time, for the public /status uptime page.
 APP_START_TIME = time.time()
@@ -3374,13 +3381,13 @@ def root(request: Request):
 
 @app.get("/signup", response_class=HTMLResponse)
 def signup_page():
-    return login_layout('''
+    return login_layout(f'''
     <div class="logo">
 <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
 </div>
     <h1>Create your KhomaAPI account</h1>
     <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
-    <a class="btn google" href="/auth/google">Continue with Google</a>
+    {google_login_button()}
     <form method="post" action="/signup">
       <input name="email" type="email" placeholder="Email" required>
       <input name="password" type="password" placeholder="Password" minlength="8" required>
@@ -3469,13 +3476,13 @@ def verify_email(token: str):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
-    return login_layout('''
+    return login_layout(f'''
     <div class="logo">
 <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
 </div>
     <h1>Welcome back</h1>
     <p>Login to your KhomaAPI execution workspace.</p>
-    <a class="btn google" href="/auth/google">Continue with Google</a>
+    {google_login_button()}
     <form method="post" action="/login">
       <input name="email" placeholder="Email" required>
       <input name="password" type="password" placeholder="Password" required>
@@ -3542,10 +3549,7 @@ def logout(request: Request):
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI = os.getenv(
-    "GOOGLE_REDIRECT_URI",
-    "https://web-production-6ad48.up.railway.app/auth/google/callback"
-)
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", f"{APP_URL}/auth/google/callback")
 
 
 @app.get("/auth/google")
