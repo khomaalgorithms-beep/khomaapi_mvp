@@ -1114,7 +1114,11 @@ def account_live_state(account: dict, cfg: dict, now_utc: datetime = None) -> di
     broker_ok = snap is not None or positions or fills
 
     open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
-    cash = _snapshot_value(snap, ("totalCashValue", "netLiquidatingValue", "totalCashBalance", "cashBalance", "amount"))
+    # netLiq = real account equity (cash + open PnL, commissions already netted).
+    net_liq = _snapshot_value(snap, ("netLiq", "netLiquidatingValue"))
+    # netLiqSOD = equity at Start Of Day -> penny-exact daily PnL baseline.
+    net_liq_sod = _snapshot_value(snap, ("netLiqSOD", "totalCashValueSOD", "cashSODUSD"))
+    cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
     total_pnl = _snapshot_value(snap, ("totalPnL", "totalPnl", "netPnL"))
 
     # Open positions for this account -> roots + flat flag.
@@ -1158,12 +1162,21 @@ def account_live_state(account: dict, cfg: dict, now_utc: datetime = None) -> di
     day_realized = realized_pnl_from_fills(day_fills, name_for) if day_fills else 0.0
     day_trade_count = len(day_fills)
 
-    equity = None
-    if cash is not None:
+    # Equity: prefer the broker's net liquidation value (penny-exact).
+    if net_liq is not None:
+        equity = net_liq
+    elif cash is not None:
         equity = round(cash + (open_pnl or 0), 2)
+    else:
+        equity = None
 
-    # Day PnL prefers fills-derived realized + open PnL; total_pnl as a fallback.
-    if open_pnl is not None or day_fills:
+    # Daily PnL — PENNY-EXACT straight from Tradovate: current equity minus
+    # start-of-day equity (netLiqSOD already nets commissions and resets at the
+    # broker session boundary). Falls back to fills-derived realized + open PnL.
+    if equity is not None and net_liq_sod is not None:
+        day_pnl = round(equity - net_liq_sod, 2)
+        day_realized = round(day_pnl - (open_pnl or 0), 2)
+    elif open_pnl is not None or day_fills:
         day_pnl = round((day_realized or 0) + (open_pnl or 0), 2)
     elif total_pnl is not None:
         day_pnl = total_pnl
@@ -1405,12 +1418,18 @@ def fast_breach_check(a: dict, cfg: dict):
     set_heartbeat(a["id"], True)
 
     open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
-    cash = _snapshot_value(snap, ("totalCashValue", "netLiquidatingValue", "totalCashBalance", "cashBalance", "amount"))
+    net_liq = _snapshot_value(snap, ("netLiq", "netLiquidatingValue"))
+    net_liq_sod = _snapshot_value(snap, ("netLiqSOD", "totalCashValueSOD", "cashSODUSD"))
+    cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
     fast = _ACCT_FAST.get(a["id"], {})
     dr = fast.get("day_realized", 0) or 0
     anchor = fast.get("anchor")
-    equity = round(cash + (open_pnl or 0), 2) if cash is not None else None
-    day_pnl = round(dr + (open_pnl or 0), 2)
+    equity = net_liq if net_liq is not None else (round(cash + (open_pnl or 0), 2) if cash is not None else None)
+    # Penny-exact, fully live: equity - start-of-day equity (incl. fees).
+    if equity is not None and net_liq_sod is not None:
+        day_pnl = round(equity - net_liq_sod, 2)
+    else:
+        day_pnl = round(dr + (open_pnl or 0), 2)
     state = {"ok": True, "equity": equity, "open_pnl": open_pnl, "cash": cash,
              "day_realized": dr, "day_pnl": day_pnl, "flat": False,
              "session_anchor": anchor, "high_water_mark": cfg.get("high_water_mark")}
