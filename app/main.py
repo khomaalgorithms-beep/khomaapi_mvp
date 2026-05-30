@@ -3178,6 +3178,7 @@ document.addEventListener("click", function(event) {{
     {nav_item(active,'webhooks','/webhooks','⌘','Webhooks')}
     {nav_item(active,'logs','/logs','▥','Trade Logs')}
     {nav_item(active,'journal','/journal','◷','Journal')}
+    {nav_item(active,'calendar','/calendar','◆','Economic Calendar')}
     {nav_item(active,'risk','/risk','☰','Risk Engine')}
     {nav_item(active,'settings','/settings','⚙','Settings')}
   </div>
@@ -5002,6 +5003,151 @@ async def journal_trip_save(request: Request, key: str, tags: str = Form(""),
         image_path = f"/uploads/{safe_name}"
     save_trip_journal(user["id"], key, tags.strip(), note.strip(), image_path)
     return RedirectResponse(f"/journal/trip/{key}", status_code=302)
+
+
+# ============================================================
+# ECONOMIC CALENDAR (high-impact events + one-click news lockout)
+# ============================================================
+
+_CAL_FEEDS = {
+    "this": "ff_calendar_thisweek.json",
+    "next": "ff_calendar_nextweek.json",
+    "last": "ff_calendar_lastweek.json",
+}
+_CAL_CACHE: Dict[str, tuple] = {}
+_CAL_TTL = 1200  # 20 minutes
+
+
+def fetch_economic_calendar(week: str = "this") -> list:
+    """Fetch + cache the ForexFactory weekly calendar (community JSON feed).
+    Serves cached/stale data on any failure so the page never breaks."""
+    week = week if week in _CAL_FEEDS else "this"
+    cached = _CAL_CACHE.get(week)
+    if cached and (time.time() - cached[1]) < _CAL_TTL:
+        return cached[0]
+    try:
+        r = requests.get(f"https://nfs.faireconomy.media/{_CAL_FEEDS[week]}",
+                         timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+        data = r.json() if r.status_code < 400 else []
+        if not isinstance(data, list):
+            data = []
+    except Exception:
+        data = []
+    if data:
+        _CAL_CACHE[week] = (data, time.time())
+        return data
+    return cached[0] if cached else []
+
+
+_IMPACT_STYLE = {
+    "high": ("#dc2626", "High"),
+    "medium": ("#ea580c", "Medium"),
+    "low": ("#ca8a04", "Low"),
+    "holiday": ("#9ca3af", "Holiday"),
+}
+
+
+@app.get("/calendar", response_class=HTMLResponse)
+def economic_calendar_page(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    week = (request.query_params.get("week") or "this").lower()
+    impact_filter = (request.query_params.get("impact") or "all").lower()
+
+    events = fetch_economic_calendar(week)
+    # Parse + group by day (ET).
+    by_day = {}
+    for e in events:
+        imp = str(e.get("impact") or "").lower()
+        if impact_filter == "high" and imp != "high":
+            continue
+        if impact_filter == "med" and imp not in ("high", "medium"):
+            continue
+        dt = _parse_iso(e.get("date") or "")
+        if dt is None:
+            continue
+        et = dt.astimezone(ZoneInfo(_ET))
+        day = et.strftime("%A, %b %-d")
+        by_day.setdefault(day, []).append((et, e, imp))
+
+    rows_html = ""
+    if not events:
+        rows_html = "<div class='card span12'><p class='muted'>Calendar data is temporarily unavailable — please refresh in a minute.</p></div>"
+    for day, items in by_day.items():
+        items.sort(key=lambda x: x[0])
+        ev_rows = ""
+        for et, e, imp in items:
+            color, label = _IMPACT_STYLE.get(imp, ("#9ca3af", imp.title() or "—"))
+            dot = f"<span style='display:inline-block;width:9px;height:9px;border-radius:999px;background:{color};margin-right:7px;'></span>"
+            fc = e.get("forecast") or ""
+            pv = e.get("previous") or ""
+            cur = e.get("country") or ""
+            title = e.get("title") or ""
+            # One-click block: lock trading ±15 min around the event.
+            start_iso = (et - timedelta(minutes=15)).astimezone(timezone.utc).isoformat()
+            end_iso = (et + timedelta(minutes=15)).astimezone(timezone.utc).isoformat()
+            block = ""
+            if imp in ("high", "medium"):
+                block = (f"<form method='post' action='/calendar/block' style='margin:0;'>"
+                         f"<input type='hidden' name='starts_at' value='{start_iso}'>"
+                         f"<input type='hidden' name='ends_at' value='{end_iso}'>"
+                         f"<input type='hidden' name='label' value='{cur} {title[:40]}'>"
+                         f"<button class='secondary' style='padding:5px 10px;margin:0;'>🔒 Block ±15m</button></form>")
+            ev_rows += (
+                f"<tr><td style='white-space:nowrap;'>{et.strftime('%-I:%M %p')}</td>"
+                f"<td><b>{cur}</b></td>"
+                f"<td>{dot}<span style='font-size:11px;color:{color};font-weight:800;'>{label}</span></td>"
+                f"<td>{title}</td>"
+                f"<td style='text-align:right;'>{fc}</td><td style='text-align:right;color:#9ca3af;'>{pv}</td>"
+                f"<td style='text-align:right;'>{block}</td></tr>"
+            )
+        rows_html += (f"<div class='card span12'><h3>{day}</h3>"
+                      f"<table><tr><th>Time (ET)</th><th>Cur</th><th>Impact</th><th>Event</th>"
+                      f"<th style='text-align:right'>Forecast</th><th style='text-align:right'>Previous</th><th></th></tr>{ev_rows}</table></div>")
+
+    def wbtn(val, label):
+        cls = "btn" if week == val else "btn secondary"
+        return f'<a class="{cls}" style="padding:7px 13px;margin:0 6px 6px 0;" href="/calendar?week={val}&impact={impact_filter}">{label}</a>'
+
+    def ibtn(val, label):
+        cls = "btn" if impact_filter == val else "btn secondary"
+        return f'<a class="{cls}" style="padding:7px 13px;margin:0 6px 6px 0;" href="/calendar?week={week}&impact={val}">{label}</a>'
+
+    content = f'''
+    <div class="header"><div><h2>Economic Calendar</h2><p>Major market-moving events (ForexFactory data). Block trading around red-folder news in one click — your accounts auto-pause during the window.</p></div></div>
+    <div class="grid">
+      <div class="card span12" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+        {wbtn("last","‹ Last week")}{wbtn("this","This week")}{wbtn("next","Next week ›")}
+        <span style="width:18px;"></span>
+        {ibtn("all","All")}{ibtn("med","Medium+")}{ibtn("high","High only")}
+        <span class="muted" style="margin-left:auto;font-size:12px;">🔴 High · 🟠 Medium · 🟡 Low · times in ET</span>
+      </div>
+      {rows_html}
+    </div>
+    '''
+    return layout(content, user, "calendar")
+
+
+@app.post("/calendar/block")
+async def calendar_block(request: Request):
+    """Create a news-lockout window from a calendar event — the risk engine then
+    rejects opening orders across the user's accounts during that window."""
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    starts, ends = (form.get("starts_at") or "").strip(), (form.get("ends_at") or "").strip()
+    if starts and ends:
+        con = db()
+        con.execute(
+            "INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,created_at) VALUES(?,?,?,?,?,?)",
+            (user["id"], None, starts, ends, (form.get("label") or "Economic event").strip()[:80],
+             datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        con.close()
+    return RedirectResponse("/calendar", status_code=302)
 
 
 @app.get("/settings", response_class=HTMLResponse)
