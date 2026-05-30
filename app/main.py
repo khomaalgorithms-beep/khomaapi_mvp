@@ -95,6 +95,9 @@ FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 OAUTH_STATES: Dict[str, int] = {}
 
 APP_URL = os.getenv("APP_URL", "https://khomaapi.com")
+# Session cookies are Secure (HTTPS-only) by default — correct for production.
+# Set COOKIE_SECURE=0 for local http testing.
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"
 
 
 def google_login_button() -> str:
@@ -3210,7 +3213,50 @@ table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; bord
 .journal-day:last-child {{ border-bottom:none; }} .journal-day b {{ display:block; }} .journal-day small {{ color:var(--muted); }}
 .copy-note {{ background:var(--green-soft); color:var(--green-dark); border:1px solid var(--green-line); padding:12px 14px; border-radius:14px; font-size:14px; font-weight:750; }}
 .google-box {{ border:1px dashed var(--line); border-radius:18px; padding:20px; background:#fbfcfd; }}
-@media(max-width:1100px) {{ .sidebar{{position:relative;width:100%;}} .main{{margin-left:0;}} .shell{{display:block;}} .span3,.span4,.span5,.span6,.span7,.span8{{grid-column:span 12;}} .formgrid{{grid-template-columns:1fr;}} .header{{display:block;}} }}
+/* Hamburger (hidden on desktop) + drawer backdrop */
+.menu-btn {{ display:none; align-items:center; justify-content:center; background:#fff; color:var(--text); border:1px solid var(--line); width:44px; height:44px; min-width:44px; padding:0; border-radius:12px; font-size:21px; line-height:1; box-shadow:none; margin:0; flex:0 0 auto; }}
+.menu-btn:hover {{ transform:none; filter:none; background:#f8faf9; box-shadow:0 8px 20px rgba(17,24,39,.07); }}
+.menu-btn:active {{ transform:scale(.95); }}
+.sidebar-backdrop {{ display:none; position:fixed; inset:0; background:rgba(17,24,39,.45); z-index:150; opacity:0; transition:opacity .2s ease; }}
+.sidebar-backdrop.show {{ display:block; opacity:1; }}
+.topbar-left {{ display:flex; align-items:center; gap:12px; min-width:0; }}
+
+/* Tablet: collapse the 12-col grid to a single column before the phone breakpoint */
+@media(max-width:1100px) {{
+  .span3,.span4,.span5,.span6,.span7,.span8 {{ grid-column:span 12; }}
+  .formgrid {{ grid-template-columns:1fr; }}
+}}
+
+/* Phone / small tablet: off-canvas slide-in nav drawer + stacked content */
+@media(max-width:900px) {{
+  .shell {{ display:block; }}
+  .sidebar {{ width:280px; transform:translateX(-100%); transition:transform .26s cubic-bezier(.2,.7,.3,1); z-index:200; box-shadow:0 24px 80px rgba(17,24,39,.20); overflow-y:auto; padding-bottom:40px; }}
+  .sidebar.open {{ transform:translateX(0); }}
+  .sidebar-card {{ position:static; margin-top:20px; }}
+  .main {{ margin-left:0; }}
+  .menu-btn {{ display:inline-flex; }}
+  .topbar {{ height:60px; padding:0 14px; gap:10px; }}
+  .top-left span {{ display:none; }}
+  .top-left b {{ font-size:13px; display:inline-block; max-width:38vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle; }}
+  .top-actions {{ gap:8px; }}
+  .avatar {{ width:38px; height:38px; font-size:14px; }}
+  .content {{ padding:20px 15px 56px; }}
+  .header {{ display:block; margin-bottom:18px; }}
+  .header h2 {{ font-size:25px; letter-spacing:-.8px; }}
+  .header p {{ font-size:14px; margin-top:7px; }}
+  .grid {{ gap:15px; }}
+  .span12,.span3,.span4,.span5,.span6,.span7,.span8 {{ grid-column:span 12; }}
+  .card {{ padding:18px; border-radius:18px; overflow-x:auto; }}
+  .metric {{ font-size:27px; }}
+  .formgrid {{ grid-template-columns:1fr; }}
+  table {{ min-width:540px; }}  /* wide tables scroll inside their card instead of squashing */
+}}
+@media(max-width:430px) {{
+  .header h2 {{ font-size:22px; }}
+  .top-left b {{ max-width:30vw; }}
+  .pill {{ padding:7px 9px; font-size:11px; }}
+  .content {{ padding:18px 12px 50px; }}
+}}
 </style>
 <script>
 function copyText(id) {{
@@ -3218,6 +3264,29 @@ function copyText(id) {{
   navigator.clipboard.writeText(text);
   alert('Copied');
 }}
+function toggleSidebar() {{
+  const s = document.getElementById('sidebar');
+  const b = document.getElementById('sidebarBackdrop');
+  const open = s.classList.toggle('open');
+  if (b) {{ b.classList.toggle('show', open); }}
+  document.body.style.overflow = open ? 'hidden' : '';
+}}
+function closeSidebar() {{
+  const s = document.getElementById('sidebar');
+  const b = document.getElementById('sidebarBackdrop');
+  if (s) {{ s.classList.remove('open'); }}
+  if (b) {{ b.classList.remove('show'); }}
+  document.body.style.overflow = '';
+}}
+// Tapping any nav link closes the drawer; resizing back to desktop resets it.
+document.addEventListener('DOMContentLoaded', function() {{
+  document.querySelectorAll('.sidebar .nav a').forEach(function(a) {{
+    a.addEventListener('click', closeSidebar);
+  }});
+}});
+window.addEventListener('resize', function() {{
+  if (window.innerWidth > 900) {{ closeSidebar(); }}
+}});
 function toggleProfileMenu() {{
     const menu = document.getElementById("profileMenu");
     menu.style.display = menu.style.display === "block" ? "none" : "block";
@@ -3234,7 +3303,8 @@ document.addEventListener("click", function(event) {{
 </head>
 <body>
 <div class="shell">
-<aside class="sidebar">
+<div class="sidebar-backdrop" id="sidebarBackdrop" onclick="closeSidebar()"></div>
+<aside class="sidebar" id="sidebar">
   <div class="brand"><div class="logo">
   <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:14px;">
 </div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
@@ -3251,7 +3321,10 @@ document.addEventListener("click", function(event) {{
 </aside>
 <main class="main">
   <div class="topbar">
-    <div class="top-left"><b>{email}</b><span>TradingView automation workspace</span></div>
+    <div class="topbar-left">
+      <button class="menu-btn" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
+      <div class="top-left"><b>{email}</b><span>TradingView automation workspace</span></div>
+    </div>
     <div class="top-actions"><span class="{status_pill_cls}">● {status_label}</span>
 <div style="position:relative;">
   <div class="avatar" onclick="toggleProfileMenu()" style="cursor:pointer;">{initials}</div>
@@ -3347,8 +3420,9 @@ def login_layout(content):
     return HTMLResponse(f"""
 <!DOCTYPE html><html><head><title>KhomaAPI Login</title><style>
 body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#f8faf9;color:#111827;}}
-.wrap{{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 10% 10%,#dff5e7,transparent 30%),radial-gradient(circle at 90% 20%,#eefaf2,transparent 28%),#f8faf9;}}
-.card{{width:470px;background:white;border:1px solid #e5e7eb;border-radius:24px;padding:34px;box-shadow:0 24px 90px rgba(17,24,39,.09);}}
+.wrap{{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 16px;box-sizing:border-box;background:radial-gradient(circle at 10% 10%,#dff5e7,transparent 30%),radial-gradient(circle at 90% 20%,#eefaf2,transparent 28%),#f8faf9;}}
+.card{{width:470px;max-width:100%;box-sizing:border-box;background:white;border:1px solid #e5e7eb;border-radius:24px;padding:34px;box-shadow:0 24px 90px rgba(17,24,39,.09);}}
+@media(max-width:520px){{ .wrap{{padding:16px 12px;}} .card{{padding:26px 22px;border-radius:20px;}} h1{{font-size:24px;}} }}
 .logo{{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,#16a34a,#064e2a);color:white;display:flex;align-items:center;justify-content:center;font-weight:950;margin-bottom:20px;}}
 h1{{letter-spacing:-1px;margin:0 0 8px;}} p{{color:#6b7280;line-height:1.55;}} input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:13px;margin:8px 0 14px;box-sizing:border-box;}}
 button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;cursor:pointer;box-shadow:0 10px 24px rgba(15,143,69,.18);transition:transform .14s cubic-bezier(.2,.7,.3,1),box-shadow .2s ease,filter .15s ease;}} a{{color:#0f8f45;font-weight:850;}}
@@ -3578,7 +3652,7 @@ def login(email: str = Form(...), password: str = Form(...)):
         "khoma_session",
         sid,
         httponly=True,
-        secure=True,
+        secure=COOKIE_SECURE,
         samesite="lax"
     )
     return response
@@ -3688,7 +3762,7 @@ def auth_google_callback(code: str = ""):
         "khoma_session",
         sid,
         httponly=True,
-        secure=True,
+        secure=COOKIE_SECURE,
         samesite="lax"
     )
     return response
@@ -5940,6 +6014,7 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial
 .card b{{font-weight:700;}} .muted{{color:#93a1b5;font-size:13px;}}
 .metrics{{display:flex;gap:12px;margin-top:8px;}} .metric{{flex:1;background:#111a2e;border:1px solid #1f2a44;border-radius:14px;padding:18px 22px;}}
 .metric .v{{font-size:26px;font-weight:850;letter-spacing:-1px;}} .foot{{color:#6b7a90;font-size:12px;margin-top:24px;text-align:center;}}
+@media(max-width:520px){{ .wrap{{padding:34px 16px;}} .head{{font-size:19px;padding:18px 18px;}} .metrics{{flex-direction:column;}} .card{{padding:16px 18px;}} }}
 </style></head><body><div class="wrap">
   <div class="brand"><img src="/static/logo.png" alt="KhomaAPI"><h1>KhomaAPI Status</h1></div>
   <div class="head">{headline}</div>
