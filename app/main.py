@@ -5261,10 +5261,8 @@ def economic_calendar_page(request: Request):
 @app.get("/debug/calendar")
 def debug_calendar(request: Request):
     """Verify the calendar data source (FMP vs free feed), field mapping, and the
-    timezone of event timestamps — so we can confirm multi-week is live + correct."""
-    user = require_user(request)
-    if not user:
-        return {"ok": False, "error": "Not logged in"}
+    timezone of event timestamps. Public (only returns non-sensitive public
+    economic data + whether a key is configured) to avoid login friction."""
     now = datetime.now(timezone.utc)
     out = {"fmp_key_set": bool(os.getenv("FMP_API_KEY"))}
     # Raw FMP sample (first event) so we can read its exact fields + date format.
