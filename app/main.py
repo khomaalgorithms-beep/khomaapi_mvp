@@ -21,6 +21,9 @@ import requests
 
 from app.tradovate_oauth import build_tradovate_login, exchange_code_for_token, fetch_accounts
 from app import tradovate_oauth as tvo
+from app import risk_engine as risk
+import asyncio
+import yaml
 import re
 import smtplib
 
@@ -90,6 +93,9 @@ FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
 OAUTH_STATES: Dict[str, int] = {}
 
 APP_URL = os.getenv("APP_URL", "https://web-production-6ad48.up.railway.app")
+
+# Process start time, for the public /status uptime page.
+APP_START_TIME = time.time()
 
 
 def public_base_url(request: Request) -> str:
@@ -518,8 +524,60 @@ def init_db():
     cur.execute("UPDATE broker_accounts SET group_type='copy' WHERE in_copy_box=1 AND (group_type IS NULL OR group_type='independent')")
     cur.execute("UPDATE broker_accounts SET group_type='independent' WHERE group_type IS NULL OR group_type=''")
 
+    # Watchdog / heartbeat state per connected account.
+    ensure_column("broker_accounts", "last_heartbeat", "TEXT")
+    ensure_column("broker_accounts", "connectivity", "TEXT DEFAULT 'unknown'")
+
+    # Per-account risk configuration + runtime state (the Risk Engine).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS account_risk_config(
+        account_id INTEGER PRIMARY KEY,            -- broker_accounts.id
+        user_id INTEGER NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        daily_loss_limit REAL,
+        trailing_dd REAL,
+        trailing_basis TEXT DEFAULT 'intraday',    -- 'intraday' | 'closed'
+        profit_target REAL,
+        max_position INTEGER,
+        max_contracts_per_order INTEGER,
+        max_open_positions INTEGER,
+        daily_trade_cap INTEGER,
+        hours_start TEXT,                          -- 'HH:MM'
+        hours_end TEXT,
+        tz TEXT DEFAULT 'America/New_York',
+        reset_hour INTEGER DEFAULT 17,             -- session reset (local hour)
+        -- runtime state (persisted so locks survive restarts):
+        locked INTEGER DEFAULT 0,
+        locked_reason TEXT DEFAULT '',
+        lock_expires_at TEXT,
+        high_water_mark REAL,
+        hwm_day_anchor TEXT,                        -- session start the HWM belongs to
+        updated_at TEXT
+    )
+    """)
+
+    # User-defined news / manual lockout windows.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS news_windows(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        account_id INTEGER,                         -- NULL = all accounts
+        starts_at TEXT NOT NULL,                    -- ISO UTC
+        ends_at TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        created_at TEXT
+    )
+    """)
+
     con.commit()
     con.close()
+    # Concurrent background poller + request threads -> WAL reduces write locking.
+    try:
+        c2 = db()
+        c2.execute("PRAGMA journal_mode=WAL")
+        c2.close()
+    except Exception:
+        pass
 
 
 init_db()
@@ -823,6 +881,441 @@ def set_account_group(user_id: int, account_db_id: int, group_type: str) -> None
     con.close()
 
 
+# ============================================================
+# RISK ENGINE — per-account config, live state, enforcement, kill-switch
+# ============================================================
+
+RISK_FIELDS = (
+    "daily_loss_limit", "trailing_dd", "trailing_basis", "profit_target",
+    "max_position", "max_contracts_per_order", "max_open_positions",
+    "daily_trade_cap", "hours_start", "hours_end", "tz", "reset_hour", "enabled",
+)
+
+# Recent live state per account_id -> (state, monotonic-ish ts). Written by the
+# background poller and by account_live_state(); read by the pre-order gate so
+# order placement stays fast (no extra broker round-trip per alert).
+ACCOUNT_STATE_CACHE: Dict[int, tuple] = {}
+STATE_CACHE_TTL = 8  # seconds before the gate refetches synchronously
+
+
+def get_risk_config(account_id: int) -> dict:
+    con = db()
+    row = con.execute("SELECT * FROM account_risk_config WHERE account_id=?", (account_id,)).fetchone()
+    con.close()
+    return dict(row) if row else {}
+
+
+def ensure_risk_config(account_id: int, user_id: int) -> dict:
+    cfg = get_risk_config(account_id)
+    if cfg:
+        return cfg
+    con = db()
+    con.execute(
+        "INSERT OR IGNORE INTO account_risk_config(account_id,user_id,updated_at) VALUES(?,?,?)",
+        (account_id, user_id, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit()
+    con.close()
+    return get_risk_config(account_id)
+
+
+def save_risk_config(account_id: int, user_id: int, values: dict) -> None:
+    ensure_risk_config(account_id, user_id)
+    cols = [k for k in RISK_FIELDS if k in values]
+    if not cols:
+        return
+    sets = ", ".join(f"{c}=?" for c in cols) + ", updated_at=?"
+    params = [values[c] for c in cols] + [datetime.now(timezone.utc).isoformat(), account_id, user_id]
+    con = db()
+    con.execute(f"UPDATE account_risk_config SET {sets} WHERE account_id=? AND user_id=?", params)
+    con.commit()
+    con.close()
+
+
+def set_account_lock(account_id: int, locked: bool, reason: str = "", expires_at: str = "") -> None:
+    con = db()
+    con.execute(
+        "UPDATE account_risk_config SET locked=?, locked_reason=?, lock_expires_at=?, updated_at=? WHERE account_id=?",
+        (1 if locked else 0, reason, expires_at, datetime.now(timezone.utc).isoformat(), account_id),
+    )
+    con.commit()
+    con.close()
+
+
+def _maybe_auto_unlock(cfg: dict) -> dict:
+    """Locks auto-clear at the next session reset (new trading day)."""
+    if cfg.get("locked") and cfg.get("lock_expires_at"):
+        try:
+            expires = datetime.fromisoformat(str(cfg["lock_expires_at"]).replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= expires:
+                set_account_lock(cfg["account_id"], False, "", "")
+                cfg = get_risk_config(cfg["account_id"])
+        except Exception:
+            pass
+    return cfg
+
+
+def news_windows_for(user_id: int, account_id: int):
+    """Active/future news windows (as UTC datetime tuples) for an account."""
+    con = db()
+    rows = con.execute(
+        "SELECT starts_at, ends_at FROM news_windows WHERE user_id=? AND (account_id IS NULL OR account_id=?)",
+        (user_id, account_id),
+    ).fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            s = datetime.fromisoformat(str(r["starts_at"]).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(r["ends_at"]).replace("Z", "+00:00"))
+            if s.tzinfo is None:
+                s = s.replace(tzinfo=timezone.utc)
+            if e.tzinfo is None:
+                e = e.replace(tzinfo=timezone.utc)
+            out.append((s, e))
+        except Exception:
+            continue
+    return out
+
+
+def account_live_state(account: dict, cfg: dict, now_utc: datetime = None) -> dict:
+    """Fetch live equity / day-PnL / positions for one account from Tradovate.
+
+    Equity = totalCashValue + openPnL (net liquidation). Day PnL = realized since
+    the session anchor (from fills) + open PnL. Snapshot fields are detected
+    broadly; fills are the fallback so a missing field never silently zeroes risk.
+    Returns {ok, equity, open_pnl, day_pnl, open_symbols, day_trade_count, flat, ...}.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return {"ok": False, "error": "Reconnect required"}
+
+    try:
+        acct_id_int = int(acct_id)
+    except Exception:
+        acct_id_int = None
+
+    def belongs(o):
+        aid = o.get("accountId")
+        return acct_id_int is None or aid == acct_id_int or str(aid) == str(acct_id)
+
+    positions = tvo.get_positions(env, token)
+    fills = tvo.get_fills(env, token)
+    snap = tvo.get_cash_snapshot(env, token, acct_id)
+    # A None snapshot AND empty positions/fills => treat as broker unreachable.
+    broker_ok = snap is not None or positions or fills
+
+    open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
+    cash = _snapshot_value(snap, ("totalCashValue", "netLiquidatingValue", "totalCashBalance", "cashBalance", "amount"))
+    total_pnl = _snapshot_value(snap, ("totalPnL", "totalPnl", "netPnL"))
+
+    # Open positions for this account -> roots + flat flag.
+    open_symbols, contract_names = [], {}
+
+    def name_for(cid):
+        if cid in contract_names:
+            return contract_names[cid]
+        c = tvo.get_contract(env, token, cid) or {}
+        nm = c.get("name") if isinstance(c, dict) else None
+        contract_names[cid] = nm or ""
+        return contract_names[cid]
+
+    net_by_root = {}
+    for p in (positions or []):
+        if not belongs(p):
+            continue
+        net = int(p.get("netPos") or 0)
+        if net == 0:
+            continue
+        root = symbol_root(name_for(p.get("contractId")).upper())
+        open_symbols.append(root)
+        net_by_root[root] = net_by_root.get(root, 0) + net
+    flat = len(open_symbols) == 0
+
+    # Realized PnL since the session anchor, from this account's fills.
+    anchor = risk.session_anchor(now_utc, int(cfg.get("reset_hour") or 17), cfg.get("tz") or "America/New_York")
+    day_fills = []
+    for f in (fills or []):
+        if not belongs(f):
+            continue
+        ts = str(f.get("timestamp", ""))
+        try:
+            fts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if fts.tzinfo is None:
+                fts = fts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if fts >= anchor:
+            day_fills.append(f)
+    day_realized = realized_pnl_from_fills(day_fills, name_for) if day_fills else 0.0
+    day_trade_count = len(day_fills)
+
+    equity = None
+    if cash is not None:
+        equity = round(cash + (open_pnl or 0), 2)
+
+    # Day PnL prefers fills-derived realized + open PnL; total_pnl as a fallback.
+    if open_pnl is not None or day_fills:
+        day_pnl = round((day_realized or 0) + (open_pnl or 0), 2)
+    elif total_pnl is not None:
+        day_pnl = total_pnl
+    else:
+        day_pnl = None
+
+    state = {
+        "ok": bool(broker_ok),
+        "equity": equity,
+        "open_pnl": open_pnl,
+        "day_pnl": day_pnl,
+        "open_symbols": list(set(s for s in open_symbols if s)),
+        "net_by_root": net_by_root,
+        "day_trade_count": day_trade_count,
+        "flat": flat,
+        "session_anchor": anchor.isoformat(),
+        "news_windows": news_windows_for(account.get("user_id"), account.get("id")),
+        "high_water_mark": cfg.get("high_water_mark"),
+        "fetched_at": now_utc.isoformat(),
+    }
+    ACCOUNT_STATE_CACHE[account.get("id")] = (state, time.time())
+    return state
+
+
+def update_account_hwm(account: dict, cfg: dict, state: dict, now_utc: datetime = None):
+    """Persist the trailing high-water-mark, resetting it at each new session."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if state.get("equity") is None:
+        return cfg.get("high_water_mark")
+    anchor_iso = state.get("session_anchor")
+    hwm = cfg.get("high_water_mark")
+    # New trading session -> reset HWM to current equity.
+    if cfg.get("hwm_day_anchor") != anchor_iso:
+        hwm = state["equity"]
+    hwm = risk.update_high_water_mark(hwm, state["equity"], cfg.get("trailing_basis") or "intraday", state.get("flat", True))
+    con = db()
+    con.execute(
+        "UPDATE account_risk_config SET high_water_mark=?, hwm_day_anchor=?, updated_at=? WHERE account_id=?",
+        (hwm, anchor_iso, datetime.now(timezone.utc).isoformat(), account.get("id")),
+    )
+    con.commit()
+    con.close()
+    return hwm
+
+
+def flatten_and_lock_account(account: dict, reason: str, now_utc: datetime = None) -> dict:
+    """Kill-switch: cancel working orders, flatten all positions on the account,
+    then LOCK it until the next session reset. Idempotent."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    results = {"cancelled": 0, "flattened": []}
+    if token and acct_id:
+        try:
+            orders = tvo.get_orders(env, token)
+            for oid in tvo.working_order_ids(orders, acct_id):
+                tvo.cancel_order(env, token, oid)
+                results["cancelled"] += 1
+        except Exception:
+            pass
+        # Flatten every open position on the account.
+        try:
+            for p in (tvo.get_positions(env, token) or []):
+                if str(p.get("accountId")) != str(acct_id):
+                    continue
+                net = int(p.get("netPos") or 0)
+                if net == 0:
+                    continue
+                cname = ((tvo.get_contract(env, token, p.get("contractId")) or {}).get("name") or "").upper()
+                action = "Sell" if net > 0 else "Buy"
+                resp = tvo.place_order(env, token, account.get("account_name"), acct_id, action, cname, abs(net))
+                results["flattened"].append({"symbol": cname, "qty": abs(net), "ok": _order_ok(resp)})
+        except Exception as e:
+            results["flatten_error"] = str(e)
+
+    expires = risk.next_session_anchor(
+        now_utc,
+        int((get_risk_config(account.get("id")).get("reset_hour")) or 17),
+        get_risk_config(account.get("id")).get("tz") or "America/New_York",
+    ).isoformat()
+    set_account_lock(account.get("id"), True, reason, expires)
+    # Log the kill-switch event for the audit trail.
+    try:
+        log_trade(account.get("user_id"), f"risk-lock-{account.get('id')}", "*", "flatten", 0,
+                  "live", "RISK_LOCK", 0, f"RISK LOCK [{account.get('account_name')}]: {reason}", results)
+    except Exception:
+        pass
+    return results
+
+
+def _cached_state(account: dict, cfg: dict):
+    """Return recent live state for an account: from cache if fresh, else fetch."""
+    cached = ACCOUNT_STATE_CACHE.get(account.get("id"))
+    if cached and (time.time() - cached[1]) < STATE_CACHE_TTL:
+        return cached[0]
+    try:
+        return account_live_state(account, cfg)
+    except Exception:
+        return {"ok": False}
+
+
+def risk_gate(account: dict, side: str, qty: int, resolved_symbol: str):
+    """Server-side pre-order risk gate for ONE account. Returns
+    (allowed: bool, reason: str, breach: bool). On a hard-limit breach it fires
+    the kill-switch (flatten + lock) and blocks the order.
+
+    Hard locks are read from the DB (authoritative, no broker call); numeric caps
+    use recent cached live state to keep order placement fast.
+    """
+    cfg = ensure_risk_config(account.get("id"), account.get("user_id"))
+    cfg = _maybe_auto_unlock(cfg)
+
+    # Closing/reducing is always allowed (even when locked).
+    if side in ("flatten", "close"):
+        return True, "", False
+
+    # Fast path: locked -> reject without any broker call.
+    if cfg.get("locked"):
+        return False, cfg.get("locked_reason") or "Account locked", False
+
+    # No rules configured -> allow without fetching live state (keeps placement fast).
+    if not _risk_active(cfg):
+        return True, "", False
+
+    state = _cached_state(account, cfg)
+    root = symbol_root(str(resolved_symbol).upper())
+    cur_net = (state.get("net_by_root") or {}).get(root, 0)
+    if side == "buy":
+        resulting = cur_net + qty
+    elif side == "sell":
+        resulting = cur_net - qty
+    elif side == "reverse":
+        resulting = -cur_net + (qty if cur_net <= 0 else -qty)
+    else:
+        resulting = cur_net
+    intent = {"side": side, "qty": qty, "symbol_root": root, "resulting_net": resulting}
+
+    decision = risk.evaluate_order(cfg, state, intent, datetime.now(timezone.utc))
+    if decision.action == risk.Decision.BREACH:
+        flatten_and_lock_account(account, decision.reason)
+        return False, decision.reason, True
+    if decision.action == risk.Decision.REJECT:
+        return False, decision.reason, False
+    return True, "", False
+
+
+# ============================================================
+# WATCHDOG / HEARTBEAT + BACKGROUND RISK POLLER
+# ============================================================
+
+POLL_INTERVAL = 3          # seconds between risk/heartbeat polls
+HEARTBEAT_STALE = 30       # seconds without a good poll -> DISCONNECTED
+
+
+def set_heartbeat(account_id: int, ok: bool) -> None:
+    con = db()
+    con.execute(
+        "UPDATE broker_accounts SET last_heartbeat=?, connectivity=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), "connected" if ok else "disconnected", account_id),
+    )
+    con.commit()
+    con.close()
+
+
+def account_connectivity(account: dict) -> str:
+    """CONNECTED / DISCONNECTED based on the last successful heartbeat."""
+    hb = _parse_iso(account.get("last_heartbeat") or "")
+    if hb is None:
+        return (account.get("connectivity") or "unknown")
+    if hb.tzinfo is None:
+        hb = hb.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - hb).total_seconds() > HEARTBEAT_STALE:
+        return "disconnected"
+    return account.get("connectivity") or "unknown"
+
+
+def _has_hard_limits(cfg: dict) -> bool:
+    return any(risk._num(cfg.get(k)) for k in ("daily_loss_limit", "trailing_dd", "profit_target"))
+
+
+def _risk_active(cfg: dict) -> bool:
+    """True if this account has ANY enforceable rule configured — used to avoid
+    polling/fetching live state for accounts with no risk rules set."""
+    if str(cfg.get("enabled", 1)) in ("0", "False", "false"):
+        return False
+    if cfg.get("locked"):
+        return True
+    numeric = ("daily_loss_limit", "trailing_dd", "profit_target", "max_position",
+               "max_contracts_per_order", "max_open_positions", "daily_trade_cap")
+    if any(risk._num(cfg.get(k)) for k in numeric):
+        return True
+    return bool(cfg.get("hours_start") and cfg.get("hours_end"))
+
+
+def poll_accounts_once() -> None:
+    """One pass: refresh heartbeat + (for risk-enabled accounts) live state, HWM,
+    and breach detection -> kill-switch. Runs in a worker thread (tvo is sync)."""
+    con = db()
+    rows = con.execute("SELECT * FROM broker_accounts WHERE status='connected'").fetchall()
+    con.close()
+    for r in rows:
+        a = dict(r)
+        cfg = ensure_risk_config(a["id"], a["user_id"])
+        cfg = _maybe_auto_unlock(cfg)
+        risk_on = _risk_active(cfg)
+
+        try:
+            if risk_on:
+                state = account_live_state(a, cfg)
+            else:
+                # Heartbeat-only: a cheap snapshot call.
+                token = ensure_fresh_token(a)
+                snap = tvo.get_cash_snapshot(a.get("env") or "live", token, a.get("account_id")) if token else None
+                state = {"ok": snap is not None}
+        except Exception:
+            state = {"ok": False}
+
+        set_heartbeat(a["id"], bool(state.get("ok")))
+        if not state.get("ok") or not risk_on:
+            continue
+
+        # Update trailing high-water-mark, then re-check hard limits.
+        update_account_hwm(a, cfg, state)
+        cfg = get_risk_config(a["id"])
+        if cfg.get("locked"):
+            continue
+        if _has_hard_limits(cfg):
+            reason = risk.evaluate_breach(cfg, {**state, "high_water_mark": cfg.get("high_water_mark")})
+            if reason:
+                flatten_and_lock_account(a, reason)
+
+
+async def risk_watchdog_loop():
+    print("RISK WATCHDOG started (interval %ss)" % POLL_INTERVAL)
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, poll_accounts_once)
+        except Exception as e:
+            print("WATCHDOG ERROR:", e)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_watchdog():
+    # Disable with KHOMA_DISABLE_WATCHDOG=1 (e.g. in tests / CI).
+    if os.getenv("KHOMA_DISABLE_WATCHDOG") == "1":
+        return
+    asyncio.create_task(risk_watchdog_loop())
+
+
 def _order_ok(resp) -> bool:
     return (
         isinstance(resp, dict)
@@ -998,6 +1491,13 @@ def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dic
     # 3. Submit to all accounts in parallel — same instant, same price.
     def run(a):
         try:
+            # SERVER-SIDE RISK GATE — runs per account before any order reaches
+            # Tradovate. Flatten/close is never blocked (it reduces exposure).
+            if side != "flatten":
+                allowed, reason, breach = risk_gate(a, side, qty, resolved)
+                if not allowed:
+                    return [{"account": a.get("account_name"), "ok": False,
+                             "error": ("Risk: " + reason), "risk_blocked": True, "breach": breach}]
             if side == "flatten":
                 return flatten_on_account(a, symbol)
             elif side == "reverse":
@@ -2631,6 +3131,9 @@ def dashboard(request: Request):
       <div class="card span3"><h3>Max Drawdown</h3><div class="metric warn" id="maxDrawdown">${m['max_drawdown']}</div><p class="muted" id="drawdownSub">Realized: <b>${m['realized_pnl']}</b> from closed trades.</p></div>
       <div class="card span3"><h3>Avg Latency</h3><div class="metric">{m['avg_latency']}ms</div><p class="muted">Cloud routing + broker response.</p></div>
 
+      {dashboard_risk_panel(user['id'])}
+      {dashboard_rejected_feed(user['id'])}
+
       <div class="card span8"><h3>Live Trade Monitor</h3><p class="muted">Open positions from your connected Tradovate accounts. Refreshes automatically.</p><div id="liveMonitor"><p class="muted">Loading live positions…</p></div></div>
       <div class="card span4"><h3>Live Account PnL</h3><p class="muted">Per connected account.</p><div id="livePnl"><p class="muted">Loading…</p></div></div>
 
@@ -2892,22 +3395,352 @@ def webhooks_page(request: Request):
     return layout(content, user, "webhooks")
 
 
+def dashboard_risk_panel(user_id: int) -> str:
+    """Compact per-account risk status for the dashboard: ACTIVE / LOCKED /
+    DISCONNECTED, today's PnL vs daily limit, and trailing-DD headroom."""
+    accounts = get_broker_accounts(user_id, connected_only=True)
+    if not accounts:
+        return ""
+    rows = ""
+    for a in accounts:
+        cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], user_id))
+        conn = account_connectivity(a)
+        if conn == "disconnected":
+            badge = "<span class='pill gray' style='background:#fff7ed;color:#c2410c;border-color:#fed7aa;'>DISCONNECTED</span>"
+        elif cfg.get("locked"):
+            badge = "<span class='pill' style='background:#fee2e2;color:#b91c1c;border-color:#fecaca;'>LOCKED</span>"
+        else:
+            badge = "<span class='pill'>ACTIVE</span>"
+        state = ACCOUNT_STATE_CACHE.get(a["id"], (None,))[0] or {}
+        detail = ""
+        dll = risk._num(cfg.get("daily_loss_limit"))
+        day_pnl = state.get("day_pnl")
+        if dll and day_pnl is not None:
+            cls = "bad" if day_pnl < 0 else "good"
+            detail += f"<small>PnL <b class='{cls}'>${day_pnl:,.0f}</b> / -${dll:,.0f}</small> "
+        tdd = risk._num(cfg.get("trailing_dd"))
+        hwm = cfg.get("high_water_mark")
+        eq = state.get("equity")
+        if tdd and hwm is not None and eq is not None:
+            detail += f"<small>DD headroom <b>${max(0, tdd-(hwm-eq)):,.0f}</b></small>"
+        if cfg.get("locked"):
+            detail = f"<small class='bad'>{cfg.get('locked_reason') or ''}</small>"
+        rows += (f"<div class='journal-day'><div><b>{a['account_name']}</b> "
+                 f"<small style='color:#9ca3af'>{(a.get('env') or '').upper()}</small></div>"
+                 f"<div style='text-align:right'>{badge}<br>{detail}</div></div>")
+    return (f"<div class='card span6'><h3>Risk Status</h3>"
+            f"<p class='muted'>Live per-account enforcement state.</p>{rows}"
+            f"<a class='btn secondary' href='/risk' style='margin-top:10px;'>Open Risk Engine</a></div>")
+
+
+def dashboard_rejected_feed(user_id: int) -> str:
+    """Recent alerts the risk engine blocked or locked — shows the engine working."""
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM trades WHERE user_id=? AND (status='RISK_LOCK' OR (status='REJECTED' AND message LIKE 'Risk:%')) "
+        "ORDER BY id DESC LIMIT 8",
+        (user_id,),
+    ).fetchall()
+    con.close()
+    items = "".join(
+        f"<div class='journal-day'><div><b>{r['symbol']}</b> <small>{(r['ts'] or '')[:19].replace('T',' ')}</small></div>"
+        f"<div style='text-align:right;max-width:60%'><small class='bad'>{(r['message'] or '')[:120]}</small></div></div>"
+        for r in rows
+    ) or "<p class='muted'>No risk-blocked alerts yet.</p>"
+    return f"<div class='card span6'><h3>Risk-Blocked Alerts</h3><p class='muted'>Alerts the engine stopped before they hit the broker.</p>{items}</div>"
+
+
+def load_risk_presets() -> list:
+    try:
+        with open(os.path.join(BASE_DIR, "app", "risk_presets.yaml")) as f:
+            return (yaml.safe_load(f) or {}).get("presets", [])
+    except Exception:
+        return []
+
+
+def _rv(cfg, key):
+    v = cfg.get(key)
+    return "" if v in (None, "") else v
+
+
+def _progress_bar(used_pct: float, color: str) -> str:
+    pct = max(0, min(100, used_pct))
+    return (f"<div style='height:10px;background:#eef0ef;border-radius:999px;overflow:hidden;margin:6px 0;'>"
+            f"<div style='height:100%;width:{pct:.0f}%;background:{color};'></div></div>")
+
+
+def risk_account_card(user, a, cfg, state) -> str:
+    aid = a["id"]
+    name = a["account_name"]
+    env = (a.get("env") or "").upper()
+    conn = account_connectivity(a)
+    locked = bool(cfg.get("locked"))
+
+    # Status badge
+    if conn == "disconnected":
+        status = "<span class='pill gray' style='background:#fff7ed;color:#c2410c;border-color:#fed7aa;'>● DISCONNECTED</span>"
+    elif locked:
+        status = "<span class='pill' style='background:#fee2e2;color:#b91c1c;border-color:#fecaca;'>● LOCKED</span>"
+    else:
+        status = "<span class='pill'>● ACTIVE</span>"
+
+    lock_line = ""
+    if locked:
+        lock_line = (f"<p class='bad' style='margin:6px 0;'><b>Locked:</b> {cfg.get('locked_reason') or ''}</p>"
+                     f"<form method='post' action='/risk/account/{aid}/unlock' style='margin:0 0 10px;'>"
+                     f"<button class='secondary' style='padding:7px 12px;'>Unlock now</button></form>")
+
+    # Live status: day PnL vs daily limit + trailing-DD headroom
+    live = ""
+    if state and state.get("ok"):
+        dll = risk._num(cfg.get("daily_loss_limit"))
+        day_pnl = state.get("day_pnl")
+        if dll and day_pnl is not None:
+            used = (-day_pnl / dll) * 100 if day_pnl < 0 else 0
+            cls = "bad" if day_pnl < 0 else "good"
+            live += (f"<p class='muted' style='margin:10px 0 0;'>Today's PnL: <b class='{cls}'>${day_pnl:,.2f}</b> "
+                     f"/ limit -${dll:,.0f}</p>{_progress_bar(used, '#dc2626')}")
+        tdd = risk._num(cfg.get("trailing_dd"))
+        hwm = cfg.get("high_water_mark")
+        eq = state.get("equity")
+        if tdd and hwm is not None and eq is not None:
+            dd = max(0, hwm - eq)
+            used = (dd / tdd) * 100
+            live += (f"<p class='muted' style='margin:10px 0 0;'>Drawdown from peak: <b>${dd:,.2f}</b> / ${tdd:,.0f} "
+                     f"(headroom ${max(0, tdd-dd):,.2f})</p>{_progress_bar(used, '#ca8a04')}")
+    elif conn == "disconnected":
+        live = "<p class='muted' style='margin:10px 0 0;'>No live data — account is disconnected.</p>"
+
+    f = lambda k: _rv(cfg, k)
+    checked = "" if str(cfg.get("enabled", 1)) in ("0", "False", "false") else "checked"
+    basis = cfg.get("trailing_basis") or "intraday"
+    return f'''
+    <div class="card span6" data-acct="{aid}">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+        <h3 style="margin:0;">{name} <small style="color:#9ca3af;font-weight:600;">{env}</small></h3>{status}
+      </div>
+      {lock_line}{live}
+      <form method="post" action="/risk/account/{aid}/save" style="margin-top:14px;">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;"><input type="checkbox" name="enabled" value="1" {checked} style="width:auto;margin:0;"> Risk enforcement enabled</label>
+        <div style="margin:12px 0 6px;">
+          <label style="font-size:12px;">Load preset</label>
+          <select onchange="applyPreset({aid}, this.value)">
+            <option value="">— choose a starting template —</option>
+            {"".join(f'<option value="{p["id"]}">{p["name"]}</option>' for p in load_risk_presets())}
+          </select>
+        </div>
+        <div class="formgrid">
+          <div><label>Daily loss limit ($)</label><input name="daily_loss_limit" value="{f('daily_loss_limit')}" placeholder="e.g. 1000"></div>
+          <div><label>Trailing drawdown ($)</label><input name="trailing_dd" value="{f('trailing_dd')}" placeholder="e.g. 2000"></div>
+          <div><label>Trailing basis</label><select name="trailing_basis"><option value="intraday" {"selected" if basis=="intraday" else ""}>Intraday equity</option><option value="closed" {"selected" if basis=="closed" else ""}>Closed balance</option></select></div>
+          <div><label>Profit target ($, optional)</label><input name="profit_target" value="{f('profit_target')}" placeholder="auto-stop"></div>
+          <div><label>Max position (contracts)</label><input name="max_position" value="{f('max_position')}"></div>
+          <div><label>Max contracts / order</label><input name="max_contracts_per_order" value="{f('max_contracts_per_order')}"></div>
+          <div><label>Max open positions</label><input name="max_open_positions" value="{f('max_open_positions')}"></div>
+          <div><label>Daily trade cap</label><input name="daily_trade_cap" value="{f('daily_trade_cap')}"></div>
+          <div><label>Trading hours start (HH:MM)</label><input name="hours_start" value="{f('hours_start')}" placeholder="09:30"></div>
+          <div><label>Trading hours end (HH:MM)</label><input name="hours_end" value="{f('hours_end')}" placeholder="16:00"></div>
+          <div><label>Timezone</label><input name="tz" value="{cfg.get('tz') or 'America/New_York'}"></div>
+          <div><label>Session reset hour (local)</label><input name="reset_hour" value="{cfg.get('reset_hour') or 17}"></div>
+        </div>
+        <button>Save risk rules</button>
+        <button formaction="/risk/account/{aid}/flatten-lock" class="danger" formnovalidate onclick="return confirm('Flatten ALL positions on {name} and lock it now?');">Flatten &amp; Lock</button>
+      </form>
+    </div>
+    '''
+
+
+RISK_PRESET_SCRIPT = """
+<script>
+window.KHOMA_PRESETS = %s;
+function applyPreset(aid, pid){
+  if(!pid) return;
+  var p = (window.KHOMA_PRESETS||[]).find(function(x){return x.id===pid;});
+  if(!p) return;
+  if(p.note) { /* show note */ }
+  var card = document.querySelector('[data-acct="'+aid+'"]');
+  if(!card) return;
+  var fields = p.fields||{};
+  Object.keys(fields).forEach(function(k){
+    var el = card.querySelector('[name="'+k+'"]');
+    if(el){ el.value = fields[k]; }
+  });
+  alert((p.note||'Preset loaded.') + '\\n\\nThese are STARTING values — verify them against your firm\\'s current rules, then Save.');
+}
+</script>
+"""
+
+
 @app.get("/risk", response_class=HTMLResponse)
 def risk_page(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
+    accounts = get_broker_accounts(user["id"], connected_only=True)
+    cards = ""
+    for a in accounts:
+        cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], user["id"]))
+        try:
+            state = _cached_state(a, cfg)
+        except Exception:
+            state = {"ok": False}
+        cards += risk_account_card(user, a, cfg, state)
+    if not accounts:
+        cards = "<div class='card span12'><p class='muted'>Connect a Tradovate account on the Broker page to configure per-account risk rules.</p></div>"
+
+    # News / lockout windows
+    con = db()
+    nws = con.execute("SELECT * FROM news_windows WHERE user_id=? ORDER BY starts_at", (user["id"],)).fetchall()
+    con.close()
+    news_rows = "".join(
+        f"<tr><td>{(n['starts_at'] or '')[:16].replace('T',' ')}</td><td>{(n['ends_at'] or '')[:16].replace('T',' ')}</td>"
+        f"<td>{n['label'] or ''}</td><td><form method='post' action='/risk/news/{n['id']}/delete' style='margin:0'><button class='secondary' style='padding:5px 10px;margin:0'>Remove</button></form></td></tr>"
+        for n in nws
+    ) or "<tr><td colspan='4' class='muted'>No lockout windows set.</td></tr>"
+
+    presets_json = json.dumps(load_risk_presets())
     content = f'''
-    <div class="header"><div><h2>Risk Engine</h2><p>Daily order limits and duplicate protection. KhomaAPI trades exactly the symbol and quantity each TradingView alert sends — no symbol list or size cap to maintain.</p></div></div>
-    <div class="card span6"><h3>Webhook Secret</h3><p class="muted">This is your account's signing key. It is included automatically in the Webhooks JSON you copy — you don't set it and can't change it.</p><div class="keybox"><span>{user['webhook_secret']}</span></div></div>
-    <div class="card"><form method="post" action="/risk/save"><div class="formgrid">
-      <div><label>Max Orders Per Day</label><input name="max_orders" value="{user['max_orders']}"><p class="muted">Hard daily cap across all symbols.</p></div>
-      <div><label>Duplicate Lock Seconds</label><input name="duplicate_seconds" value="{user['duplicate_seconds']}"><p class="muted">Blocks identical repeat alerts within this window.</p></div>
-      <div><label>Max Rejections Per Day</label><input name="max_rejections_per_day" value="{user['max_rejections_per_day']}"><p class="muted">Auto-locks automation after this many broker rejections.</p></div>
-    </div><button>Save Risk Settings</button></form></div>
+    <div class="header"><div><h2>Risk Engine</h2><p>Account-survival enforcement. Set your own limits per account — KhomaAPI enforces them server-side, in real time, against your live Tradovate balance, and flattens + locks an account the instant a hard limit is breached.</p></div>
+      <form method="post" action="/risk/flatten-all" onsubmit="return confirm('FLATTEN ALL positions across every connected account and lock them now?');"><button class="danger">⚠ Flatten All &amp; Lock</button></form>
+    </div>
+
+    <div class="card span12" style="background:#fffbeb;border-color:#fde68a;">
+      <p class="muted" style="margin:0;">⚖️ Presets are <b>starting templates</b>, not a compliance guarantee. KhomaAPI enforces exactly the values you save here against your live account — always verify them against your prop firm's current rules.</p>
+    </div>
+
+    <div class="grid">{cards}</div>
+
+    <div class="card span12" style="margin-top:22px;">
+      <h3>News / Manual Lockout Windows</h3>
+      <p class="muted">During these windows, all opening alerts are rejected (closing is still allowed). Times are UTC.</p>
+      <form method="post" action="/risk/news/add" class="formgrid" style="align-items:end;">
+        <div><label>Start (UTC)</label><input type="datetime-local" name="starts_at" required></div>
+        <div><label>End (UTC)</label><input type="datetime-local" name="ends_at" required></div>
+        <div><label>Label</label><input name="label" placeholder="e.g. FOMC"></div>
+        <div><button>Add window</button></div>
+      </form>
+      <table><tr><th>Start</th><th>End</th><th>Label</th><th></th></tr>{news_rows}</table>
+    </div>
+
+    <div class="card span12">
+      <h3>Account-wide safety (legacy)</h3>
+      <form method="post" action="/risk/save"><div class="formgrid">
+        <div><label>Max Orders Per Day</label><input name="max_orders" value="{user['max_orders']}"></div>
+        <div><label>Duplicate Lock Seconds</label><input name="duplicate_seconds" value="{user['duplicate_seconds']}"></div>
+        <div><label>Max Rejections Per Day</label><input name="max_rejections_per_day" value="{user['max_rejections_per_day']}"></div>
+      </div><button>Save</button></form>
+    </div>
     '''
-    return layout(content, user, "risk")
+    return layout(content + (RISK_PRESET_SCRIPT % presets_json), user, "risk")
+
+
+def _risk_owns(user, account_id):
+    con = db()
+    row = con.execute("SELECT * FROM broker_accounts WHERE id=? AND user_id=?", (account_id, user["id"])).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+@app.post("/risk/account/{account_id}/save")
+async def risk_account_save(request: Request, account_id: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if not _risk_owns(user, account_id):
+        return RedirectResponse("/risk")
+    form = await request.form()
+
+    def numf(key):
+        v = (form.get(key) or "").strip()
+        if v == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    values = {
+        "enabled": 1 if form.get("enabled") else 0,
+        "daily_loss_limit": numf("daily_loss_limit"),
+        "trailing_dd": numf("trailing_dd"),
+        "trailing_basis": "closed" if form.get("trailing_basis") == "closed" else "intraday",
+        "profit_target": numf("profit_target"),
+        "max_position": numf("max_position"),
+        "max_contracts_per_order": numf("max_contracts_per_order"),
+        "max_open_positions": numf("max_open_positions"),
+        "daily_trade_cap": numf("daily_trade_cap"),
+        "hours_start": (form.get("hours_start") or "").strip(),
+        "hours_end": (form.get("hours_end") or "").strip(),
+        "tz": (form.get("tz") or "America/New_York").strip(),
+        "reset_hour": int(numf("reset_hour") or 17),
+    }
+    save_risk_config(account_id, user["id"], values)
+    return RedirectResponse("/risk", status_code=302)
+
+
+@app.post("/risk/account/{account_id}/flatten-lock")
+def risk_account_flatten_lock(request: Request, account_id: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    a = _risk_owns(user, account_id)
+    if a:
+        flatten_and_lock_account(a, "Manually flattened & locked by user")
+    return RedirectResponse("/risk", status_code=302)
+
+
+@app.post("/risk/account/{account_id}/unlock")
+def risk_account_unlock(request: Request, account_id: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if _risk_owns(user, account_id):
+        set_account_lock(account_id, False, "", "")
+    return RedirectResponse("/risk", status_code=302)
+
+
+@app.post("/risk/flatten-all")
+def risk_flatten_all(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    for a in get_broker_accounts(user["id"], connected_only=True):
+        flatten_and_lock_account(a, "Global Flatten All & Lock by user")
+    return RedirectResponse("/risk", status_code=302)
+
+
+@app.post("/risk/news/add")
+async def risk_news_add(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    starts, ends = (form.get("starts_at") or "").strip(), (form.get("ends_at") or "").strip()
+    if starts and ends:
+        # datetime-local has no tz -> treat as UTC.
+        con = db()
+        con.execute(
+            "INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,created_at) VALUES(?,?,?,?,?,?)",
+            (user["id"], None, starts + ":00+00:00" if len(starts) == 16 else starts,
+             ends + ":00+00:00" if len(ends) == 16 else ends, (form.get("label") or "").strip(),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        con.close()
+    return RedirectResponse("/risk", status_code=302)
+
+
+@app.post("/risk/news/{nid}/delete")
+def risk_news_delete(request: Request, nid: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    con = db()
+    con.execute("DELETE FROM news_windows WHERE id=? AND user_id=?", (nid, user["id"]))
+    con.commit()
+    con.close()
+    return RedirectResponse("/risk", status_code=302)
 
 
 @app.post("/risk/save")
@@ -3142,9 +3975,36 @@ def settings_page(request: Request):
   </div>
 </div>
 
+<div class="card span12">
+  <h3>Webhook Security</h3>
+  <p class="muted">Your webhook secret signs every TradingView alert. Regenerate it if it may have leaked — this <b>immediately invalidates the old secret</b>, so any existing TradingView alerts will be rejected until you paste the new JSON from the Webhooks page.</p>
+  <div class="keybox" style="margin:12px 0;"><span>{mask_value(user['webhook_secret'])}</span></div>
+  <form method="post" action="/settings/regenerate-webhook-secret" onsubmit="return confirm('Regenerate your webhook secret? Existing TradingView alerts will STOP working until you update them with the new secret from the Webhooks page.');">
+    <button class="danger">Regenerate Webhook Secret</button>
+  </form>
+</div>
+
     </div>
     '''
     return layout(content, user, "settings")
+
+
+@app.post("/settings/regenerate-webhook-secret")
+def regenerate_webhook_secret(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    new_secret = secrets.token_hex(20)
+    con = db()
+    con.execute("UPDATE users SET webhook_secret=? WHERE id=?", (new_secret, user["id"]))
+    con.commit()
+    con.close()
+    return login_layout(
+        "<h1>Webhook secret regenerated</h1>"
+        "<p>Your old secret is now invalid. Open the Webhooks page, copy the new JSON, "
+        "and paste it into every TradingView alert — existing alerts will be rejected until you do.</p>"
+        "<a class='btn' href='/webhooks'>Go to Webhooks</a> <a class='btn secondary' href='/settings'>Back to Settings</a>"
+    )
 
 
 @app.get("/start")
@@ -3424,6 +4284,96 @@ def health():
         "app": "KhomaAPI v5 Full SaaS Dashboard",
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _fmt_uptime(seconds: float) -> str:
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, _ = divmod(s, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _status_data() -> dict:
+    """Aggregate, non-identifying system metrics for the public status page."""
+    con = db()
+    # Broker connectivity: operational if any account had a recent heartbeat.
+    recent_cut = (datetime.now(timezone.utc) - timedelta(seconds=HEARTBEAT_STALE)).isoformat()
+    total = con.execute("SELECT COUNT(*) c FROM broker_accounts WHERE status='connected'").fetchone()["c"]
+    live = con.execute(
+        "SELECT COUNT(*) c FROM broker_accounts WHERE status='connected' AND last_heartbeat >= ?",
+        (recent_cut,),
+    ).fetchone()["c"]
+    # Avg execution latency over the last ~500 executed orders (no user data).
+    row = con.execute(
+        "SELECT AVG(latency_ms) a, COUNT(*) c FROM (SELECT latency_ms FROM trades WHERE status='EXECUTED' AND latency_ms>0 ORDER BY id DESC LIMIT 500)"
+    ).fetchone()
+    con.close()
+    avg_latency = round(row["a"], 1) if row and row["a"] else None
+
+    if total == 0:
+        broker = ("operational", "Operational")
+    elif live > 0:
+        broker = ("operational", "Operational")
+    else:
+        broker = ("degraded", "Degraded — no recent broker heartbeat")
+    return {
+        "uptime": _fmt_uptime(time.time() - APP_START_TIME),
+        "api": ("operational", "Operational"),
+        "broker": broker,
+        "avg_latency": avg_latency,
+        "executions_sampled": row["c"] if row else 0,
+        "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+@app.get("/api/status")
+def api_status():
+    return _status_data()
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page():
+    d = _status_data()
+
+    def dot(state):
+        color = "#16a34a" if state == "operational" else ("#ca8a04" if state == "degraded" else "#dc2626")
+        return f"<span style='display:inline-block;width:11px;height:11px;border-radius:999px;background:{color};margin-right:9px;'></span>"
+
+    overall_ok = d["api"][0] == "operational" and d["broker"][0] == "operational"
+    headline = "All systems operational" if overall_ok else "Partial degradation"
+    head_color = "#0f8f45" if overall_ok else "#ca8a04"
+    lat = f"{d['avg_latency']} ms" if d["avg_latency"] is not None else "—"
+
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>KhomaAPI Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#0b1220;color:#e5e7eb;}}
+.wrap{{max-width:680px;margin:0 auto;padding:56px 20px;}}
+.brand{{display:flex;align-items:center;gap:12px;margin-bottom:30px;}}
+.brand img{{width:40px;height:40px;border-radius:10px;}}
+.brand h1{{font-size:20px;margin:0;letter-spacing:-.4px;}}
+.head{{background:{head_color};border-radius:16px;padding:22px 24px;font-size:22px;font-weight:800;color:#fff;margin-bottom:24px;}}
+.card{{background:#111a2e;border:1px solid #1f2a44;border-radius:14px;padding:18px 22px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;}}
+.card b{{font-weight:700;}} .muted{{color:#93a1b5;font-size:13px;}}
+.metrics{{display:flex;gap:12px;margin-top:8px;}} .metric{{flex:1;background:#111a2e;border:1px solid #1f2a44;border-radius:14px;padding:18px 22px;}}
+.metric .v{{font-size:26px;font-weight:850;letter-spacing:-1px;}} .foot{{color:#6b7a90;font-size:12px;margin-top:24px;text-align:center;}}
+</style></head><body><div class="wrap">
+  <div class="brand"><img src="/static/logo.png" alt="KhomaAPI"><h1>KhomaAPI Status</h1></div>
+  <div class="head">{headline}</div>
+  <div class="card"><div>{dot(d['api'][0])}<b>Execution API</b></div><span class="muted">{d['api'][1]}</span></div>
+  <div class="card"><div>{dot(d['broker'][0])}<b>Broker Connectivity (Tradovate)</b></div><span class="muted">{d['broker'][1]}</span></div>
+  <div class="metrics">
+    <div class="metric"><div class="muted">Uptime</div><div class="v">{d['uptime']}</div></div>
+    <div class="metric"><div class="muted">Avg execution latency</div><div class="v">{lat}</div></div>
+  </div>
+  <div class="card" style="margin-top:12px;"><div><b>Incidents</b></div><span class="muted">No incidents reported</span></div>
+  <p class="foot">Last updated {d['as_of']} · KhomaAlgorithms</p>
+</div></body></html>""")
 
 
 @app.get("/api/trades")

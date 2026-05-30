@@ -1,0 +1,48 @@
+# KhomaAPI risk presets — STARTING TEMPLATES ONLY.
+#
+# These pre-fill the per-account risk fields with common prop-firm-style values.
+# They are NOT a guarantee of compliance with any firm's current rules. KhomaAPI
+# enforces exactly what the user saves on the account, not these defaults.
+# Add new presets here without code changes.
+
+presets:
+  - id: custom
+    name: "Custom (blank)"
+    note: "Start from scratch — set your own values."
+    fields: {}
+
+  - id: eval_50k
+    name: "50K Evaluation (template)"
+    note: "Typical 50K eval starting values — verify against your firm's current rules."
+    fields:
+      daily_loss_limit: 1000
+      trailing_dd: 2000
+      trailing_basis: intraday
+      max_position: 5
+      max_contracts_per_order: 5
+      max_open_positions: 2
+      daily_trade_cap: 40
+
+  - id: eval_100k
+    name: "100K Evaluation (template)"
+    note: "Typical 100K eval starting values — verify against your firm's current rules."
+    fields:
+      daily_loss_limit: 2000
+      trailing_dd: 3000
+      trailing_basis: intraday
+      max_position: 10
+      max_contracts_per_order: 10
+      max_open_positions: 3
+      daily_trade_cap: 60
+
+  - id: eval_150k
+    name: "150K Evaluation (template)"
+    note: "Typical 150K eval starting values — verify against your firm's current rules."
+    fields:
+      daily_loss_limit: 3000
+      trailing_dd: 4500
+      trailing_basis: intraday
+      max_position: 15
+      max_contracts_per_order: 15
+      max_open_positions: 4
+      daily_trade_cap: 80

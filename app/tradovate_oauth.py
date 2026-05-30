@@ -208,6 +208,26 @@ def get_cash_snapshot(env: str, token: str, account_id):
         return None
 
 
+def cancel_order(env: str, token: str, order_id):
+    """Cancel one working order. Used by the risk kill-switch before flattening."""
+    try:
+        return _post(env, token, "/order/cancelorder", {"orderId": int(order_id)})
+    except Exception:
+        return None
+
+
+def working_order_ids(orders, account_id) -> list:
+    """IDs of still-working orders for an account (to cancel on a risk breach)."""
+    out = []
+    for o in orders or []:
+        if str(o.get("accountId")) != str(account_id):
+            continue
+        status = str(o.get("ordStatus") or o.get("status") or "").lower()
+        if status in ("working", "pending", "suspended", "queued", "received", "accepted"):
+            out.append(o.get("id"))
+    return [i for i in out if i is not None]
+
+
 def get_contract(env: str, token: str, contract_id):
     return _get(env, token, "/contract/item", {"id": contract_id})
 
