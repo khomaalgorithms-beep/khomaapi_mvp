@@ -5060,6 +5060,30 @@ def _week_range(week: str, now_et: datetime):
     return monday, monday + timedelta(days=6)
 
 
+def _fmp_economic_calendar(d1, d2):
+    """Call FMP's economic calendar. Tries the new 'stable' endpoint first
+    (current API), then the legacy v3 path (older keys). Returns (data_or_text,
+    status, url_used)."""
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return None, 0, ""
+    urls = [
+        f"https://financialmodelingprep.com/stable/economic-calendar?from={d1}&to={d2}&apikey={key}",
+        f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={key}",
+    ]
+    last = (None, 0, "")
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+            raw = r.json() if r.status_code < 400 else r.text[:400]
+            if isinstance(raw, list) and raw:
+                return raw, r.status_code, u
+            last = (raw, r.status_code, u)
+        except Exception as e:
+            last = (f"{type(e).__name__}: {e}", 0, u)
+    return last
+
+
 def fetch_calendar_events(week: str, now_utc: datetime):
     """Return (normalized_events, multiweek_supported). Uses Financial Modeling
     Prep (full date range) when FMP_API_KEY is set; otherwise the always-free
@@ -5071,15 +5095,9 @@ def fetch_calendar_events(week: str, now_utc: datetime):
         cached = _CAL_CACHE.get(ck)
         if cached and (time.time() - cached[1]) < _CAL_TTL:
             return cached[0], True
-        try:
-            r = requests.get(
-                f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={fmp_key}",
-                timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
-            raw = r.json() if r.status_code < 400 else []
-            evs = [_norm_fmp(e) for e in raw] if isinstance(raw, list) else []
-            evs = [e for e in evs if e["dt"]]
-        except Exception:
-            evs = []
+        raw, _status, _url = _fmp_economic_calendar(d1, d2)
+        evs = [_norm_fmp(e) for e in raw] if isinstance(raw, list) else []
+        evs = [e for e in evs if e["dt"]]
         if evs:
             _CAL_CACHE[ck] = (evs, time.time())
             return evs, True
@@ -5265,19 +5283,14 @@ def debug_calendar(request: Request):
     economic data + whether a key is configured) to avoid login friction."""
     now = datetime.now(timezone.utc)
     out = {"fmp_key_set": bool(os.getenv("FMP_API_KEY"))}
-    # Raw FMP sample (first event) so we can read its exact fields + date format.
+    # Raw FMP sample (first events) so we can read its exact fields + date format.
     if os.getenv("FMP_API_KEY"):
         d1, d2 = _week_range("this", now.astimezone(ZoneInfo(_ET)))
-        try:
-            r = requests.get(
-                f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={os.getenv('FMP_API_KEY')}",
-                timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
-            out["fmp_status"] = r.status_code
-            raw = r.json() if r.status_code < 400 else r.text[:300]
-            out["fmp_count"] = len(raw) if isinstance(raw, list) else 0
-            out["fmp_raw_sample"] = raw[:2] if isinstance(raw, list) else raw
-        except Exception as e:
-            out["fmp_error"] = f"{type(e).__name__}: {e}"
+        raw, status, url = _fmp_economic_calendar(d1, d2)
+        out["fmp_status"] = status
+        out["fmp_url"] = url.split("?")[0] if url else ""
+        out["fmp_count"] = len(raw) if isinstance(raw, list) else 0
+        out["fmp_raw_sample"] = raw[:2] if isinstance(raw, list) else raw
     for wk in ("last", "this", "next"):
         evs, mw = fetch_calendar_events(wk, now)
         out[wk] = {"events": len(evs), "multiweek": mw,
