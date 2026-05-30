@@ -5009,35 +5009,8 @@ async def journal_trip_save(request: Request, key: str, tags: str = Form(""),
 # ECONOMIC CALENDAR (high-impact events + one-click news lockout)
 # ============================================================
 
-_CAL_FEEDS = {
-    "this": "ff_calendar_thisweek.json",
-    "next": "ff_calendar_nextweek.json",
-    "last": "ff_calendar_lastweek.json",
-}
 _CAL_CACHE: Dict[str, tuple] = {}
 _CAL_TTL = 1200  # 20 minutes
-
-
-def fetch_economic_calendar(week: str = "this") -> list:
-    """Fetch + cache the ForexFactory weekly calendar (community JSON feed).
-    Serves cached/stale data on any failure so the page never breaks."""
-    week = week if week in _CAL_FEEDS else "this"
-    cached = _CAL_CACHE.get(week)
-    if cached and (time.time() - cached[1]) < _CAL_TTL:
-        return cached[0]
-    try:
-        r = requests.get(f"https://nfs.faireconomy.media/{_CAL_FEEDS[week]}",
-                         timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
-        data = r.json() if r.status_code < 400 else []
-        if not isinstance(data, list):
-            data = []
-    except Exception:
-        data = []
-    if data:
-        _CAL_CACHE[week] = (data, time.time())
-        return data
-    return cached[0] if cached else []
-
 
 _IMPACT_STYLE = {
     "high": ("#dc2626", "High"),
@@ -5047,84 +5020,240 @@ _IMPACT_STYLE = {
 }
 
 
+def _cal_s(v):
+    return "" if v in (None, "") else str(v)
+
+
+def _norm_ff(e: dict) -> dict:
+    return {
+        "dt": _parse_iso(e.get("date") or ""),
+        "currency": (e.get("country") or "").upper(),
+        "impact": str(e.get("impact") or "").lower(),
+        "title": e.get("title") or "",
+        "forecast": _cal_s(e.get("forecast")),
+        "previous": _cal_s(e.get("previous")),
+        "actual": "",
+    }
+
+
+def _norm_fmp(e: dict) -> dict:
+    dt = _parse_iso((e.get("date") or "").replace(" ", "T"))
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return {
+        "dt": dt,
+        "currency": (e.get("currency") or e.get("country") or "").upper()[:6],
+        "impact": str(e.get("impact") or "").lower(),
+        "title": e.get("event") or "",
+        "forecast": _cal_s(e.get("estimate")),
+        "previous": _cal_s(e.get("previous")),
+        "actual": _cal_s(e.get("actual")),
+    }
+
+
+def _week_range(week: str, now_et: datetime):
+    monday = (now_et - timedelta(days=now_et.weekday())).date()
+    if week == "last":
+        monday -= timedelta(days=7)
+    elif week == "next":
+        monday += timedelta(days=7)
+    return monday, monday + timedelta(days=6)
+
+
+def fetch_calendar_events(week: str, now_utc: datetime):
+    """Return (normalized_events, multiweek_supported). Uses Financial Modeling
+    Prep (full date range) when FMP_API_KEY is set; otherwise the always-free
+    ForexFactory weekly feed (current week only). Cached + stale-on-failure."""
+    fmp_key = os.getenv("FMP_API_KEY")
+    if fmp_key:
+        d1, d2 = _week_range(week, now_utc.astimezone(ZoneInfo(_ET)))
+        ck = f"fmp:{d1}"
+        cached = _CAL_CACHE.get(ck)
+        if cached and (time.time() - cached[1]) < _CAL_TTL:
+            return cached[0], True
+        try:
+            r = requests.get(
+                f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={fmp_key}",
+                timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+            raw = r.json() if r.status_code < 400 else []
+            evs = [_norm_fmp(e) for e in raw] if isinstance(raw, list) else []
+            evs = [e for e in evs if e["dt"]]
+        except Exception:
+            evs = []
+        if evs:
+            _CAL_CACHE[ck] = (evs, time.time())
+            return evs, True
+        if cached:
+            return cached[0], True
+        # FMP failed -> fall through to the free feed (this week only).
+
+    cached = _CAL_CACHE.get("ff")
+    if cached and (time.time() - cached[1]) < _CAL_TTL:
+        return cached[0], False
+    try:
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                         timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+        raw = r.json() if r.status_code < 400 else []
+        evs = [_norm_ff(e) for e in raw] if isinstance(raw, list) else []
+        evs = [e for e in evs if e["dt"]]
+    except Exception:
+        evs = []
+    if evs:
+        _CAL_CACHE["ff"] = (evs, time.time())
+        return evs, False
+    return (cached[0] if cached else []), False
+
+
+def _lockout_window(dt_utc: datetime, duration: str):
+    """(start_utc, end_utc) for a lockout. minutes -> ±minutes; 'day' -> the
+    whole ET trading day containing the event."""
+    if duration == "day":
+        et = dt_utc.astimezone(ZoneInfo(_ET))
+        start = et.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.astimezone(timezone.utc), (start + timedelta(days=1)).astimezone(timezone.utc)
+    try:
+        m = int(duration)
+    except (TypeError, ValueError):
+        m = 15
+    return dt_utc - timedelta(minutes=m), dt_utc + timedelta(minutes=m)
+
+
 @app.get("/calendar", response_class=HTMLResponse)
 def economic_calendar_page(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
+    now_utc = datetime.now(timezone.utc)
     week = (request.query_params.get("week") or "this").lower()
     impact_filter = (request.query_params.get("impact") or "all").lower()
+    cur_filter = (request.query_params.get("cur") or "all").upper()
 
-    events = fetch_economic_calendar(week)
-    # Parse + group by day (ET).
+    events, multiweek = fetch_calendar_events(week, now_utc)
+    if not multiweek:
+        week = "this"
+
+    currencies = sorted({e["currency"] for e in events if e["currency"]})
+    today_et = now_utc.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d")
+
     by_day = {}
+    next_hi = None
     for e in events:
-        imp = str(e.get("impact") or "").lower()
+        imp = e["impact"]
         if impact_filter == "high" and imp != "high":
             continue
         if impact_filter == "med" and imp not in ("high", "medium"):
             continue
-        dt = _parse_iso(e.get("date") or "")
-        if dt is None:
+        if cur_filter != "ALL" and e["currency"] != cur_filter:
             continue
-        et = dt.astimezone(ZoneInfo(_ET))
-        day = et.strftime("%A, %b %-d")
-        by_day.setdefault(day, []).append((et, e, imp))
+        et = e["dt"].astimezone(ZoneInfo(_ET))
+        by_day.setdefault(et.strftime("%Y-%m-%d"), []).append((et, e))
+        if imp == "high" and e["dt"] > now_utc and (next_hi is None or e["dt"] < next_hi[0]):
+            next_hi = (e["dt"], e)
 
     rows_html = ""
     if not events:
         rows_html = "<div class='card span12'><p class='muted'>Calendar data is temporarily unavailable — please refresh in a minute.</p></div>"
-    for day, items in by_day.items():
-        items.sort(key=lambda x: x[0])
+    for daykey in sorted(by_day.keys()):
+        items = sorted(by_day[daykey], key=lambda x: x[0])
+        day_label = items[0][0].strftime("%A, %b %-d")
+        today_badge = " <span class='pill' style='padding:2px 9px;'>TODAY</span>" if daykey == today_et else ""
         ev_rows = ""
-        for et, e, imp in items:
+        for et, e in items:
+            imp = e["impact"]
             color, label = _IMPACT_STYLE.get(imp, ("#9ca3af", imp.title() or "—"))
             dot = f"<span style='display:inline-block;width:9px;height:9px;border-radius:999px;background:{color};margin-right:7px;'></span>"
-            fc = e.get("forecast") or ""
-            pv = e.get("previous") or ""
-            cur = e.get("country") or ""
-            title = e.get("title") or ""
-            # One-click block: lock trading ±15 min around the event.
-            start_iso = (et - timedelta(minutes=15)).astimezone(timezone.utc).isoformat()
-            end_iso = (et + timedelta(minutes=15)).astimezone(timezone.utc).isoformat()
+            actual = e.get("actual") or ""
+            act_html = f"<b>{actual}</b>" if actual else "<span style='color:#cbd5e1'>—</span>"
+            event_iso = et.astimezone(timezone.utc).isoformat()
             block = ""
             if imp in ("high", "medium"):
-                block = (f"<form method='post' action='/calendar/block' style='margin:0;'>"
-                         f"<input type='hidden' name='starts_at' value='{start_iso}'>"
-                         f"<input type='hidden' name='ends_at' value='{end_iso}'>"
-                         f"<input type='hidden' name='label' value='{cur} {title[:40]}'>"
-                         f"<button class='secondary' style='padding:5px 10px;margin:0;'>🔒 Block ±15m</button></form>")
+                block = (f"<form method='post' action='/calendar/block' style='margin:0;' "
+                         f"onsubmit=\"this.duration.value=document.getElementById('lockdur').value\">"
+                         f"<input type='hidden' name='event_at' value='{event_iso}'>"
+                         f"<input type='hidden' name='duration' value='15'>"
+                         f"<input type='hidden' name='label' value='{e['currency']} {e['title'][:40]}'>"
+                         f"<button class='secondary' style='padding:5px 10px;margin:0;'>🔒 Block</button></form>")
             ev_rows += (
                 f"<tr><td style='white-space:nowrap;'>{et.strftime('%-I:%M %p')}</td>"
-                f"<td><b>{cur}</b></td>"
+                f"<td><b>{e['currency']}</b></td>"
                 f"<td>{dot}<span style='font-size:11px;color:{color};font-weight:800;'>{label}</span></td>"
-                f"<td>{title}</td>"
-                f"<td style='text-align:right;'>{fc}</td><td style='text-align:right;color:#9ca3af;'>{pv}</td>"
+                f"<td>{e['title']}</td>"
+                f"<td style='text-align:right;'>{act_html}</td>"
+                f"<td style='text-align:right;'>{e['forecast']}</td>"
+                f"<td style='text-align:right;color:#9ca3af;'>{e['previous']}</td>"
                 f"<td style='text-align:right;'>{block}</td></tr>"
             )
-        rows_html += (f"<div class='card span12'><h3>{day}</h3>"
+        rows_html += (f"<div class='card span12'><h3>{day_label}{today_badge}</h3>"
                       f"<table><tr><th>Time (ET)</th><th>Cur</th><th>Impact</th><th>Event</th>"
-                      f"<th style='text-align:right'>Forecast</th><th style='text-align:right'>Previous</th><th></th></tr>{ev_rows}</table></div>")
+                      f"<th style='text-align:right'>Actual</th><th style='text-align:right'>Forecast</th>"
+                      f"<th style='text-align:right'>Previous</th><th></th></tr>{ev_rows}</table></div>")
 
-    def wbtn(val, label):
+    def wbtn(val, lab):
         cls = "btn" if week == val else "btn secondary"
-        return f'<a class="{cls}" style="padding:7px 13px;margin:0 6px 6px 0;" href="/calendar?week={val}&impact={impact_filter}">{label}</a>'
+        return f'<a class="{cls}" style="padding:7px 12px;margin:0 5px 5px 0;" href="/calendar?week={val}&impact={impact_filter}&cur={cur_filter}">{lab}</a>'
 
-    def ibtn(val, label):
+    def ibtn(val, lab):
         cls = "btn" if impact_filter == val else "btn secondary"
-        return f'<a class="{cls}" style="padding:7px 13px;margin:0 6px 6px 0;" href="/calendar?week={week}&impact={val}">{label}</a>'
+        return f'<a class="{cls}" style="padding:7px 12px;margin:0 5px 5px 0;" href="/calendar?week={week}&impact={val}&cur={cur_filter}">{lab}</a>'
+
+    def cbtn(val, lab):
+        cls = "btn" if cur_filter == val else "btn secondary"
+        return f'<a class="{cls}" style="padding:6px 11px;margin:0 5px 5px 0;font-size:13px;" href="/calendar?week={week}&impact={impact_filter}&cur={val}">{lab}</a>'
+
+    week_nav = (wbtn("last", "‹ Last") + wbtn("this", "This week") + wbtn("next", "Next ›")) if multiweek else \
+        '<span class="muted" style="font-size:12px;">This week · add an FMP_API_KEY for multi-week & historical</span>'
+    cur_buttons = cbtn("ALL", "All") + "".join(cbtn(c, c) for c in currencies[:10])
+
+    countdown = ""
+    if next_hi:
+        countdown = (f'<div class="card span12" id="cd-card" style="background:#0b1220;color:#e5e7eb;">'
+                     f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">'
+                     f'<div><div style="font-size:12px;color:#93a1b5;">NEXT HIGH-IMPACT EVENT</div>'
+                     f'<div style="font-size:17px;font-weight:800;">{next_hi[1]["currency"]} · {next_hi[1]["title"]}</div></div>'
+                     f'<div id="cd-timer" data-ts="{int(next_hi[0].timestamp())}" style="font-size:28px;font-weight:850;letter-spacing:-1px;">—</div>'
+                     f'</div></div>')
 
     content = f'''
-    <div class="header"><div><h2>Economic Calendar</h2><p>Major market-moving events (ForexFactory data). Block trading around red-folder news in one click — your accounts auto-pause during the window.</p></div></div>
+    <div class="header"><div><h2>Economic Calendar</h2><p>Major market-moving events. Choose a lockout length and block trading around red-folder news in one click — your accounts auto-pause during the window.</p></div></div>
     <div class="grid">
       <div class="card span12" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
-        {wbtn("last","‹ Last week")}{wbtn("this","This week")}{wbtn("next","Next week ›")}
-        <span style="width:18px;"></span>
+        {week_nav}
+        <span style="width:14px;"></span>
         {ibtn("all","All")}{ibtn("med","Medium+")}{ibtn("high","High only")}
+        <span style="display:flex;align-items:center;gap:8px;margin-left:auto;">
+          <label style="font-size:13px;font-weight:700;">Lockout</label>
+          <select id="lockdur" style="width:auto;margin:0;">
+            <option value="15">± 15 min</option><option value="30">± 30 min</option>
+            <option value="60">± 1 hour</option><option value="120">± 2 hours</option>
+            <option value="day">Entire day</option>
+          </select>
+          <form method="post" action="/calendar/block-all" style="margin:0;" onsubmit="this.duration.value=document.getElementById('lockdur').value">
+            <input type="hidden" name="week" value="{week}"><input type="hidden" name="cur" value="{cur_filter}">
+            <input type="hidden" name="duration" value="15">
+            <button class="danger" style="padding:7px 12px;margin:0;">🔒 Block all High-impact</button>
+          </form>
+        </span>
+      </div>
+      <div class="card span12" style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;">
+        <span class="muted" style="font-size:12px;margin-right:6px;">Currency:</span>{cur_buttons}
         <span class="muted" style="margin-left:auto;font-size:12px;">🔴 High · 🟠 Medium · 🟡 Low · times in ET</span>
       </div>
+      {countdown}
       {rows_html}
     </div>
+    <script>
+    (function(){{
+      var el=document.getElementById('cd-timer'); if(!el) return;
+      var ts=parseInt(el.dataset.ts,10)*1000;
+      function tick(){{
+        var d=ts-Date.now();
+        if(d<=0){{ el.textContent='NOW'; return; }}
+        var h=Math.floor(d/3600000), m=Math.floor(d%3600000/60000), s=Math.floor(d%60000/1000);
+        el.textContent=(h>0?h+'h ':'')+m+'m '+s+'s';
+      }}
+      tick(); setInterval(tick,1000);
+    }})();
+    </script>
     '''
     return layout(content, user, "calendar")
 
@@ -5137,17 +5266,49 @@ async def calendar_block(request: Request):
     if not user:
         return RedirectResponse("/login")
     form = await request.form()
-    starts, ends = (form.get("starts_at") or "").strip(), (form.get("ends_at") or "").strip()
-    if starts and ends:
+    dt = _parse_iso((form.get("event_at") or "").strip())
+    if dt is not None:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        start, end = _lockout_window(dt, (form.get("duration") or "15").strip())
         con = db()
         con.execute(
             "INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,created_at) VALUES(?,?,?,?,?,?)",
-            (user["id"], None, starts, ends, (form.get("label") or "Economic event").strip()[:80],
-             datetime.now(timezone.utc).isoformat()),
+            (user["id"], None, start.isoformat(), end.isoformat(),
+             (form.get("label") or "Economic event").strip()[:80], datetime.now(timezone.utc).isoformat()),
         )
         con.commit()
         con.close()
     return RedirectResponse("/calendar", status_code=302)
+
+
+@app.post("/calendar/block-all")
+async def calendar_block_all(request: Request):
+    """Bulk-block every HIGH-impact event in the current view with one click."""
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    week = (form.get("week") or "this").lower()
+    cur = (form.get("cur") or "ALL").upper()
+    duration = (form.get("duration") or "15").strip()
+    events, _mw = fetch_calendar_events(week, datetime.now(timezone.utc))
+    con = db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for e in events:
+        if e["impact"] != "high":
+            continue
+        if cur != "ALL" and e["currency"] != cur:
+            continue
+        start, end = _lockout_window(e["dt"], duration)
+        con.execute(
+            "INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,created_at) VALUES(?,?,?,?,?,?)",
+            (user["id"], None, start.isoformat(), end.isoformat(),
+             f"{e['currency']} {e['title'][:40]}", now_iso),
+        )
+    con.commit()
+    con.close()
+    return RedirectResponse(f"/calendar?week={week}&impact=high&cur={cur}", status_code=302)
 
 
 @app.get("/settings", response_class=HTMLResponse)
