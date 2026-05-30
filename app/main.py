@@ -5857,6 +5857,7 @@ def health():
     return {
         "ok": True,
         "app": "KhomaAPI v5 Full SaaS Dashboard",
+        "db": "postgres" if dbmod.IS_PG else "sqlite",
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
