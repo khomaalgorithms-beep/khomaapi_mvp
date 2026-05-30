@@ -3192,7 +3192,6 @@ document.addEventListener("click", function(event) {{
     {nav_item(active,'risk','/risk','☰','Risk Engine')}
     {nav_item(active,'settings','/settings','⚙','Settings')}
   </div>
-  <div class="sidebar-card"><b>Cloud Execution Active</b><p>No VPS. No ngrok. No screen clicking. KhomaAPI routes TradingView signals directly through broker infrastructure.</p></div>
 </aside>
 <main class="main">
   <div class="topbar">
