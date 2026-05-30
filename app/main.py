@@ -1682,12 +1682,22 @@ def digest_tick():
                     _mark_digest_sent(u["id"], "digest_monthly_sent", pid)
 
 
+def _prewarm_calendar():
+    """Keep the economic-calendar cache warm + current so it stays up to date
+    automatically (incl. the weekly roll-over) without waiting for a page view."""
+    try:
+        fetch_calendar_events("this", datetime.now(timezone.utc))
+    except Exception:
+        pass
+
+
 async def digest_loop():
     print("DIGEST scheduler started (10-min cadence)")
     loop = asyncio.get_event_loop()
     while True:
         try:
             await loop.run_in_executor(None, digest_tick)
+            await loop.run_in_executor(None, _prewarm_calendar)
         except Exception as e:
             print("DIGEST ERROR:", e)
         await asyncio.sleep(600)
@@ -5119,7 +5129,22 @@ def fetch_calendar_events(week: str, now_utc: datetime):
     if evs:
         _CAL_CACHE["ff"] = (evs, time.time())
         return evs, False
-    return (cached[0] if cached else []), False
+    # Fetch failed: serve cached data ONLY if it still covers the current week,
+    # so we never show last week's events as if they were this week's.
+    if cached and _calendar_is_current(cached[0], now_utc):
+        return cached[0], False
+    return [], False
+
+
+def _calendar_is_current(events, now_utc: datetime) -> bool:
+    """True if the cached events still belong to the current (ET) week."""
+    if not events:
+        return False
+    et = now_utc.astimezone(ZoneInfo(_ET))
+    monday = (et - timedelta(days=et.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = monday.astimezone(timezone.utc)
+    end = (monday + timedelta(days=7)).astimezone(timezone.utc)
+    return any(start <= e["dt"] < end for e in events if e.get("dt"))
 
 
 def _lockout_window(dt_utc: datetime, duration: str):
