@@ -897,6 +897,10 @@ RISK_FIELDS = (
 ACCOUNT_STATE_CACHE: Dict[int, tuple] = {}
 STATE_CACHE_TTL = 8  # seconds before the gate refetches synchronously
 
+# Lightweight per-account cache for the 1-second fast breach loop: the realized
+# day-PnL component (only changes on a fill) + whether a position is open.
+_ACCT_FAST: Dict[int, dict] = {}
+
 
 def get_risk_config(account_id: int) -> dict:
     con = db()
@@ -1072,6 +1076,8 @@ def account_live_state(account: dict, cfg: dict, now_utc: datetime = None) -> di
         "ok": bool(broker_ok),
         "equity": equity,
         "open_pnl": open_pnl,
+        "cash": cash,
+        "day_realized": round(day_realized or 0, 2),
         "day_pnl": day_pnl,
         "open_symbols": list(set(s for s in open_symbols if s)),
         "net_by_root": net_by_root,
@@ -1083,6 +1089,12 @@ def account_live_state(account: dict, cfg: dict, now_utc: datetime = None) -> di
         "fetched_at": now_utc.isoformat(),
     }
     ACCOUNT_STATE_CACHE[account.get("id")] = (state, time.time())
+    # Cache the realized component + position flag for the 1s fast breach loop.
+    _ACCT_FAST[account.get("id")] = {
+        "day_realized": round(day_realized or 0, 2),
+        "anchor": anchor.isoformat(),
+        "in_position": not flat,
+    }
     return state
 
 
@@ -1215,7 +1227,6 @@ def risk_gate(account: dict, side: str, qty: int, resolved_symbol: str):
 # WATCHDOG / HEARTBEAT + BACKGROUND RISK POLLER
 # ============================================================
 
-POLL_INTERVAL = 3          # seconds between risk/heartbeat polls
 HEARTBEAT_STALE = 30       # seconds without a good poll -> DISCONNECTED
 
 
@@ -1259,53 +1270,118 @@ def _risk_active(cfg: dict) -> bool:
     return bool(cfg.get("hours_start") and cfg.get("hours_end"))
 
 
-def poll_accounts_once() -> None:
-    """One pass: refresh heartbeat + (for risk-enabled accounts) live state, HWM,
-    and breach detection -> kill-switch. Runs in a worker thread (tvo is sync)."""
+def _breach_and_lock(a: dict, cfg: dict, state: dict):
+    """Shared: evaluate hard limits and fire the kill-switch. Returns a broadcast
+    event dict if the account was just locked, else None."""
+    if cfg.get("locked") or not _has_hard_limits(cfg):
+        return None
+    reason = risk.evaluate_breach(cfg, {**state, "high_water_mark": cfg.get("high_water_mark")})
+    if not reason:
+        return None
+    flatten_and_lock_account(a, reason)
+    return {"event": "risk", "type": "lock", "account_id": a.get("id"),
+            "account": a.get("account_name"), "user_id": a.get("user_id"), "reason": reason}
+
+
+def fast_breach_check(a: dict, cfg: dict):
+    """1-second hot path: ONE cash-snapshot call -> equity + open PnL -> breach.
+    Realized day-PnL is taken from the fast cache (only changes on a fill, which
+    the full refresh picks up). This is what gives near-real-time drawdown/daily-
+    loss enforcement without hammering the broker."""
+    token = ensure_fresh_token(a)
+    env = a.get("env") or "live"
+    acct_id = a.get("account_id")
+    if not token or not acct_id:
+        set_heartbeat(a["id"], False)
+        return None
+    snap = tvo.get_cash_snapshot(env, token, acct_id)
+    if snap is None:
+        set_heartbeat(a["id"], False)
+        return None
+    set_heartbeat(a["id"], True)
+
+    open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
+    cash = _snapshot_value(snap, ("totalCashValue", "netLiquidatingValue", "totalCashBalance", "cashBalance", "amount"))
+    fast = _ACCT_FAST.get(a["id"], {})
+    dr = fast.get("day_realized", 0) or 0
+    anchor = fast.get("anchor")
+    equity = round(cash + (open_pnl or 0), 2) if cash is not None else None
+    day_pnl = round(dr + (open_pnl or 0), 2)
+    state = {"ok": True, "equity": equity, "open_pnl": open_pnl, "cash": cash,
+             "day_realized": dr, "day_pnl": day_pnl, "flat": False,
+             "session_anchor": anchor, "high_water_mark": cfg.get("high_water_mark")}
+    # Keep the shared cache warm so the order gate + dashboard see live numbers.
+    prev = ACCOUNT_STATE_CACHE.get(a["id"], ({},))[0]
+    merged = {**prev, **state}
+    ACCOUNT_STATE_CACHE[a["id"]] = (merged, time.time())
+    if anchor:
+        update_account_hwm(a, cfg, merged)
+        cfg = get_risk_config(a["id"])
+    return _breach_and_lock(a, cfg, merged)
+
+
+# Adaptive watchdog cadence.
+FAST_INTERVAL = 1          # seconds — hot loop tick
+FULL_REFRESH_TICKS = 10    # full state (fills/positions) every N ticks (~10s)
+_WATCH_TICK = 0
+
+
+def poll_tick():
+    """One watchdog tick. Fast snapshot breach-check for risk-active accounts
+    holding a position; periodic full refresh otherwise. Returns lock events."""
+    global _WATCH_TICK
+    _WATCH_TICK += 1
+    events = []
     con = db()
     rows = con.execute("SELECT * FROM broker_accounts WHERE status='connected'").fetchall()
     con.close()
     for r in rows:
         a = dict(r)
-        cfg = ensure_risk_config(a["id"], a["user_id"])
-        cfg = _maybe_auto_unlock(cfg)
-        risk_on = _risk_active(cfg)
-
         try:
-            if risk_on:
+            cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], a["user_id"]))
+            active = _risk_active(cfg)
+            hard = _has_hard_limits(cfg)
+            fast = _ACCT_FAST.get(a["id"], {})
+            in_pos = fast.get("in_position", True)  # assume in-position until first full refresh
+            need_full = active and ((_WATCH_TICK % FULL_REFRESH_TICKS == 0) or a["id"] not in _ACCT_FAST)
+
+            if need_full:
                 state = account_live_state(a, cfg)
-            else:
-                # Heartbeat-only: a cheap snapshot call.
+                set_heartbeat(a["id"], bool(state.get("ok")))
+                if state.get("ok"):
+                    update_account_hwm(a, cfg, state)
+                    ev = _breach_and_lock(a, get_risk_config(a["id"]), state)
+                    if ev:
+                        events.append(ev)
+            elif active and hard and in_pos:
+                ev = fast_breach_check(a, cfg)
+                if ev:
+                    events.append(ev)
+            elif _WATCH_TICK % FULL_REFRESH_TICKS == 0:
+                # Heartbeat-only for accounts with no active risk rules.
                 token = ensure_fresh_token(a)
                 snap = tvo.get_cash_snapshot(a.get("env") or "live", token, a.get("account_id")) if token else None
-                state = {"ok": snap is not None}
+                set_heartbeat(a["id"], snap is not None)
         except Exception:
-            state = {"ok": False}
-
-        set_heartbeat(a["id"], bool(state.get("ok")))
-        if not state.get("ok") or not risk_on:
             continue
-
-        # Update trailing high-water-mark, then re-check hard limits.
-        update_account_hwm(a, cfg, state)
-        cfg = get_risk_config(a["id"])
-        if cfg.get("locked"):
-            continue
-        if _has_hard_limits(cfg):
-            reason = risk.evaluate_breach(cfg, {**state, "high_water_mark": cfg.get("high_water_mark")})
-            if reason:
-                flatten_and_lock_account(a, reason)
+    return events
 
 
 async def risk_watchdog_loop():
-    print("RISK WATCHDOG started (interval %ss)" % POLL_INTERVAL)
+    print("RISK WATCHDOG started — fast breach loop @ %ss, full refresh @ %ss"
+          % (FAST_INTERVAL, FAST_INTERVAL * FULL_REFRESH_TICKS))
     loop = asyncio.get_event_loop()
     while True:
         try:
-            await loop.run_in_executor(None, poll_accounts_once)
+            events = await loop.run_in_executor(None, poll_tick)
+            for ev in events or []:
+                try:
+                    await manager.broadcast(ev)
+                except Exception:
+                    pass
         except Exception as e:
             print("WATCHDOG ERROR:", e)
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(FAST_INTERVAL)
 
 
 @app.on_event("startup")
@@ -2643,6 +2719,21 @@ socket.onmessage = (event) => {{
             location.reload();
         }}
     }}
+
+    // Real-time risk lock: surface instantly and refresh the relevant views.
+    if(data.event === "risk" && data.type === "lock") {{
+        try {{
+            var bar = document.createElement("div");
+            bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
+            bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            document.body.appendChild(bar);
+        }} catch(e) {{}}
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/risk" ||
+           window.location.pathname === "/logs") {{
+            setTimeout(function(){{ location.reload(); }}, 1500);
+        }}
+    }}
 }};
 
 socket.onclose = () => {{
@@ -2696,6 +2787,21 @@ socket.onmessage = (event) => {{
            window.location.pathname === "/journal") {{
 
             location.reload();
+        }}
+    }}
+
+    // Real-time risk lock: surface instantly and refresh the relevant views.
+    if(data.event === "risk" && data.type === "lock") {{
+        try {{
+            var bar = document.createElement("div");
+            bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
+            bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            document.body.appendChild(bar);
+        }} catch(e) {{}}
+        if(window.location.pathname === "/dashboard" ||
+           window.location.pathname === "/risk" ||
+           window.location.pathname === "/logs") {{
+            setTimeout(function(){{ location.reload(); }}, 1500);
         }}
     }}
 }};

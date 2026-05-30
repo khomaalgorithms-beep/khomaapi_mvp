@@ -210,3 +210,54 @@ def test_evaluation_is_pure_per_config():
     state = {"equity": 10000, "day_pnl": 0, "high_water_mark": 10000}
     assert evaluate_order(locked, state, buy(), _now()).action == Decision.REJECT
     assert evaluate_order(active, state, buy(), _now()).action == Decision.ALLOW
+
+
+# ---- exact-boundary + extra edge cases ------------------------------------
+
+def test_trailing_dd_exact_boundary_breaches():
+    cfg = {"trailing_dd": 2000}
+    state = {"equity": 8000, "day_pnl": 0, "high_water_mark": 10000}  # exactly 2000
+    assert evaluate_breach(cfg, state) is not None
+
+
+def test_profit_target_exact_boundary():
+    cfg = {"profit_target": 1000}
+    state = {"equity": 11000, "day_pnl": 1000, "high_water_mark": 11000}
+    assert evaluate_breach(cfg, state) is not None
+
+
+def test_zero_or_blank_limits_are_ignored():
+    # 0 / '' / None must mean "no limit", never an instant breach.
+    for val in (0, "", None, "0"):
+        cfg = {"daily_loss_limit": val, "trailing_dd": val, "profit_target": val}
+        state = {"equity": 1, "day_pnl": -99999, "high_water_mark": 999999}
+        assert evaluate_breach(cfg, state) is None
+        assert evaluate_order(cfg, state, buy(), _now()).action == Decision.ALLOW
+
+
+def test_overnight_hours_window():
+    # Window 18:00 -> 16:00 (overnight). 02:00 ET should be INSIDE.
+    cfg = {"hours_start": "18:00", "hours_end": "16:00", "tz": "America/New_York"}
+    state = {"equity": 10000, "day_pnl": 0, "high_water_mark": 10000}
+    # 07:00 UTC = 02:00 ET
+    assert evaluate_order(cfg, state, buy(), datetime(2026, 6, 1, 7, 0, tzinfo=UTC)).action == Decision.ALLOW
+    # 21:30 UTC = 17:30 ET -> inside the gap (16:00-18:00) -> rejected
+    assert evaluate_order(cfg, state, buy(), datetime(2026, 6, 1, 21, 30, tzinfo=UTC)).action == Decision.REJECT
+
+
+def test_news_window_boundaries_inclusive():
+    s = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
+    e = datetime(2026, 6, 1, 15, 0, tzinfo=UTC)
+    state = {"equity": 10000, "day_pnl": 0, "high_water_mark": 10000, "news_windows": [(s, e)]}
+    cfg = {}
+    assert evaluate_order(cfg, state, buy(), s).action == Decision.REJECT          # at start
+    assert evaluate_order(cfg, state, buy(), e).action == Decision.REJECT          # at end
+    before = datetime(2026, 6, 1, 13, 59, tzinfo=UTC)
+    assert evaluate_order(cfg, state, buy(), before).action == Decision.ALLOW
+
+
+def test_breach_takes_priority_over_size_reject():
+    # A hard breach should return BREACH (flatten+lock), not just REJECT.
+    cfg = {"daily_loss_limit": 500, "max_contracts_per_order": 1}
+    state = {"equity": 9000, "day_pnl": -600, "high_water_mark": 10000}
+    assert evaluate_order(cfg, state, buy(qty=10, resulting=10), _now()).action == Decision.BREACH
