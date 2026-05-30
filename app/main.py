@@ -3100,7 +3100,8 @@ body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,-ap
 .logo {{ width:42px; height:42px; border-radius:14px; background:linear-gradient(135deg,#16a34a,#064e2a); color:white; display:flex; align-items:center; justify-content:center; font-weight:950; box-shadow:0 12px 30px rgba(15,143,69,.25); }}
 .brand h1 {{ font-size:26px; margin:0; letter-spacing:-1px; }}
 .brand small {{ display:block; color:var(--muted); font-size:12px; margin-top:2px; }}
-.nav a {{ display:flex; gap:12px; align-items:center; padding:13px 15px; color:#374151; text-decoration:none; border-radius:12px; margin-bottom:7px; font-size:14px; font-weight:700; }}
+.nav a {{ display:flex; gap:12px; align-items:center; padding:13px 15px; color:#374151; text-decoration:none; border-radius:12px; margin-bottom:7px; font-size:14px; font-weight:700; transition:background .16s ease, color .16s ease, transform .12s ease; }}
+.nav a:hover {{ transform:translateX(2px); }}
 .nav a.active,.nav a:hover {{ background:var(--green-soft); color:var(--green-dark); }}
 .sidebar-card {{ position:absolute; left:16px; right:16px; bottom:22px; background:linear-gradient(135deg,#f1fbf5,#fff); border:1px solid var(--green-line); border-radius:18px; padding:18px; }}
 .sidebar-card b {{ color:var(--green-dark); }} .sidebar-card p {{ color:var(--muted); font-size:13px; line-height:1.5; margin:8px 0 0; }}
@@ -3120,8 +3121,18 @@ body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,-ap
 .card h3 {{ margin:0 0 8px; font-size:16px; letter-spacing:-.2px; }} .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
 .metric {{ font-size:31px; font-weight:950; margin:13px 0 6px; letter-spacing:-1.2px; }}
 .good {{ color:var(--green-dark)!important; }} .bad {{ color:var(--danger)!important; }} .warn {{ color:var(--warning)!important; }}
-.btn,button {{ border:none; background:linear-gradient(135deg,#12a150,#087135); color:white; padding:12px 15px; border-radius:12px; text-decoration:none; font-weight:900; display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; margin:4px 6px 4px 0; box-shadow:0 12px 28px rgba(15,143,69,.18); }}
-.btn.secondary,button.secondary {{ background:white; color:#374151; border:1px solid var(--line); box-shadow:none; }} .btn.danger,button.danger {{ background:var(--danger); }}
+.btn,button {{ border:none; background:linear-gradient(135deg,#12a150,#087135); color:white; padding:12px 15px; border-radius:12px; text-decoration:none; font-weight:900; display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer; margin:4px 6px 4px 0; box-shadow:0 12px 28px rgba(15,143,69,.18); transition:transform .14s cubic-bezier(.2,.7,.3,1), box-shadow .2s ease, filter .15s ease, background .2s ease; will-change:transform; }}
+.btn:hover,button:hover {{ transform:translateY(-2px); filter:brightness(1.06); box-shadow:0 18px 38px rgba(15,143,69,.28); }}
+.btn:active,button:active {{ transform:translateY(0) scale(.985); filter:brightness(.97); box-shadow:0 6px 16px rgba(15,143,69,.20); transition-duration:.05s; }}
+.btn:focus-visible,button:focus-visible {{ outline:none; box-shadow:0 0 0 4px var(--green-soft),0 12px 28px rgba(15,143,69,.18); }}
+.btn.secondary,button.secondary {{ background:white; color:#374151; border:1px solid var(--line); box-shadow:none; }}
+.btn.secondary:hover,button.secondary:hover {{ background:#f8faf9; border-color:var(--green-line); filter:none; box-shadow:0 8px 20px rgba(17,24,39,.07); }}
+.btn.secondary:active,button.secondary:active {{ background:#eef2f0; }}
+.btn.secondary:focus-visible,button.secondary:focus-visible {{ box-shadow:0 0 0 4px var(--green-soft); }}
+.btn.danger,button.danger {{ background:var(--danger); box-shadow:0 12px 28px rgba(220,38,38,.18); }}
+.btn.danger:hover,button.danger:hover {{ box-shadow:0 18px 38px rgba(220,38,38,.30); }}
+.btn.danger:focus-visible,button.danger:focus-visible {{ box-shadow:0 0 0 4px #fde2e2,0 12px 28px rgba(220,38,38,.18); }}
+@media (prefers-reduced-motion: reduce) {{ .btn,button {{ transition:none; }} .btn:hover,button:hover,.btn:active,button:active {{ transform:none; }} }}
 input,select,textarea {{ width:100%; padding:13px 14px; border:1px solid var(--line); border-radius:13px; margin:8px 0 14px; outline:none; background:#fff; font-size:14px; }}
 input:focus,select:focus,textarea:focus {{ border-color:var(--green); box-shadow:0 0 0 4px var(--green-soft); }}
 .formgrid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
@@ -3274,8 +3285,13 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial
 .card{{width:470px;background:white;border:1px solid #e5e7eb;border-radius:24px;padding:34px;box-shadow:0 24px 90px rgba(17,24,39,.09);}}
 .logo{{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,#16a34a,#064e2a);color:white;display:flex;align-items:center;justify-content:center;font-weight:950;margin-bottom:20px;}}
 h1{{letter-spacing:-1px;margin:0 0 8px;}} p{{color:#6b7280;line-height:1.55;}} input{{width:100%;padding:14px;border:1px solid #e5e7eb;border-radius:13px;margin:8px 0 14px;box-sizing:border-box;}}
-button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;}} a{{color:#0f8f45;font-weight:850;}}
-.google{{background:white;color:#111827;border:1px solid #e5e7eb;width:100%;margin-bottom:12px;}}
+button,.btn{{background:#0f8f45;color:white;border:none;padding:13px 16px;border-radius:13px;font-weight:900;text-decoration:none;display:inline-block;cursor:pointer;box-shadow:0 10px 24px rgba(15,143,69,.18);transition:transform .14s cubic-bezier(.2,.7,.3,1),box-shadow .2s ease,filter .15s ease;}} a{{color:#0f8f45;font-weight:850;}}
+button:hover,.btn:hover{{transform:translateY(-2px);filter:brightness(1.06);box-shadow:0 16px 34px rgba(15,143,69,.28);}}
+button:active,.btn:active{{transform:translateY(0) scale(.985);filter:brightness(.97);box-shadow:0 6px 16px rgba(15,143,69,.2);transition-duration:.05s;}}
+button:focus-visible,.btn:focus-visible{{outline:none;box-shadow:0 0 0 4px #dff5e7,0 10px 24px rgba(15,143,69,.18);}}
+.google{{background:white;color:#111827;border:1px solid #e5e7eb;width:100%;margin-bottom:12px;box-shadow:none;}}
+.google:hover{{background:#f8faf9;filter:none;box-shadow:0 8px 20px rgba(17,24,39,.07);}}
+@media (prefers-reduced-motion: reduce){{button,.btn{{transition:none;}}button:hover,.btn:hover,button:active,.btn:active{{transform:none;}}}}
 </style></head><body><div class="wrap"><div class="card">{content}</div></div>
 <script>
 
