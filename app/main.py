@@ -594,6 +594,12 @@ def init_db():
     ensure_column("account_risk_config", "buffer_zone", "REAL")           # funded cushion before max loss
     ensure_column("account_risk_config", "funded_daily_loss", "REAL")
     ensure_column("account_risk_config", "funded_max_loss", "REAL")
+    # Accounts that were defaulted to 'evaluation' but have no prop goal set are
+    # really standard accounts -> stop the misleading EVALUATION badge.
+    cur.execute("""UPDATE account_risk_config SET account_phase='standard'
+                   WHERE account_phase='evaluation'
+                   AND (profit_goal IS NULL OR profit_goal=0)
+                   AND (eval_passed IS NULL OR eval_passed=0)""")
 
     # User-defined news / manual lockout windows.
     cur.execute("""
@@ -957,7 +963,7 @@ def ensure_risk_config(account_id: int, user_id: int) -> dict:
         return cfg
     con = db()
     con.execute(
-        "INSERT OR IGNORE INTO account_risk_config(account_id,user_id,updated_at) VALUES(?,?,?)",
+        "INSERT OR IGNORE INTO account_risk_config(account_id,user_id,account_phase,updated_at) VALUES(?,?,'standard',?)",
         (account_id, user_id, datetime.now(timezone.utc).isoformat()),
     )
     con.commit()
@@ -3869,14 +3875,14 @@ def broker_page(request: Request):
       <div class="card span5"><h3>Connection Status</h3>
         <div class="metric {'good' if connected_count else 'bad'}">{connected_count} Connected</div>
         <p class="muted">{available_count} available (independent) · {box_count} in copy trading. Connect through Tradovate's secure login — KhomaAPI never sees your password.</p>
-        <label style="font-size:13px;font-weight:700;">Which accounts to import?</label>
+        <label style="font-size:13px;font-weight:700;">Account type to connect</label>
         <select id="connect-env" style="margin:6px 0 12px;">
-          <option value="both">Both demo &amp; live</option>
-          <option value="demo">Demo / Eval only</option>
-          <option value="live">Live / Funded only</option>
+          <option value="demo">Demo</option>
+          <option value="live">Live</option>
+          <option value="prop">Prop Firm</option>
         </select>
-        <a class="btn" href="/auth/tradovate/connect?env=both" onclick="this.href='/auth/tradovate/connect?env='+document.getElementById('connect-env').value;">Connect with Tradovate</a>
-        <p class="muted" style="margin-top:8px;font-size:12px;">A single Tradovate login exposes both demo and live. Pick which to pull in so you never trade the wrong one by accident.</p>
+        <a class="btn" href="/auth/tradovate/connect?env=demo" onclick="this.href='/auth/tradovate/connect?env='+document.getElementById('connect-env').value;">Connect with Tradovate</a>
+        <p class="muted" style="margin-top:8px;font-size:12px;">Pick what you're connecting so the right accounts import and nothing gets traded by accident.</p>
       </div>
       <div class="card span7"><h3>Account Groups</h3>
         <p class="muted">Drag accounts between the two groups. <b>Available Accounts</b> trade independently; <b>Copy Trading Accounts</b> all receive the same master signal. The two systems run simultaneously and never interfere.</p>
@@ -4147,7 +4153,7 @@ def risk_account_card(user, a, cfg, state, pf=None) -> str:
     env = (a.get("env") or "").upper()
     conn = account_connectivity(a)
     locked = bool(cfg.get("locked"))
-    phase = (cfg.get("account_phase") or "evaluation")
+    phase = (cfg.get("account_phase") or "standard")
     passed = bool(cfg.get("eval_passed"))
     eff = effective_risk_cfg(cfg)
 
@@ -4161,10 +4167,13 @@ def risk_account_card(user, a, cfg, state, pf=None) -> str:
 
     if phase == "funded":
         phase_badge = "<span class='pill'>FUNDED</span>"
-    elif passed:
+    elif phase == "evaluation" and passed:
         phase_badge = "<span class='pill' style='background:#ecfdf5;color:#047857;border-color:#a7f3d0;'>✓ EVAL PASSED</span>"
-    else:
+    elif phase == "evaluation":
         phase_badge = "<span class='pill gray'>EVALUATION</span>"
+    else:
+        env_label = (a.get("env") or "live").upper()
+        phase_badge = f"<span class='pill gray'>{env_label}</span>"
 
     lock_line = ""
     if locked:
@@ -4217,7 +4226,7 @@ def risk_account_card(user, a, cfg, state, pf=None) -> str:
 
     # Funded section (unlocked once the evaluation is passed).
     funded_section = ""
-    if passed:
+    if passed or phase == "funded":
         fchecked = "checked" if phase == "funded" else ""
         funded_section = f'''
         <div style="margin:16px 0 6px;padding:14px;border:1px solid #a7f3d0;background:#f0fdf4;border-radius:14px;">
@@ -4242,14 +4251,26 @@ def risk_account_card(user, a, cfg, state, pf=None) -> str:
       <form method="post" action="/risk/account/{aid}/save" style="margin-top:14px;">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;"><input type="checkbox" name="enabled" value="1" {checked} style="width:auto;margin:0;"> Risk enforcement enabled</label>
         <div class="formgrid" style="margin-top:10px;">
+          <div><label>Account type</label><select name="account_phase">
+            <option value="standard" {"selected" if phase=="standard" else ""}>Standard ({env or 'LIVE'})</option>
+            <option value="evaluation" {"selected" if phase=="evaluation" else ""}>Prop Evaluation</option>
+            <option value="funded" {"selected" if phase=="funded" else ""}>Prop Funded</option>
+          </select></div>
           <div><label>Prop firm</label><input name="prop_firm" value="{f('prop_firm')}" placeholder="e.g. Apex, TPT"></div>
+        </div>
+        <div class="formgrid">
           <div><label>Load preset</label><select onchange="applyPreset({aid}, this.value)"><option value="">— template —</option>{"".join(f'<option value="{p["id"]}">{p["name"]}</option>' for p in load_risk_presets())}</select></div>
+          <div></div>
         </div>
 
-        <h4 style="margin:14px 0 0;">Evaluation rules</h4>
+        <h4 style="margin:14px 0 0;">Evaluation goal <small class="muted" style="font-weight:500;">— used in Prop Evaluation</small></h4>
         <div class="formgrid">
           <div><label>Profit goal ($)</label><input name="profit_goal" value="{f('profit_goal')}" placeholder="e.g. 3000"></div>
           <div><label>Profit factor target</label><input name="profit_factor_target" value="{f('profit_factor_target')}" placeholder="e.g. 1.5"></div>
+        </div>
+
+        <h4 style="margin:14px 0 0;">Risk limits</h4>
+        <div class="formgrid">
           <div><label>Daily loss limit ($)</label><input name="daily_loss_limit" value="{f('daily_loss_limit')}" placeholder="e.g. 1000"></div>
           <div><label>Max drawdown ($)</label><input name="trailing_dd" value="{f('trailing_dd')}" placeholder="e.g. 2000"></div>
           <div><label>Drawdown basis</label><select name="trailing_basis"><option value="intraday" {"selected" if basis=="intraday" else ""}>Intraday equity</option><option value="closed" {"selected" if basis=="closed" else ""}>Closed balance</option></select></div>
@@ -4398,8 +4419,13 @@ async def risk_account_save(request: Request, account_id: int):
             return None
 
     existing = get_risk_config(account_id)
-    # Funded mode only activatable once the evaluation is passed.
-    phase = "funded" if (form.get("activate_funded") and existing.get("eval_passed")) else "evaluation"
+    # Account type is chosen explicitly (standard / evaluation / funded). The
+    # "Activate funded" toggle in the funded section is a shortcut to 'funded'.
+    phase = (form.get("account_phase") or "standard").lower()
+    if phase not in ("standard", "evaluation", "funded"):
+        phase = "standard"
+    if form.get("activate_funded"):
+        phase = "funded"
 
     values = {
         "enabled": 1 if form.get("enabled") else 0,
@@ -4664,9 +4690,57 @@ def journal_page(request: Request):
     tabs = account_tabs(user["id"], sel, "/journal")
 
     try:
-        trips, _open = account_trade_history(user["id"], only_account_id=only)
+        all_trips, _open = account_trade_history(user["id"], only_account_id=only)
     except Exception:
-        trips = []
+        all_trips = []
+
+    # Date-range filter: presets (today/7d/30d/month/ytd/all) or custom from/to.
+    rng = (request.query_params.get("range") or "all").lower()
+    q_from = request.query_params.get("from", "")
+    q_to = request.query_params.get("to", "")
+    et = ZoneInfo(_ET)
+    now_et = datetime.now(et)
+    start_utc = end_utc = None
+    if rng == "today":
+        start_utc = now_et.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    elif rng == "7d":
+        start_utc = now_et - timedelta(days=7)
+    elif rng == "30d":
+        start_utc = now_et - timedelta(days=30)
+    elif rng == "month":
+        start_utc = now_et.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    elif rng == "ytd":
+        start_utc = now_et.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    elif rng == "custom":
+        try:
+            if q_from:
+                start_utc = datetime.strptime(q_from, "%Y-%m-%d").replace(tzinfo=et).astimezone(timezone.utc)
+            if q_to:
+                end_utc = (datetime.strptime(q_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=et)).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    if start_utc is not None or end_utc is not None:
+        s_utc = start_utc or datetime(1970, 1, 1, tzinfo=timezone.utc)
+        e_utc = end_utc or datetime.now(timezone.utc)
+        trips = _trips_in_range(all_trips, s_utc, e_utc)
+    else:
+        trips = all_trips
+
+    # Range selector bar.
+    def rbtn(val, label):
+        cls = "btn" if rng == val else "btn secondary"
+        return f'<a class="{cls}" style="padding:7px 13px;margin:0 6px 6px 0;" href="/journal?account={sel}&range={val}">{label}</a>'
+    range_bar = (
+        '<div class="card span12" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">'
+        + rbtn("today", "Today") + rbtn("7d", "7D") + rbtn("30d", "30D") + rbtn("month", "This Month")
+        + rbtn("ytd", "YTD") + rbtn("all", "All")
+        + f'<form method="get" action="/journal" style="display:flex;gap:6px;align-items:center;margin:0 0 0 8px;">'
+        + f'<input type="hidden" name="account" value="{sel}"><input type="hidden" name="range" value="custom">'
+        + f'<input type="date" name="from" value="{q_from}" style="width:auto;margin:0;">'
+        + f'<span class="muted">→</span><input type="date" name="to" value="{q_to}" style="width:auto;margin:0;">'
+        + f'<button style="margin:0;">Apply</button></form></div>'
+    )
 
     tmap = get_trip_journal_map(user["id"])
     s = journal_analytics(trips, tags_map=tmap)
@@ -4734,6 +4808,7 @@ def journal_page(request: Request):
     <div class="header"><div><h2>KhomaTradingJournal</h2><p>Full performance analytics from your real Tradovate fills — equity curve, P&amp;L calendar, profit factor, expectancy and breakdowns.</p></div></div>
     {tabs}
     <div class="grid">
+      {range_bar}
       {cards}
 
       <div class="card span8"><h3>Equity Curve</h3><p class="muted">Cumulative realized P&amp;L across {s['n']} closed trades.</p><div class="equity-wrap">{equity_svg}</div></div>
@@ -5135,9 +5210,10 @@ def tradovate_connect(request: Request):
         return RedirectResponse("/login")
 
     # Which environment(s) to import. A single Tradovate login exposes BOTH demo
-    # and live, so the user chooses here to avoid pulling in the wrong account.
-    choice = (request.query_params.get("env") or "both").lower()
-    envs = {"demo": ("demo",), "live": ("live",)}.get(choice, ("live", "demo"))
+    # and live. Demo -> demo root; Live -> live root; Prop Firm -> both (eval
+    # accounts often live on sim/demo while funded accounts are on live).
+    choice = (request.query_params.get("env") or "demo").lower()
+    envs = {"demo": ("demo",), "live": ("live",), "prop": ("live", "demo")}.get(choice, ("demo",))
 
     # Tie this OAuth attempt to the logged-in user via an unguessable state token.
     state = secrets.token_urlsafe(24)
