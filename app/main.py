@@ -5282,15 +5282,29 @@ def debug_calendar(request: Request):
     timezone of event timestamps. Public (only returns non-sensitive public
     economic data + whether a key is configured) to avoid login friction."""
     now = datetime.now(timezone.utc)
-    out = {"fmp_key_set": bool(os.getenv("FMP_API_KEY"))}
-    # Raw FMP sample (first events) so we can read its exact fields + date format.
-    if os.getenv("FMP_API_KEY"):
+    key = os.getenv("FMP_API_KEY")
+    out = {"fmp_key_set": bool(key)}
+    # Probe EACH candidate FMP endpoint separately so we can see exactly which
+    # (if any) works on this key/plan.
+    if key:
         d1, d2 = _week_range("this", now.astimezone(ZoneInfo(_ET)))
-        raw, status, url = _fmp_economic_calendar(d1, d2)
-        out["fmp_status"] = status
-        out["fmp_url"] = url.split("?")[0] if url else ""
-        out["fmp_count"] = len(raw) if isinstance(raw, list) else 0
-        out["fmp_raw_sample"] = raw[:2] if isinstance(raw, list) else raw
+        probes = {
+            "stable_economic-calendar": f"https://financialmodelingprep.com/stable/economic-calendar?from={d1}&to={d2}&apikey={key}",
+            "stable_economics-calendar": f"https://financialmodelingprep.com/stable/economics_calendar?from={d1}&to={d2}&apikey={key}",
+            "v3_economic_calendar": f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={key}",
+        }
+        out["fmp_probes"] = {}
+        for name, u in probes.items():
+            try:
+                r = requests.get(u, timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+                body = r.json() if r.status_code < 400 else r.text[:200]
+                out["fmp_probes"][name] = {
+                    "status": r.status_code,
+                    "count": len(body) if isinstance(body, list) else 0,
+                    "sample": body[0] if isinstance(body, list) and body else (body if not isinstance(body, list) else None),
+                }
+            except Exception as e:
+                out["fmp_probes"][name] = {"error": f"{type(e).__name__}: {e}"}
     for wk in ("last", "this", "next"):
         evs, mw = fetch_calendar_events(wk, now)
         out[wk] = {"events": len(evs), "multiweek": mw,
