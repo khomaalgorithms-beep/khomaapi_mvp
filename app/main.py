@@ -23,6 +23,7 @@ import requests
 from app.tradovate_oauth import build_tradovate_login, exchange_code_for_token, fetch_accounts
 from app import tradovate_oauth as tvo
 from app import risk_engine as risk
+from app import db as dbmod
 import asyncio
 import yaml
 import re
@@ -162,9 +163,9 @@ manager = ConnectionManager()
 # ============================================================
 
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    # Dual-backend: SQLite by default, Postgres when DATABASE_URL is set
+    # (see app/db.py). Call sites are unchanged — same ? placeholders + dict rows.
+    return dbmod.connect(str(DB_PATH))
 
 
 def enc(value: str) -> str:
@@ -3415,7 +3416,8 @@ def signup(email: str = Form(...), password: str = Form(...)):
     con = db()
     try:
         cur = con.cursor()
-        cur.execute(
+        uid = dbmod.insert_returning_id(
+            cur,
             """
             INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at,is_verified)
             VALUES(?,?,?,?,?,?)
@@ -3429,7 +3431,6 @@ def signup(email: str = Form(...), password: str = Form(...)):
                 verified,
             ),
         )
-        uid = cur.lastrowid
         cur.execute("INSERT INTO brokers(user_id) VALUES(?)", (uid,))
         con.commit()
     except Exception:
@@ -3610,7 +3611,8 @@ def auth_google_callback(code: str = ""):
     if not existing_user:
         random_password = secrets.token_hex(24)
         cur = con.cursor()
-        cur.execute(
+        uid = dbmod.insert_returning_id(
+            cur,
             """
             INSERT INTO users(email,password_hash,api_key,webhook_secret,created_at,allowed_symbols)
             VALUES(?,?,?,?,?,?)
@@ -3624,7 +3626,6 @@ def auth_google_callback(code: str = ""):
                 "*",
             ),
         )
-        uid = cur.lastrowid
         cur.execute("INSERT INTO brokers(user_id) VALUES(?)", (uid,))
         con.commit()
         user = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
@@ -5838,7 +5839,7 @@ def _status_data() -> dict:
     ).fetchone()["c"]
     # Avg execution latency over the last ~500 executed orders (no user data).
     row = con.execute(
-        "SELECT AVG(latency_ms) a, COUNT(*) c FROM (SELECT latency_ms FROM trades WHERE status='EXECUTED' AND latency_ms>0 ORDER BY id DESC LIMIT 500)"
+        "SELECT AVG(latency_ms) a, COUNT(*) c FROM (SELECT latency_ms FROM trades WHERE status='EXECUTED' AND latency_ms>0 ORDER BY id DESC LIMIT 500) AS recent"
     ).fetchone()
     con.close()
     avg_latency = round(row["a"], 1) if row and row["a"] else None
