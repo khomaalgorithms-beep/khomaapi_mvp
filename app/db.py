@@ -13,8 +13,18 @@ import os
 import re
 import sqlite3
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+def _pick_db_url() -> str:
+    """First env var that's a REAL postgres URL. Tolerates an unresolved
+    ${{...}} reference in DATABASE_URL by falling through to the public URL."""
+    for key in ("DATABASE_URL", "DATABASE_PUBLIC_URL"):
+        v = os.getenv(key, "").strip()
+        if v.startswith(("postgres://", "postgresql://")):
+            return v
+    return ""
+
+
+DATABASE_URL = _pick_db_url()
+IS_PG = bool(DATABASE_URL)
 
 if IS_PG:
     import psycopg
