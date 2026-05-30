@@ -190,6 +190,19 @@ def evaluate_order(config: dict, state: dict, intent: dict, now_utc: datetime = 
     return Decision(Decision.ALLOW)
 
 
+def resolve_phase_limits(cfg: dict):
+    """Return (daily_loss_limit, trailing_dd, profit_target) actually in force for
+    the account's phase. In 'funded' the funded_* limits apply and buffer_zone is
+    a cushion that locks BEFORE the firm's hard max loss."""
+    if (cfg.get("account_phase") or "evaluation") == "funded":
+        maxl = _num(cfg.get("funded_max_loss"))
+        buf = _num(cfg.get("buffer_zone")) or 0
+        return (cfg.get("funded_daily_loss"),
+                (maxl - buf) if maxl is not None else None,
+                None)
+    return (cfg.get("daily_loss_limit"), cfg.get("trailing_dd"), cfg.get("profit_target"))
+
+
 def update_high_water_mark(prev_hwm, equity, basis: str, flat: bool):
     """Compute the new high-water-mark.
 

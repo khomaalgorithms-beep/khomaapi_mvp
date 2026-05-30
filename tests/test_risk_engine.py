@@ -15,6 +15,7 @@ from app.risk_engine import (
     session_anchor,
     next_session_anchor,
     update_high_water_mark,
+    resolve_phase_limits,
 )
 
 UTC = ZoneInfo("UTC")
@@ -261,3 +262,30 @@ def test_breach_takes_priority_over_size_reject():
     cfg = {"daily_loss_limit": 500, "max_contracts_per_order": 1}
     state = {"equity": 9000, "day_pnl": -600, "high_water_mark": 10000}
     assert evaluate_order(cfg, state, buy(qty=10, resulting=10), _now()).action == Decision.BREACH
+
+
+# ---- prop-firm evaluation -> funded phase limits --------------------------
+
+def test_phase_limits_evaluation_uses_eval_fields():
+    cfg = {"account_phase": "evaluation", "daily_loss_limit": 1000, "trailing_dd": 2000,
+           "funded_daily_loss": 500, "funded_max_loss": 3000}
+    assert resolve_phase_limits(cfg) == (1000, 2000, None)
+
+
+def test_phase_limits_funded_uses_funded_fields_with_buffer():
+    cfg = {"account_phase": "funded", "daily_loss_limit": 1000, "trailing_dd": 2000,
+           "funded_daily_loss": 800, "funded_max_loss": 3000, "buffer_zone": 500}
+    dll, tdd, pt = resolve_phase_limits(cfg)
+    assert dll == 800          # funded daily loss
+    assert tdd == 2500         # 3000 max loss minus 500 buffer (locks early)
+    assert pt is None
+
+
+def test_funded_buffer_breaches_before_hard_max():
+    # Funded account: equity 1500 below peak; max loss 3000 but buffer 2000 ->
+    # effective trailing limit 1000 -> should breach at 1500 drawdown.
+    cfg = {"account_phase": "funded", "funded_max_loss": 3000, "buffer_zone": 2000}
+    dll, tdd, pt = resolve_phase_limits(cfg)
+    state = {"equity": 8500, "high_water_mark": 10000, "day_pnl": 0}
+    eff = {"trailing_dd": tdd}
+    assert evaluate_breach(eff, state) is not None  # 1500 >= 1000 effective

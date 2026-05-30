@@ -556,6 +556,18 @@ def init_db():
     )
     """)
 
+    # Prop-firm evaluation -> funded lifecycle fields.
+    ensure_column("account_risk_config", "prop_firm", "TEXT DEFAULT ''")
+    ensure_column("account_risk_config", "account_phase", "TEXT DEFAULT 'evaluation'")  # evaluation | funded
+    ensure_column("account_risk_config", "profit_goal", "REAL")          # eval profit target ($)
+    ensure_column("account_risk_config", "profit_factor_target", "REAL")  # tracked performance metric
+    ensure_column("account_risk_config", "eval_start_balance", "REAL")    # baseline equity for progress
+    ensure_column("account_risk_config", "eval_passed", "INTEGER DEFAULT 0")
+    ensure_column("account_risk_config", "eval_passed_at", "TEXT")
+    ensure_column("account_risk_config", "buffer_zone", "REAL")           # funded cushion before max loss
+    ensure_column("account_risk_config", "funded_daily_loss", "REAL")
+    ensure_column("account_risk_config", "funded_max_loss", "REAL")
+
     # User-defined news / manual lockout windows.
     cur.execute("""
     CREATE TABLE IF NOT EXISTS news_windows(
@@ -889,6 +901,9 @@ RISK_FIELDS = (
     "daily_loss_limit", "trailing_dd", "trailing_basis", "profit_target",
     "max_position", "max_contracts_per_order", "max_open_positions",
     "daily_trade_cap", "hours_start", "hours_end", "tz", "reset_hour", "enabled",
+    # Prop-firm evaluation -> funded lifecycle.
+    "prop_firm", "account_phase", "profit_goal", "profit_factor_target",
+    "buffer_zone", "funded_daily_loss", "funded_max_loss",
 )
 
 # Recent live state per account_id -> (state, monotonic-ish ts). Written by the
@@ -959,6 +974,89 @@ def _maybe_auto_unlock(cfg: dict) -> dict:
         except Exception:
             pass
     return cfg
+
+
+def effective_risk_cfg(cfg: dict) -> dict:
+    """Resolve the daily-loss / trailing-DD limits actually in force given the
+    account phase. In 'funded' mode the funded_* limits apply, and buffer_zone
+    locks that many dollars BEFORE the firm's hard max loss (a safety cushion)."""
+    eff = dict(cfg)
+    dll, tdd, ptarget = risk.resolve_phase_limits(cfg)
+    eff["daily_loss_limit"] = dll
+    eff["trailing_dd"] = tdd
+    eff["profit_target"] = ptarget
+    return eff
+
+
+def eval_profit_value(cfg: dict, state: dict):
+    """Profit toward the evaluation goal: current equity minus the baseline
+    captured when tracking started."""
+    eq = state.get("equity")
+    base = cfg.get("eval_start_balance")
+    if eq is None or base is None:
+        return None
+    return round(eq - base, 2)
+
+
+def profit_factor_from_trips(trips: list):
+    wins = sum(float(t.get("pnl") or 0) for t in trips if (t.get("pnl") or 0) > 0)
+    losses = -sum(float(t.get("pnl") or 0) for t in trips if (t.get("pnl") or 0) < 0)
+    if losses <= 0:
+        return None  # undefined (no losing trades yet)
+    return round(wins / losses, 2)
+
+
+def check_eval_pass(a: dict, cfg: dict, state: dict):
+    """If an account in evaluation reaches its profit goal, mark it passed, email
+    the client, and return a broadcast event. Baseline is captured on first sight."""
+    if (cfg.get("account_phase") or "evaluation") != "evaluation":
+        return None
+    if cfg.get("eval_passed"):
+        return None
+    goal = risk._num(cfg.get("profit_goal"))
+    if not goal:
+        return None
+    eq = state.get("equity")
+    if eq is None:
+        return None
+    if cfg.get("eval_start_balance") is None:
+        con = db()
+        con.execute("UPDATE account_risk_config SET eval_start_balance=?, updated_at=? WHERE account_id=?",
+                    (eq, datetime.now(timezone.utc).isoformat(), a["id"]))
+        con.commit()
+        con.close()
+        return None
+    profit = eq - cfg["eval_start_balance"]
+    if profit < goal:
+        return None
+    # Passed!
+    now_iso = datetime.now(timezone.utc).isoformat()
+    con = db()
+    con.execute("UPDATE account_risk_config SET eval_passed=1, eval_passed_at=?, updated_at=? WHERE account_id=?",
+                (now_iso, now_iso, a["id"]))
+    user = con.execute("SELECT email FROM users WHERE id=?", (a["user_id"],)).fetchone()
+    con.commit()
+    con.close()
+    try:
+        if user and user["email"]:
+            firm = cfg.get("prop_firm") or "your prop firm"
+            send_branded_email(
+                user["email"],
+                "🎉 You passed your evaluation",
+                "Congratulations — evaluation passed!",
+                f"Your account <b>{a.get('account_name')}</b> just hit its profit goal of "
+                f"<b>${goal:,.0f}</b> for {firm}. 🎯<br><br>"
+                f"Your funded-account stage is now unlocked in KhomaAPI — set your buffer zone, "
+                f"max loss and daily loss for the funded phase and keep KhomaAPI guarding every trade.",
+                button_label="Set up my funded account",
+                button_url=f"{APP_URL}/risk",
+                text_fallback=f"Congratulations! {a.get('account_name')} reached its ${goal:,.0f} profit goal. Open KhomaAPI to set up your funded account.",
+            )
+    except Exception:
+        pass
+    return {"event": "risk", "type": "eval_passed", "account_id": a["id"],
+            "account": a.get("account_name"), "user_id": a.get("user_id"),
+            "reason": f"Evaluation passed — ${goal:,.0f} goal reached"}
 
 
 def news_windows_for(user_id: int, account_id: int):
@@ -1214,7 +1312,7 @@ def risk_gate(account: dict, side: str, qty: int, resolved_symbol: str):
         resulting = cur_net
     intent = {"side": side, "qty": qty, "symbol_root": root, "resulting_net": resulting}
 
-    decision = risk.evaluate_order(cfg, state, intent, datetime.now(timezone.utc))
+    decision = risk.evaluate_order(effective_risk_cfg(cfg), state, intent, datetime.now(timezone.utc))
     if decision.action == risk.Decision.BREACH:
         flatten_and_lock_account(account, decision.reason)
         return False, decision.reason, True
@@ -1253,18 +1351,23 @@ def account_connectivity(account: dict) -> str:
 
 
 def _has_hard_limits(cfg: dict) -> bool:
-    return any(risk._num(cfg.get(k)) for k in ("daily_loss_limit", "trailing_dd", "profit_target"))
+    eff = effective_risk_cfg(cfg)
+    return any(risk._num(eff.get(k)) for k in ("daily_loss_limit", "trailing_dd", "profit_target"))
 
 
 def _risk_active(cfg: dict) -> bool:
-    """True if this account has ANY enforceable rule configured — used to avoid
-    polling/fetching live state for accounts with no risk rules set."""
+    """True if this account has ANY enforceable rule or tracked goal configured —
+    used to avoid polling live state for accounts with nothing to enforce."""
     if str(cfg.get("enabled", 1)) in ("0", "False", "false"):
         return False
     if cfg.get("locked"):
         return True
-    numeric = ("daily_loss_limit", "trailing_dd", "profit_target", "max_position",
-               "max_contracts_per_order", "max_open_positions", "daily_trade_cap")
+    if _has_hard_limits(cfg):
+        return True
+    # Profit goal needs polling so the evaluation progress bar updates.
+    if risk._num(cfg.get("profit_goal")) and not cfg.get("eval_passed"):
+        return True
+    numeric = ("max_position", "max_contracts_per_order", "max_open_positions", "daily_trade_cap")
     if any(risk._num(cfg.get(k)) for k in numeric):
         return True
     return bool(cfg.get("hours_start") and cfg.get("hours_end"))
@@ -1275,7 +1378,8 @@ def _breach_and_lock(a: dict, cfg: dict, state: dict):
     event dict if the account was just locked, else None."""
     if cfg.get("locked") or not _has_hard_limits(cfg):
         return None
-    reason = risk.evaluate_breach(cfg, {**state, "high_water_mark": cfg.get("high_water_mark")})
+    eff = effective_risk_cfg(cfg)
+    reason = risk.evaluate_breach(eff, {**state, "high_water_mark": cfg.get("high_water_mark")})
     if not reason:
         return None
     flatten_and_lock_account(a, reason)
@@ -1350,7 +1454,13 @@ def poll_tick():
                 set_heartbeat(a["id"], bool(state.get("ok")))
                 if state.get("ok"):
                     update_account_hwm(a, cfg, state)
-                    ev = _breach_and_lock(a, get_risk_config(a["id"]), state)
+                    cfg = get_risk_config(a["id"])
+                    # Evaluation progress -> congrats + funded unlock on pass.
+                    ev_pass = check_eval_pass(a, cfg, state)
+                    if ev_pass:
+                        events.append(ev_pass)
+                        cfg = get_risk_config(a["id"])
+                    ev = _breach_and_lock(a, cfg, state)
                     if ev:
                         events.append(ev)
             elif active and hard and in_pos:
@@ -2720,18 +2830,23 @@ socket.onmessage = (event) => {{
         }}
     }}
 
-    // Real-time risk lock: surface instantly and refresh the relevant views.
-    if(data.event === "risk" && data.type === "lock") {{
+    // Real-time risk events: surface instantly and refresh the relevant views.
+    if(data.event === "risk") {{
         try {{
             var bar = document.createElement("div");
-            bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
-            bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            if(data.type === "eval_passed") {{
+                bar.textContent = "🎉 EVALUATION PASSED — " + (data.account||"") + "! Funded setup unlocked.";
+                bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#0f8f45;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            }} else {{
+                bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
+                bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            }}
             document.body.appendChild(bar);
         }} catch(e) {{}}
         if(window.location.pathname === "/dashboard" ||
            window.location.pathname === "/risk" ||
            window.location.pathname === "/logs") {{
-            setTimeout(function(){{ location.reload(); }}, 1500);
+            setTimeout(function(){{ location.reload(); }}, 2000);
         }}
     }}
 }};
@@ -2790,18 +2905,23 @@ socket.onmessage = (event) => {{
         }}
     }}
 
-    // Real-time risk lock: surface instantly and refresh the relevant views.
-    if(data.event === "risk" && data.type === "lock") {{
+    // Real-time risk events: surface instantly and refresh the relevant views.
+    if(data.event === "risk") {{
         try {{
             var bar = document.createElement("div");
-            bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
-            bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            if(data.type === "eval_passed") {{
+                bar.textContent = "🎉 EVALUATION PASSED — " + (data.account||"") + "! Funded setup unlocked.";
+                bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#0f8f45;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            }} else {{
+                bar.textContent = "⚠ RISK LOCK — " + (data.account||"") + ": " + (data.reason||"");
+                bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-weight:800;padding:12px 18px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+            }}
             document.body.appendChild(bar);
         }} catch(e) {{}}
         if(window.location.pathname === "/dashboard" ||
            window.location.pathname === "/risk" ||
            window.location.pathname === "/logs") {{
-            setTimeout(function(){{ location.reload(); }}, 1500);
+            setTimeout(function(){{ location.reload(); }}, 2000);
         }}
     }}
 }};
@@ -3518,13 +3638,22 @@ def dashboard_risk_panel(user_id: int) -> str:
         else:
             badge = "<span class='pill'>ACTIVE</span>"
         state = ACCOUNT_STATE_CACHE.get(a["id"], (None,))[0] or {}
+        eff = effective_risk_cfg(cfg)
         detail = ""
-        dll = risk._num(cfg.get("daily_loss_limit"))
+        # Evaluation progress toward profit goal.
+        if (cfg.get("account_phase") or "evaluation") == "evaluation":
+            goal = risk._num(cfg.get("profit_goal"))
+            evp = eval_profit_value(cfg, state)
+            if goal and evp is not None:
+                pct = max(0, min(100, (evp / goal) * 100))
+                detail += (f"<small>Goal ${goal:,.0f}: <b class='{'good' if evp>=0 else 'bad'}'>${evp:,.0f}</b> ({pct:.0f}%)</small>"
+                           f"{_progress_bar(pct, '#0f8f45')}")
+        dll = risk._num(eff.get("daily_loss_limit"))
         day_pnl = state.get("day_pnl")
         if dll and day_pnl is not None:
             cls = "bad" if day_pnl < 0 else "good"
             detail += f"<small>PnL <b class='{cls}'>${day_pnl:,.0f}</b> / -${dll:,.0f}</small> "
-        tdd = risk._num(cfg.get("trailing_dd"))
+        tdd = risk._num(eff.get("trailing_dd"))
         hwm = cfg.get("high_water_mark")
         eq = state.get("equity")
         if tdd and hwm is not None and eq is not None:
@@ -3575,12 +3704,15 @@ def _progress_bar(used_pct: float, color: str) -> str:
             f"<div style='height:100%;width:{pct:.0f}%;background:{color};'></div></div>")
 
 
-def risk_account_card(user, a, cfg, state) -> str:
+def risk_account_card(user, a, cfg, state, pf=None) -> str:
     aid = a["id"]
     name = a["account_name"]
     env = (a.get("env") or "").upper()
     conn = account_connectivity(a)
     locked = bool(cfg.get("locked"))
+    phase = (cfg.get("account_phase") or "evaluation")
+    passed = bool(cfg.get("eval_passed"))
+    eff = effective_risk_cfg(cfg)
 
     # Status badge
     if conn == "disconnected":
@@ -3590,56 +3722,107 @@ def risk_account_card(user, a, cfg, state) -> str:
     else:
         status = "<span class='pill'>● ACTIVE</span>"
 
+    if phase == "funded":
+        phase_badge = "<span class='pill'>FUNDED</span>"
+    elif passed:
+        phase_badge = "<span class='pill' style='background:#ecfdf5;color:#047857;border-color:#a7f3d0;'>✓ EVAL PASSED</span>"
+    else:
+        phase_badge = "<span class='pill gray'>EVALUATION</span>"
+
     lock_line = ""
     if locked:
         lock_line = (f"<p class='bad' style='margin:6px 0;'><b>Locked:</b> {cfg.get('locked_reason') or ''}</p>"
                      f"<form method='post' action='/risk/account/{aid}/unlock' style='margin:0 0 10px;'>"
                      f"<button class='secondary' style='padding:7px 12px;'>Unlock now</button></form>")
 
-    # Live status: day PnL vs daily limit + trailing-DD headroom
+    # Evaluation progress + live status
     live = ""
+    eq = state.get("equity") if state else None
+    if phase == "evaluation":
+        goal = risk._num(cfg.get("profit_goal"))
+        ev_profit = eval_profit_value(cfg, state) if state else None
+        if goal:
+            if ev_profit is not None:
+                pct = (ev_profit / goal) * 100
+                live += (f"<p class='muted' style='margin:10px 0 0;'>Evaluation progress: "
+                         f"<b class='{'good' if ev_profit>=0 else 'bad'}'>${ev_profit:,.2f}</b> / goal ${goal:,.0f} "
+                         f"<b>({max(0,pct):.0f}%)</b></p>{_progress_bar(pct, '#0f8f45')}")
+            else:
+                live += (f"<p class='muted' style='margin:10px 0 0;'>Evaluation goal ${goal:,.0f} — "
+                         f"progress starts once live balance is read.</p>{_progress_bar(0, '#0f8f45')}")
+    pf_txt = (f"{pf}" if pf is not None else "—")
+    pft = risk._num(cfg.get("profit_factor_target"))
+    if pft or pf is not None:
+        live += f"<p class='muted' style='margin:8px 0 0;'>Profit factor: <b>{pf_txt}</b>{f' / target {pft:g}' if pft else ''}</p>"
+
+    # Live PnL vs the IN-FORCE limits (phase-aware).
     if state and state.get("ok"):
-        dll = risk._num(cfg.get("daily_loss_limit"))
+        dll = risk._num(eff.get("daily_loss_limit"))
         day_pnl = state.get("day_pnl")
         if dll and day_pnl is not None:
             used = (-day_pnl / dll) * 100 if day_pnl < 0 else 0
             cls = "bad" if day_pnl < 0 else "good"
             live += (f"<p class='muted' style='margin:10px 0 0;'>Today's PnL: <b class='{cls}'>${day_pnl:,.2f}</b> "
                      f"/ limit -${dll:,.0f}</p>{_progress_bar(used, '#dc2626')}")
-        tdd = risk._num(cfg.get("trailing_dd"))
+        tdd = risk._num(eff.get("trailing_dd"))
         hwm = cfg.get("high_water_mark")
-        eq = state.get("equity")
         if tdd and hwm is not None and eq is not None:
             dd = max(0, hwm - eq)
             used = (dd / tdd) * 100
             live += (f"<p class='muted' style='margin:10px 0 0;'>Drawdown from peak: <b>${dd:,.2f}</b> / ${tdd:,.0f} "
                      f"(headroom ${max(0, tdd-dd):,.2f})</p>{_progress_bar(used, '#ca8a04')}")
     elif conn == "disconnected":
-        live = "<p class='muted' style='margin:10px 0 0;'>No live data — account is disconnected.</p>"
+        live += "<p class='muted' style='margin:10px 0 0;'>No live data — account is disconnected.</p>"
 
     f = lambda k: _rv(cfg, k)
     checked = "" if str(cfg.get("enabled", 1)) in ("0", "False", "false") else "checked"
     basis = cfg.get("trailing_basis") or "intraday"
+
+    # Funded section (unlocked once the evaluation is passed).
+    funded_section = ""
+    if passed:
+        fchecked = "checked" if phase == "funded" else ""
+        funded_section = f'''
+        <div style="margin:16px 0 6px;padding:14px;border:1px solid #a7f3d0;background:#f0fdf4;border-radius:14px;">
+          <b style="color:#047857;">🎉 Funded account</b>
+          <p class="muted" style="margin:4px 0 10px;">You passed the evaluation. Set your funded rules — buffer zone locks you that many dollars BEFORE the firm's hard max loss.</p>
+          <div class="formgrid">
+            <div><label>Buffer zone ($)</label><input name="buffer_zone" value="{f('buffer_zone')}" placeholder="e.g. 500"></div>
+            <div><label>Funded max loss ($)</label><input name="funded_max_loss" value="{f('funded_max_loss')}" placeholder="e.g. 3000"></div>
+            <div><label>Funded daily loss ($)</label><input name="funded_daily_loss" value="{f('funded_daily_loss')}" placeholder="e.g. 1500"></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;margin-top:8px;"><input type="checkbox" name="activate_funded" value="1" {fchecked} style="width:auto;margin:0;"> Activate funded mode (enforce funded rules)</label>
+        </div>
+        '''
+
     return f'''
     <div class="card span6" data-acct="{aid}">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-        <h3 style="margin:0;">{name} <small style="color:#9ca3af;font-weight:600;">{env}</small></h3>{status}
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <h3 style="margin:0;">{name} <small style="color:#9ca3af;font-weight:600;">{env}</small></h3>
+        <div style="display:flex;gap:6px;">{phase_badge}{status}</div>
       </div>
       {lock_line}{live}
       <form method="post" action="/risk/account/{aid}/save" style="margin-top:14px;">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;"><input type="checkbox" name="enabled" value="1" {checked} style="width:auto;margin:0;"> Risk enforcement enabled</label>
-        <div style="margin:12px 0 6px;">
-          <label style="font-size:12px;">Load preset</label>
-          <select onchange="applyPreset({aid}, this.value)">
-            <option value="">— choose a starting template —</option>
-            {"".join(f'<option value="{p["id"]}">{p["name"]}</option>' for p in load_risk_presets())}
-          </select>
+        <div class="formgrid" style="margin-top:10px;">
+          <div><label>Prop firm</label><input name="prop_firm" value="{f('prop_firm')}" placeholder="e.g. Apex, TPT"></div>
+          <div><label>Load preset</label><select onchange="applyPreset({aid}, this.value)"><option value="">— template —</option>{"".join(f'<option value="{p["id"]}">{p["name"]}</option>' for p in load_risk_presets())}</select></div>
         </div>
+
+        <h4 style="margin:14px 0 0;">Evaluation rules</h4>
         <div class="formgrid">
+          <div><label>Profit goal ($)</label><input name="profit_goal" value="{f('profit_goal')}" placeholder="e.g. 3000"></div>
+          <div><label>Profit factor target</label><input name="profit_factor_target" value="{f('profit_factor_target')}" placeholder="e.g. 1.5"></div>
           <div><label>Daily loss limit ($)</label><input name="daily_loss_limit" value="{f('daily_loss_limit')}" placeholder="e.g. 1000"></div>
-          <div><label>Trailing drawdown ($)</label><input name="trailing_dd" value="{f('trailing_dd')}" placeholder="e.g. 2000"></div>
-          <div><label>Trailing basis</label><select name="trailing_basis"><option value="intraday" {"selected" if basis=="intraday" else ""}>Intraday equity</option><option value="closed" {"selected" if basis=="closed" else ""}>Closed balance</option></select></div>
-          <div><label>Profit target ($, optional)</label><input name="profit_target" value="{f('profit_target')}" placeholder="auto-stop"></div>
+          <div><label>Max drawdown ($)</label><input name="trailing_dd" value="{f('trailing_dd')}" placeholder="e.g. 2000"></div>
+          <div><label>Drawdown basis</label><select name="trailing_basis"><option value="intraday" {"selected" if basis=="intraday" else ""}>Intraday equity</option><option value="closed" {"selected" if basis=="closed" else ""}>Closed balance</option></select></div>
+          <div><label>Profit auto-stop ($, optional)</label><input name="profit_target" value="{f('profit_target')}" placeholder="optional"></div>
+        </div>
+
+        {funded_section}
+
+        <h4 style="margin:14px 0 0;">Position &amp; time guards</h4>
+        <div class="formgrid">
           <div><label>Max position (contracts)</label><input name="max_position" value="{f('max_position')}"></div>
           <div><label>Max contracts / order</label><input name="max_contracts_per_order" value="{f('max_contracts_per_order')}"></div>
           <div><label>Max open positions</label><input name="max_open_positions" value="{f('max_open_positions')}"></div>
@@ -3649,7 +3832,7 @@ def risk_account_card(user, a, cfg, state) -> str:
           <div><label>Timezone</label><input name="tz" value="{cfg.get('tz') or 'America/New_York'}"></div>
           <div><label>Session reset hour (local)</label><input name="reset_hour" value="{cfg.get('reset_hour') or 17}"></div>
         </div>
-        <button>Save risk rules</button>
+        <button>Save rules</button>
         <button formaction="/risk/account/{aid}/flatten-lock" class="danger" formnovalidate onclick="return confirm('Flatten ALL positions on {name} and lock it now?');">Flatten &amp; Lock</button>
       </form>
     </div>
@@ -3684,6 +3867,17 @@ def risk_page(request: Request):
         return RedirectResponse("/login")
 
     accounts = get_broker_accounts(user["id"], connected_only=True)
+    # Profit factor per account from real broker round-trips (fetched once).
+    pf_by_name = {}
+    try:
+        trips, _open = account_trade_history(user["id"])
+        by_name = {}
+        for t in trips:
+            by_name.setdefault(t.get("account"), []).append(t)
+        pf_by_name = {n: profit_factor_from_trips(ts) for n, ts in by_name.items()}
+    except Exception:
+        pf_by_name = {}
+
     cards = ""
     for a in accounts:
         cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], user["id"]))
@@ -3691,7 +3885,7 @@ def risk_page(request: Request):
             state = _cached_state(a, cfg)
         except Exception:
             state = {"ok": False}
-        cards += risk_account_card(user, a, cfg, state)
+        cards += risk_account_card(user, a, cfg, state, pf=pf_by_name.get(a["account_name"]))
     if not accounts:
         cards = "<div class='card span12'><p class='muted'>Connect a Tradovate account on the Broker page to configure per-account risk rules.</p></div>"
 
@@ -3766,12 +3960,23 @@ async def risk_account_save(request: Request, account_id: int):
         except Exception:
             return None
 
+    existing = get_risk_config(account_id)
+    # Funded mode only activatable once the evaluation is passed.
+    phase = "funded" if (form.get("activate_funded") and existing.get("eval_passed")) else "evaluation"
+
     values = {
         "enabled": 1 if form.get("enabled") else 0,
+        "prop_firm": (form.get("prop_firm") or "").strip(),
+        "account_phase": phase,
+        "profit_goal": numf("profit_goal"),
+        "profit_factor_target": numf("profit_factor_target"),
         "daily_loss_limit": numf("daily_loss_limit"),
         "trailing_dd": numf("trailing_dd"),
         "trailing_basis": "closed" if form.get("trailing_basis") == "closed" else "intraday",
         "profit_target": numf("profit_target"),
+        "buffer_zone": numf("buffer_zone"),
+        "funded_daily_loss": numf("funded_daily_loss"),
+        "funded_max_loss": numf("funded_max_loss"),
         "max_position": numf("max_position"),
         "max_contracts_per_order": numf("max_contracts_per_order"),
         "max_open_positions": numf("max_open_positions"),
@@ -3782,6 +3987,12 @@ async def risk_account_save(request: Request, account_id: int):
         "reset_hour": int(numf("reset_hour") or 17),
     }
     save_risk_config(account_id, user["id"], values)
+    # If the profit goal changed, re-baseline the evaluation progress.
+    if numf("profit_goal") != (risk._num(existing.get("profit_goal"))) and not existing.get("eval_passed"):
+        con = db()
+        con.execute("UPDATE account_risk_config SET eval_start_balance=NULL WHERE account_id=?", (account_id,))
+        con.commit()
+        con.close()
     return RedirectResponse("/risk", status_code=302)
 
 
