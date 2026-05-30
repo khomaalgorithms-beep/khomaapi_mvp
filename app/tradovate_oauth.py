@@ -121,32 +121,40 @@ def renew_access_token(env: str, token: str) -> dict:
     }
 
 
-def fetch_accounts(access_token: str) -> dict:
-    """List all Tradovate accounts visible to this token.
+def fetch_accounts_for_env(access_token: str, env: str) -> dict:
+    """List Tradovate accounts on a single environment ('live' or 'demo')."""
+    base = REST_DEMO if env == "demo" else REST_LIVE
+    try:
+        r = requests.get(f"{base}/account/list", headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "accounts": [], "env": env}
+    if isinstance(data, list):
+        return {"ok": True, "accounts": data, "env": env}
+    return {"ok": False, "error": data, "accounts": [], "env": env}
 
-    Tries the live REST root first, then demo, so a single OAuth login surfaces
-    every account (cash, live, prop). Returns {"ok": True, "accounts": [...], "env": "live"|"demo"}.
+
+def fetch_accounts(access_token: str, envs=("live", "demo")) -> dict:
+    """List accounts across the requested environments. A single Tradovate OAuth
+    login exposes BOTH demo and live, so by default we import both (tagged with
+    their env) — the user then chooses which to trade. Pass envs=("demo",) to
+    import only demo, etc. Returns {"ok", "accounts": [...with _env...], "env"}.
     """
-    headers = {"Authorization": f"Bearer {access_token}"}
+    if isinstance(envs, str):
+        envs = (envs,)
+    all_accounts = []
     last_error = None
-
-    for env, base in (("live", REST_LIVE), ("demo", REST_DEMO)):
-        try:
-            response = requests.get(f"{base}/account/list", headers=headers, timeout=20)
-            data = response.json()
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-        if isinstance(data, list):
-            if data:
-                return {"ok": True, "accounts": data, "env": env}
-            # Valid but empty on this env — keep the empty result as a fallback.
-            last_error = "No accounts returned"
+    for env in envs:
+        res = fetch_accounts_for_env(access_token, env)
+        if res.get("ok"):
+            for acc in res["accounts"]:
+                acc["_env"] = env  # tag each account with the env it came from
+            all_accounts.extend(res["accounts"])
         else:
-            last_error = data
-
-    return {"ok": False, "error": last_error or "Could not fetch accounts", "accounts": []}
+            last_error = res.get("error")
+    if all_accounts:
+        return {"ok": True, "accounts": all_accounts, "env": all_accounts[0].get("_env", "live")}
+    return {"ok": False, "error": last_error or "No accounts returned", "accounts": []}
 
 
 # ----------------------------------------------------------------------------

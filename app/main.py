@@ -3665,7 +3665,14 @@ def broker_page(request: Request):
       <div class="card span5"><h3>Connection Status</h3>
         <div class="metric {'good' if connected_count else 'bad'}">{connected_count} Connected</div>
         <p class="muted">{available_count} available (independent) · {box_count} in copy trading. Connect through Tradovate's secure login — KhomaAPI never sees your password.</p>
-        <a class="btn" href="/auth/tradovate/connect">Connect with Tradovate</a>
+        <label style="font-size:13px;font-weight:700;">Which accounts to import?</label>
+        <select id="connect-env" style="margin:6px 0 12px;">
+          <option value="both">Both demo &amp; live</option>
+          <option value="demo">Demo / Eval only</option>
+          <option value="live">Live / Funded only</option>
+        </select>
+        <a class="btn" href="/auth/tradovate/connect?env=both" onclick="this.href='/auth/tradovate/connect?env='+document.getElementById('connect-env').value;">Connect with Tradovate</a>
+        <p class="muted" style="margin-top:8px;font-size:12px;">A single Tradovate login exposes both demo and live. Pick which to pull in so you never trade the wrong one by accident.</p>
       </div>
       <div class="card span7"><h3>Account Groups</h3>
         <p class="muted">Drag accounts between the two groups. <b>Available Accounts</b> trade independently; <b>Copy Trading Accounts</b> all receive the same master signal. The two systems run simultaneously and never interfere.</p>
@@ -4778,9 +4785,14 @@ def tradovate_connect(request: Request):
     if not user:
         return RedirectResponse("/login")
 
+    # Which environment(s) to import. A single Tradovate login exposes BOTH demo
+    # and live, so the user chooses here to avoid pulling in the wrong account.
+    choice = (request.query_params.get("env") or "both").lower()
+    envs = {"demo": ("demo",), "live": ("live",)}.get(choice, ("live", "demo"))
+
     # Tie this OAuth attempt to the logged-in user via an unguessable state token.
     state = secrets.token_urlsafe(24)
-    OAUTH_STATES[state] = user["id"]
+    OAUTH_STATES[state] = {"user_id": user["id"], "envs": envs}
 
     return RedirectResponse(build_tradovate_login(state))
 
@@ -4794,7 +4806,13 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
         return RedirectResponse("/broker?error=missing_code", status_code=302)
 
     # Resolve which user started this flow: state map first, session cookie as fallback.
-    user_id = OAUTH_STATES.pop(state, None)
+    st = OAUTH_STATES.pop(state, None)
+    envs = ("live", "demo")
+    if isinstance(st, dict):
+        user_id = st.get("user_id")
+        envs = st.get("envs") or envs
+    else:
+        user_id = st  # legacy int value
     if user_id is None:
         user = current_user(request)
         if user:
@@ -4813,9 +4831,8 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
         if expires_in else ""
     )
 
-    accounts_result = fetch_accounts(access_token)
+    accounts_result = fetch_accounts(access_token, envs=envs)
     accounts = accounts_result.get("accounts") or []
-    env = accounts_result.get("env", "live")
 
     if not accounts:
         return JSONResponse(
@@ -4824,8 +4841,10 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
                      "detail": accounts_result.get("error")},
         )
 
+    # Save each account tagged with the environment it actually came from
+    # (demo vs live), so the user never trades the wrong one by accident.
     for account in accounts:
-        save_broker_account(user_id, env, account, access_token, expires_at)
+        save_broker_account(user_id, account.get("_env", "live"), account, access_token, expires_at)
 
     return RedirectResponse(url="/broker?connected=1", status_code=302)
 
