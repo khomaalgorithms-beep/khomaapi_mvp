@@ -5258,6 +5258,37 @@ def economic_calendar_page(request: Request):
     return layout(content, user, "calendar")
 
 
+@app.get("/debug/calendar")
+def debug_calendar(request: Request):
+    """Verify the calendar data source (FMP vs free feed), field mapping, and the
+    timezone of event timestamps — so we can confirm multi-week is live + correct."""
+    user = require_user(request)
+    if not user:
+        return {"ok": False, "error": "Not logged in"}
+    now = datetime.now(timezone.utc)
+    out = {"fmp_key_set": bool(os.getenv("FMP_API_KEY"))}
+    # Raw FMP sample (first event) so we can read its exact fields + date format.
+    if os.getenv("FMP_API_KEY"):
+        d1, d2 = _week_range("this", now.astimezone(ZoneInfo(_ET)))
+        try:
+            r = requests.get(
+                f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1}&to={d2}&apikey={os.getenv('FMP_API_KEY')}",
+                timeout=15, headers={"User-Agent": "Mozilla/5.0 (KhomaAPI)"})
+            out["fmp_status"] = r.status_code
+            raw = r.json() if r.status_code < 400 else r.text[:300]
+            out["fmp_count"] = len(raw) if isinstance(raw, list) else 0
+            out["fmp_raw_sample"] = raw[:2] if isinstance(raw, list) else raw
+        except Exception as e:
+            out["fmp_error"] = f"{type(e).__name__}: {e}"
+    for wk in ("last", "this", "next"):
+        evs, mw = fetch_calendar_events(wk, now)
+        out[wk] = {"events": len(evs), "multiweek": mw,
+                   "sample": [{"title": e["title"], "currency": e["currency"], "impact": e["impact"],
+                               "et_time": e["dt"].astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d %-I:%M %p ET")}
+                              for e in evs[:3]]}
+    return out
+
+
 @app.post("/calendar/block")
 async def calendar_block(request: Request):
     """Create a news-lockout window from a calendar event — the risk engine then
