@@ -26,9 +26,40 @@ def _pick_db_url() -> str:
 DATABASE_URL = _pick_db_url()
 IS_PG = bool(DATABASE_URL)
 
+# Pool sizing. Railway Postgres caps total connections (default 100); keep the
+# pool well under that so many app instances/workers can coexist. Tune via env.
+POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+POOL_MAX = int(os.getenv("DB_POOL_MAX", "20"))
+POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "15"))
+
 if IS_PG:
     import psycopg
     from psycopg.rows import dict_row
+
+_pool = None
+
+
+def _get_pool():
+    """Lazily build a process-wide Postgres connection pool. Reusing warm
+    connections removes the per-query TCP+TLS+auth handshake (low latency) and
+    caps total connections so we never exhaust Postgres at 1,000+ clients."""
+    global _pool
+    if _pool is None:
+        from psycopg_pool import ConnectionPool
+        _pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=POOL_MIN,
+            max_size=POOL_MAX,
+            timeout=POOL_TIMEOUT,
+            max_idle=300,
+            kwargs={"connect_timeout": 10},
+            open=False,
+            name="khoma",
+        )
+        # Don't block boot if Railway's private net is still warming up;
+        # getconn() will wait/retry per checkout.
+        _pool.open(wait=False)
+    return _pool
 
 
 def _translate(sql: str) -> str:
@@ -99,9 +130,10 @@ class _Cur:
 class _Conn:
     """Uniform connection wrapper over sqlite3 / psycopg3."""
 
-    def __init__(self, raw, pg):
+    def __init__(self, raw, pg, pooled=False):
         self._raw = raw
         self._pg = pg
+        self._pooled = pooled
 
     def execute(self, sql, params=()):
         if self._pg:
@@ -119,12 +151,33 @@ class _Conn:
         self._raw.commit()
 
     def close(self):
-        self._raw.close()
+        if self._pooled:
+            # Return the connection to the pool instead of closing it. Roll back
+            # any uncommitted work first so the next checkout gets a clean slate.
+            try:
+                self._raw.rollback()
+            except Exception:
+                pass
+            try:
+                _get_pool().putconn(self._raw)
+                return
+            except Exception:
+                pass  # pool gone / conn broken -> hard close below
+        try:
+            self._raw.close()
+        except Exception:
+            pass
 
 
 def connect(sqlite_path):
     if IS_PG:
-        # Prefer the internal URL; fall back to the public URL if provided.
+        # Primary path: check a warm connection out of the pool.
+        try:
+            raw = _get_pool().getconn(timeout=POOL_TIMEOUT)
+            return _Conn(raw, True, pooled=True)
+        except Exception:
+            pass
+        # Fallback: direct connect (internal first, then public proxy).
         try:
             return _Conn(psycopg.connect(DATABASE_URL, connect_timeout=10), True)
         except Exception:

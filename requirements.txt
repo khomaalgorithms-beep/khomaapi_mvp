@@ -41,3 +41,4 @@ watchfiles==1.1.1
 websockets==16.0
 Werkzeug==3.1.8
 psycopg[binary]==3.3.4
+psycopg_pool==3.3.1
