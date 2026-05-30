@@ -528,6 +528,9 @@ def init_db():
     # Watchdog / heartbeat state per connected account.
     ensure_column("broker_accounts", "last_heartbeat", "TEXT")
     ensure_column("broker_accounts", "connectivity", "TEXT DEFAULT 'unknown'")
+    # Per-account position sizing: fixed contracts to trade on this account.
+    # NULL = N/A = use the quantity from the TradingView alert.
+    ensure_column("broker_accounts", "contract_qty", "INTEGER")
 
     # Per-account risk configuration + runtime state (the Risk Engine).
     cur.execute("""
@@ -1722,19 +1725,22 @@ def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dic
     # 3. Submit to all accounts in parallel — same instant, same price.
     def run(a):
         try:
+            # Per-account position sizing: a fixed contract size on the account
+            # overrides the alert qty (N/A -> use the alert's qty).
+            aqty = account_qty(a, qty)
             # SERVER-SIDE RISK GATE — runs per account before any order reaches
             # Tradovate. Flatten/close is never blocked (it reduces exposure).
             if side != "flatten":
-                allowed, reason, breach = risk_gate(a, side, qty, resolved)
+                allowed, reason, breach = risk_gate(a, side, aqty, resolved)
                 if not allowed:
                     return [{"account": a.get("account_name"), "ok": False,
                              "error": ("Risk: " + reason), "risk_blocked": True, "breach": breach}]
             if side == "flatten":
                 return flatten_on_account(a, symbol)
             elif side == "reverse":
-                return [reverse_on_account(a, resolved, qty)]
+                return [reverse_on_account(a, resolved, aqty)]
             else:
-                return [place_order_on_account(a, side, resolved, qty)]
+                return [place_order_on_account(a, side, resolved, aqty)]
         except Exception as e:
             return [{"account": a.get("account_name"), "ok": False, "error": str(e)}]
 
@@ -1751,6 +1757,32 @@ def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dic
         "accounts": len(accounts),
         "contract": resolved,
     }
+
+
+def account_qty(account: dict, alert_qty: int) -> int:
+    """Contracts to trade on this account. A per-account fixed size overrides the
+    alert quantity; N/A (NULL/blank) falls back to the size from the alert. This
+    lets a single master signal trade different contract counts per account."""
+    cq = account.get("contract_qty")
+    try:
+        if cq is not None and str(cq) != "" and int(cq) > 0:
+            return int(cq)
+    except (TypeError, ValueError):
+        pass
+    return max(1, int(alert_qty))
+
+
+def set_account_qty(user_id: int, account_db_id: int, qty) -> None:
+    """Persist per-account contracts. qty None/'' -> N/A (use the alert size)."""
+    try:
+        val = int(qty) if (qty not in (None, "") and int(qty) > 0) else None
+    except (TypeError, ValueError):
+        val = None
+    con = db()
+    con.execute("UPDATE broker_accounts SET contract_qty=? WHERE id=? AND user_id=?",
+                (val, account_db_id, user_id))
+    con.commit()
+    con.close()
 
 
 def find_connected_account(user_id: int, account_name: str):
@@ -3765,10 +3797,33 @@ def webhooks_page(request: Request):
         "account": "YourTradovateAccountName"
     }, indent=2)
 
+    # Per-account position sizing.
+    accounts = get_broker_accounts(user["id"], connected_only=True)
+    sizing_rows = ""
+    for a in accounts:
+        cq = a.get("contract_qty")
+        val = "" if cq in (None, "") else int(cq)
+        sizing_rows += (
+            f"<tr><td><b>{a['account_name']}</b> <small style='color:#9ca3af'>{(a.get('env') or '').upper()} · {(a.get('group_type') or 'independent').title()}</small></td>"
+            f"<td style='text-align:right'><input form='sizing-form' name='qty_{a['id']}' value='{val}' placeholder='N/A (use alert)' "
+            f"style='width:160px;display:inline-block;text-align:center;margin:0;'></td></tr>"
+        )
+    if accounts:
+        sizing_card = f'''
+      <div class="card span12"><h3>Per-Account Position Sizing</h3>
+        <p class="muted">Set a fixed number of contracts to trade on each account — this overrides the alert's <code>qty</code>. Leave blank for <b>N/A</b> (use whatever the TradingView alert sends). Works for both Copy Trading (same signal, different size per account) and Independent accounts.</p>
+        <form id="sizing-form" method="post" action="/webhooks/sizing"></form>
+        <table><tr><th>Account</th><th style="text-align:right">Contracts (blank = N/A)</th></tr>{sizing_rows}</table>
+        <button form="sizing-form" style="margin-top:12px;">Save Position Sizing</button>
+      </div>'''
+    else:
+        sizing_card = '''<div class="card span12"><h3>Per-Account Position Sizing</h3><p class="muted">Connect a Tradovate account on the Broker page to set per-account contract sizes.</p></div>'''
+
     content = f'''
     <div class="header"><div><h2>TradingView Webhooks</h2><p>Works with ANY TradingView Pine Script strategy — copy this URL and JSON into your alert.</p></div></div>
     <div class="grid">
       <div class="card span12"><h3>Webhook URL</h3><div class="keybox"><span id="webhook-url">{webhook_url}</span><button onclick="copyText('webhook-url')">Copy</button></div></div>
+      {sizing_card}
       <div class="card span7"><h3>Dynamic TradingView JSON (master / copy signal)</h3><pre class="codebox" id="json-template">{example}</pre><button onclick="copyText('json-template')">Copy JSON</button><p class="muted">No <code>account</code> field = master signal, mirrored across all Copy Trading Accounts.</p></div>
       <div class="card span5"><h3>Setup Instructions</h3><p class="muted">1. Open any TradingView alert.<br>2. Enable Webhook URL.<br>3. Paste the webhook URL.<br>4. Paste the JSON below.<br>5. Your strategy controls action / qty / symbol automatically.</p><div class="copy-note">Each client uses the same endpoint with a unique client_id + secret. Accounts never intersect between clients.</div></div>
       <div class="card span7"><h3>Route to one Independent account</h3><pre class="codebox" id="json-routed">{routed_example}</pre><button onclick="copyText('json-routed')">Copy JSON</button><p class="muted">Add an <code>account</code> field (exact Tradovate account name) to trade ONLY that Available account — different strategies can target different accounts.</p></div>
@@ -3777,6 +3832,19 @@ def webhooks_page(request: Request):
     </div>
     '''
     return layout(content, user, "webhooks")
+
+
+@app.post("/webhooks/sizing")
+async def webhooks_sizing_save(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    for a in get_broker_accounts(user["id"], connected_only=True):
+        key = f"qty_{a['id']}"
+        if key in form:
+            set_account_qty(user["id"], a["id"], (form.get(key) or "").strip())
+    return RedirectResponse("/webhooks", status_code=302)
 
 
 def dashboard_risk_panel(user_id: int) -> str:
