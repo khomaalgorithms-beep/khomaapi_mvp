@@ -114,10 +114,35 @@ class _Conn:
 
 def connect(sqlite_path):
     if IS_PG:
-        return _Conn(psycopg.connect(DATABASE_URL), True)
+        # Prefer the internal URL; fall back to the public URL if provided.
+        try:
+            return _Conn(psycopg.connect(DATABASE_URL, connect_timeout=10), True)
+        except Exception:
+            pub = os.getenv("DATABASE_PUBLIC_URL", "").strip()
+            if pub.startswith(("postgres://", "postgresql://")):
+                return _Conn(psycopg.connect(pub, connect_timeout=10), True)
+            raise
     raw = sqlite3.connect(sqlite_path)
     raw.row_factory = sqlite3.Row
     return _Conn(raw, False)
+
+
+def wait_for_db(sqlite_path, attempts: int = 20, delay: float = 2.0):
+    """Connect with retries — Railway's private network (postgres.railway.internal)
+    takes a few seconds to come up after a container boots, so connecting at the
+    very first instant fails. Retry until it's ready instead of crashing."""
+    import time as _t
+    last = None
+    for i in range(attempts):
+        try:
+            c = connect(sqlite_path)
+            c.execute("SELECT 1").fetchone()
+            return c
+        except Exception as e:
+            last = e
+            print(f"DB not ready (attempt {i + 1}/{attempts}): {e}")
+            _t.sleep(delay)
+    raise RuntimeError(f"Could not connect to database after {attempts} attempts: {last}")
 
 
 def insert_returning_id(cur, sql, params, idcol="id"):

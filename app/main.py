@@ -372,7 +372,9 @@ def send_branded_email(to_email, subject, heading, message_html, button_label=""
 
 
 def init_db():
-    con = db()
+    # Retry the first connection — Railway's private network needs a few seconds
+    # after boot before postgres.railway.internal is reachable.
+    con = dbmod.wait_for_db(str(DB_PATH))
     cur = con.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
