@@ -528,6 +528,13 @@ def init_db():
             pass
 
     ensure_column("users", "is_verified", "INTEGER DEFAULT 1")
+    # Performance email digests (opt-in) + last-sent period markers.
+    ensure_column("users", "digest_daily", "INTEGER DEFAULT 0")
+    ensure_column("users", "digest_weekly", "INTEGER DEFAULT 0")
+    ensure_column("users", "digest_monthly", "INTEGER DEFAULT 0")
+    ensure_column("users", "digest_daily_sent", "TEXT")
+    ensure_column("users", "digest_weekly_sent", "TEXT")
+    ensure_column("users", "digest_monthly_sent", "TEXT")
     ensure_column("email_verifications", "kind", "TEXT DEFAULT 'change_email'")
     ensure_column("email_verifications", "payload", "TEXT")
     ensure_column("broker_accounts", "in_copy_box", "INTEGER DEFAULT 0")
@@ -1558,12 +1565,135 @@ async def risk_watchdog_loop():
         await asyncio.sleep(FAST_INTERVAL)
 
 
+# ============================================================
+# PERFORMANCE EMAIL DIGESTS (daily / weekly / monthly)
+# ============================================================
+
+def _trips_in_range(trips, start_utc, end_utc):
+    out = []
+    for t in trips:
+        d = _trip_dt(t, "closed_at")
+        if d and start_utc <= d <= end_utc:
+            out.append(t)
+    return out
+
+
+def digest_email_html(period_label: str, s: dict) -> str:
+    """Compact branded stats grid for a performance digest email."""
+    pf = s["profit_factor"]
+    pf_disp = "∞" if pf == float("inf") else (f"{pf:.2f}" if pf is not None else "—")
+    best = (f"{s['best_day'][0]} ({_money(s['best_day'][1],0)})" if s["best_day"] else "—")
+    worst = (f"{s['worst_day'][0]} ({_money(s['worst_day'][1],0)})" if s["worst_day"] else "—")
+    net_color = "#0f8f45" if s["net"] >= 0 else "#b91c1c"
+
+    def row(label, value, color="#111827"):
+        return (f"<tr><td style='padding:9px 0;color:#6b7280;font-size:14px;'>{label}</td>"
+                f"<td style='padding:9px 0;text-align:right;font-weight:800;color:{color};font-size:14px;'>{value}</td></tr>")
+
+    return (
+        f"<p style='margin:0 0 14px;'>Here's your <b>{period_label}</b> trading performance from KhomaAPI — straight from your broker fills.</p>"
+        f"<div style='background:{net_color};border-radius:14px;padding:18px 20px;color:#fff;margin:0 0 16px;'>"
+        f"<div style='font-size:13px;opacity:.85;'>Net P&amp;L</div>"
+        f"<div style='font-size:30px;font-weight:850;'>{_money(s['net'])}</div></div>"
+        f"<table style='width:100%;border-collapse:collapse;'>"
+        + row("Trades", s["n"])
+        + row("Win rate", f"{s['win_rate']}%  ({s['wins']}W / {s['losses']}L)")
+        + row("Profit factor", pf_disp)
+        + row("Expectancy / trade", _money(s["expectancy"]), "#0f8f45" if s["expectancy"] >= 0 else "#b91c1c")
+        + row("Avg win / loss", f"{_money(s['avg_win'],0)} / {_money(-s['avg_loss'],0)}")
+        + row("Best day", best, "#0f8f45")
+        + row("Worst day", worst, "#b91c1c")
+        + row("Green / red days", f"{s['green_days']} / {s['red_days']}")
+        + "</table>"
+    )
+
+
+def _send_one_digest(user_row: dict, period_label: str, subject: str, trips: list) -> bool:
+    if not trips:
+        s = journal_analytics([])
+    else:
+        s = journal_analytics(trips)
+    html_body = digest_email_html(period_label, s)
+    text = f"{period_label} performance — Net {_money(s['net'])}, win rate {s['win_rate']}%, {s['n']} trades."
+    return send_branded_email(
+        user_row["email"], subject, f"Your {period_label} performance",
+        html_body, button_label="Open KhomaTradingJournal", button_url=f"{APP_URL}/journal",
+        text_fallback=text,
+    )
+
+
+def _mark_digest_sent(user_id: int, col: str, period_id: str):
+    con = db()
+    con.execute(f"UPDATE users SET {col}=? WHERE id=?", (period_id, user_id))
+    con.commit()
+    con.close()
+
+
+def digest_tick():
+    """Check every enabled user and send any due daily/weekly/monthly digest."""
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ZoneInfo(_ET))
+    con = db()
+    users = con.execute(
+        "SELECT * FROM users WHERE digest_daily=1 OR digest_weekly=1 OR digest_monthly=1"
+    ).fetchall()
+    con.close()
+    for u in users:
+        u = dict(u)
+        if not u.get("email"):
+            continue
+        try:
+            trips, _o = account_trade_history(u["id"])
+        except Exception:
+            trips = []
+
+        # DAILY — after the futures session close (>= 17:00 ET), once per day.
+        if u.get("digest_daily") and now_et.hour >= 17:
+            pid = now_et.strftime("%Y-%m-%d")
+            if u.get("digest_daily_sent") != pid:
+                start = risk.session_anchor(now_utc)
+                if _send_one_digest(u, "daily", "Your KhomaAPI daily performance", _trips_in_range(trips, start, now_utc)):
+                    _mark_digest_sent(u["id"], "digest_daily_sent", pid)
+
+        # WEEKLY — Saturday morning, covering the last 7 days.
+        if u.get("digest_weekly") and now_et.weekday() == 5 and now_et.hour >= 9:
+            pid = now_et.strftime("%G-W%V")
+            if u.get("digest_weekly_sent") != pid:
+                start = now_utc - timedelta(days=7)
+                if _send_one_digest(u, "weekly", "Your KhomaAPI weekly performance", _trips_in_range(trips, start, now_utc)):
+                    _mark_digest_sent(u["id"], "digest_weekly_sent", pid)
+
+        # MONTHLY — on the 1st, covering the previous calendar month.
+        if u.get("digest_monthly") and now_et.day == 1 and now_et.hour >= 9:
+            first_this = now_et.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            last_prev = first_this - timedelta(days=1)
+            first_prev = last_prev.replace(day=1)
+            pid = first_prev.strftime("%Y-%m")
+            if u.get("digest_monthly_sent") != pid:
+                start = first_prev.astimezone(timezone.utc)
+                end = first_this.astimezone(timezone.utc)
+                if _send_one_digest(u, first_prev.strftime("%B %Y"), f"Your KhomaAPI {first_prev.strftime('%B')} performance", _trips_in_range(trips, start, end)):
+                    _mark_digest_sent(u["id"], "digest_monthly_sent", pid)
+
+
+async def digest_loop():
+    print("DIGEST scheduler started (10-min cadence)")
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, digest_tick)
+        except Exception as e:
+            print("DIGEST ERROR:", e)
+        await asyncio.sleep(600)
+
+
 @app.on_event("startup")
 async def _start_watchdog():
     # Disable with KHOMA_DISABLE_WATCHDOG=1 (e.g. in tests / CI).
     if os.getenv("KHOMA_DISABLE_WATCHDOG") == "1":
         return
     asyncio.create_task(risk_watchdog_loop())
+    asyncio.create_task(digest_loop())
 
 
 def _order_ok(resp) -> bool:
@@ -4831,6 +4961,18 @@ def settings_page(request: Request):
 </div>
 
 <div class="card span12">
+  <h3>Performance Email Reports</h3>
+  <p class="muted">Get a clean, branded summary of your trading performance emailed to <b>{user['email']}</b>. Pulled straight from your broker fills.</p>
+  <form method="post" action="/settings/digests">
+    <label style="display:flex;align-items:center;gap:10px;font-weight:700;margin:8px 0;"><input type="checkbox" name="digest_daily" value="1" {'checked' if user['digest_daily'] else ''} style="width:auto;margin:0;"> Daily recap <span class="muted" style="font-weight:500;">— after the session close (≈5:00 PM ET)</span></label>
+    <label style="display:flex;align-items:center;gap:10px;font-weight:700;margin:8px 0;"><input type="checkbox" name="digest_weekly" value="1" {'checked' if user['digest_weekly'] else ''} style="width:auto;margin:0;"> Weekly summary <span class="muted" style="font-weight:500;">— Saturday morning</span></label>
+    <label style="display:flex;align-items:center;gap:10px;font-weight:700;margin:8px 0;"><input type="checkbox" name="digest_monthly" value="1" {'checked' if user['digest_monthly'] else ''} style="width:auto;margin:0;"> Monthly report <span class="muted" style="font-weight:500;">— 1st of the month</span></label>
+    <button style="margin-top:10px;">Save Report Preferences</button>
+    <a class="btn secondary" style="margin-top:10px;" href="/settings/digests/sample">Send me a sample now</a>
+  </form>
+</div>
+
+<div class="card span12">
   <h3>Webhook Security</h3>
   <p class="muted">Your webhook secret signs every TradingView alert. Regenerate it if it may have leaked — this <b>immediately invalidates the old secret</b>, so any existing TradingView alerts will be rejected until you paste the new JSON from the Webhooks page.</p>
   <div class="keybox" style="margin:12px 0;"><span>{mask_value(user['webhook_secret'])}</span></div>
@@ -4842,6 +4984,42 @@ def settings_page(request: Request):
     </div>
     '''
     return layout(content, user, "settings")
+
+
+@app.post("/settings/digests")
+async def settings_digests(request: Request):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    con = db()
+    con.execute(
+        "UPDATE users SET digest_daily=?, digest_weekly=?, digest_monthly=? WHERE id=?",
+        (1 if form.get("digest_daily") else 0, 1 if form.get("digest_weekly") else 0,
+         1 if form.get("digest_monthly") else 0, user["id"]),
+    )
+    con.commit()
+    con.close()
+    return RedirectResponse("/settings", status_code=302)
+
+
+@app.get("/settings/digests/sample")
+def settings_digest_sample(request: Request):
+    """Send the user a sample performance digest right now (preview)."""
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    try:
+        trips, _o = account_trade_history(user["id"])
+    except Exception:
+        trips = []
+    sent = _send_one_digest(dict(user), "sample (last 30 days)", "Your KhomaAPI performance — sample",
+                            _trips_in_range(trips, datetime.now(timezone.utc) - timedelta(days=30), datetime.now(timezone.utc)))
+    return login_layout(
+        ("<h1>Sample sent</h1><p>Check your inbox for a sample performance report.</p>" if sent
+         else f"<h1>Couldn't send</h1><p>{LAST_EMAIL_ERROR}</p>")
+        + "<a class='btn' href='/settings'>Back to Settings</a>"
+    )
 
 
 @app.post("/settings/regenerate-webhook-secret")
