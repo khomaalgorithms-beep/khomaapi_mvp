@@ -504,6 +504,22 @@ def init_db():
     )
     """)
 
+    # KhomaTradingJournal: tags + notes + screenshot per CLOSED round-trip
+    # (keyed by a stable hash of the trip so it survives re-reads from fills).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trip_journal(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        trip_key TEXT NOT NULL,
+        tags TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        image_path TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(user_id, trip_key)
+    )
+    """)
+
     # --- Additive column migrations (safe on existing DBs) ---
     def ensure_column(table, column, decl):
         try:
@@ -2559,7 +2575,47 @@ def _trip_dt(t, key):
         return None
 
 
-def journal_analytics(trips: list) -> dict:
+def trip_key(t: dict) -> str:
+    """Stable, URL-safe id for a closed round-trip so tags/notes/screenshots
+    survive re-reading the same trip from broker fills."""
+    sig = "|".join(str(x) for x in (
+        t.get("account", ""), t.get("symbol", ""), t.get("side", ""),
+        t.get("qty", ""), t.get("entry_price", ""), t.get("exit_price", ""),
+        t.get("closed_at", ""),
+    ))
+    return hashlib.sha1(sig.encode()).hexdigest()
+
+
+def get_trip_journal_map(user_id: int) -> Dict[str, dict]:
+    con = db()
+    rows = con.execute("SELECT * FROM trip_journal WHERE user_id=?", (user_id,)).fetchall()
+    con.close()
+    return {r["trip_key"]: dict(r) for r in rows}
+
+
+def save_trip_journal(user_id: int, key: str, tags: str, note: str, image_path) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    con = db()
+    if image_path is None:
+        existing = con.execute("SELECT image_path FROM trip_journal WHERE user_id=? AND trip_key=?",
+                               (user_id, key)).fetchone()
+        image_path = existing["image_path"] if existing else None
+    con.execute(
+        """INSERT INTO trip_journal(user_id,trip_key,tags,note,image_path,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(user_id,trip_key) DO UPDATE SET
+             tags=excluded.tags, note=excluded.note, image_path=excluded.image_path, updated_at=excluded.updated_at""",
+        (user_id, key, tags, note, image_path, now, now),
+    )
+    con.commit()
+    con.close()
+
+
+def parse_tags(s: str) -> list:
+    return [t.strip() for t in str(s or "").replace(";", ",").split(",") if t.strip()]
+
+
+def journal_analytics(trips: list, tags_map: dict = None) -> dict:
     """Full performance analytics over closed round-trips (entry/exit/pnl/side/
     qty/symbol/opened_at/closed_at). The best of Tradezella/TraderSync, computed
     from what KhomaAPI actually has from broker fills."""
@@ -2640,6 +2696,23 @@ def journal_analytics(trips: list) -> dict:
     by_weekday = bucket(lambda t: _trip_dt(t, "closed_at").astimezone(ZoneInfo(_ET)).weekday() if _trip_dt(t, "closed_at") else None)
     by_hour = bucket(lambda t: _trip_dt(t, "closed_at").astimezone(ZoneInfo(_ET)).hour if _trip_dt(t, "closed_at") else None)
 
+    # Performance by user tag (a trip can carry several tags).
+    by_tag = {}
+    if tags_map:
+        for t in trips:
+            jr = tags_map.get(trip_key(t))
+            if not jr:
+                continue
+            p = float(t.get("pnl") or 0)
+            for tag in parse_tags(jr.get("tags")):
+                e = by_tag.setdefault(tag, {"pnl": 0.0, "n": 0, "w": 0})
+                e["pnl"] += p; e["n"] += 1
+                if p > 0:
+                    e["w"] += 1
+        for e in by_tag.values():
+            e["pnl"] = round(e["pnl"], 2)
+            e["win_rate"] = round(e["w"] / e["n"] * 100) if e["n"] else 0
+
     return {
         "n": n, "net": net, "gross_profit": gross_profit, "gross_loss": gross_loss,
         "win_rate": win_rate, "wins": len(wins), "losses": len(losses), "scratches": len(scratches),
@@ -2652,6 +2725,7 @@ def journal_analytics(trips: list) -> dict:
         "green_days": green_days, "red_days": red_days, "day_win_rate": day_win_rate,
         "avg_daily": avg_daily, "best_day": best_day, "worst_day": worst_day,
         "by_symbol": by_symbol, "by_side": by_side, "by_weekday": by_weekday, "by_hour": by_hour,
+        "by_tag": by_tag,
     }
 
 
@@ -4464,7 +4538,8 @@ def journal_page(request: Request):
     except Exception:
         trips = []
 
-    s = journal_analytics(trips)
+    tmap = get_trip_journal_map(user["id"])
+    s = journal_analytics(trips, tags_map=tmap)
 
     # Calendar month: ?month=YYYY-MM, else month of latest trade, else now (ET).
     month_q = request.query_params.get("month", "")
@@ -4502,13 +4577,28 @@ def journal_page(request: Request):
     best = (f"{s['best_day'][0]} ({_money(s['best_day'][1],0)})" if s["best_day"] else "—")
     worst = (f"{s['worst_day'][0]} ({_money(s['worst_day'][1],0)})" if s["worst_day"] else "—")
 
-    # Recent closed trades (scoped).
-    trip_rows = "".join([
-        f"<tr><td>{str(t.get('closed_at') or '')[:16].replace('T',' ')}</td><td><b>{t['symbol']}</b></td><td>{t.get('account','')}</td>"
-        f"<td>{t['side']}</td><td>{t['qty']}</td><td>{t['entry_price']}</td><td>{t['exit_price']}</td>"
-        f"<td class=\"{_pnl_cls(t['pnl'])}\">{_money(t['pnl'])}</td></tr>"
-        for t in sorted(trips, key=lambda x: str(x.get('closed_at','')), reverse=True)[:60]
-    ]) or "<tr><td colspan='8'>No closed trades yet.</td></tr>"
+    # Recent closed trades (scoped) — with tags + notes + screenshot editor.
+    def _trow(t):
+        k = trip_key(t)
+        jr = tmap.get(k, {})
+        tag_chips = "".join(
+            f"<span style='display:inline-block;background:#eef2ff;color:#3730a3;border-radius:8px;padding:1px 8px;margin:1px 3px 1px 0;font-size:11px;font-weight:700;'>{tg}</span>"
+            for tg in parse_tags(jr.get("tags"))
+        )
+        marks = ("📝" if (jr.get("note") or "").strip() else "") + ("🖼" if jr.get("image_path") else "")
+        return (
+            f"<tr><td>{str(t.get('closed_at') or '')[:16].replace('T',' ')}</td><td><b>{t['symbol']}</b></td><td>{t.get('account','')}</td>"
+            f"<td>{t['side']}</td><td>{t['qty']}</td><td>{t['entry_price']}</td><td>{t['exit_price']}</td>"
+            f"<td class=\"{_pnl_cls(t['pnl'])}\">{_money(t['pnl'])}</td>"
+            f"<td>{tag_chips}{marks}</td>"
+            f"<td><a class='btn secondary' style='padding:5px 10px;margin:0;' href='/journal/trip/{k}?account={sel}'>{'Edit' if jr else 'Tag / Note'}</a></td></tr>"
+        )
+    trip_rows = "".join(_trow(t) for t in sorted(trips, key=lambda x: str(x.get('closed_at','')), reverse=True)[:80]) \
+        or "<tr><td colspan='10'>No closed trades yet.</td></tr>"
+
+    tag_card = ""
+    if s.get("by_tag"):
+        tag_card = f'''<div class="card span6"><h3>By Tag / Setup</h3>{journal_bars_html(s['by_tag'], lambda k: k, order='pnl')}</div>'''
 
     content = f'''
     <div class="header"><div><h2>KhomaTradingJournal</h2><p>Full performance analytics from your real Tradovate fills — equity curve, P&amp;L calendar, profit factor, expectancy and breakdowns.</p></div></div>
@@ -4538,8 +4628,9 @@ def journal_page(request: Request):
 
       <div class="card span6"><h3>By Symbol</h3>{journal_bars_html(s['by_symbol'], lambda k: k, order='pnl')}</div>
       <div class="card span6"><h3>By Hour (ET)</h3>{journal_bars_html(s['by_hour'], lambda k: f"{k:02d}:00")}</div>
+      {tag_card}
 
-      <div class="card span12"><h3>Closed Trades</h3><table><tr><th>Closed</th><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&amp;L</th></tr>{trip_rows}</table></div>
+      <div class="card span12"><h3>Closed Trades</h3><p class="muted">Click <b>Tag / Note</b> on any trade to add setups, a journal note, and a screenshot.</p><table><tr><th>Closed</th><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Tags</th><th></th></tr>{trip_rows}</table></div>
     </div>
     '''
     return layout(content, user, "journal")
@@ -4610,6 +4701,86 @@ async def journal_note_save(request: Request, trade_id: int, note: str = Form(""
 
     upsert_trade_note(user["id"], trade_id, note.strip(), image_path)
     return RedirectResponse(f"/journal/note/{trade_id}", status_code=302)
+
+
+_COMMON_TAGS = ["A+ setup", "Breakout", "Reversal", "Trend", "Scalp", "News",
+                "FOMO", "Revenge", "Overtraded", "Followed plan", "Broke rules", "Mistake"]
+
+
+@app.get("/journal/trip/{key}", response_class=HTMLResponse)
+def journal_trip_edit(request: Request, key: str):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    sel = request.query_params.get("account", "all") or "all"
+    try:
+        trips, _open = account_trade_history(user["id"])
+    except Exception:
+        trips = []
+    trip = next((t for t in trips if trip_key(t) == key), None)
+    jr = get_trip_journal_map(user["id"]).get(key, {})
+
+    if not trip:
+        ctx = "<p class='muted'>This trade is no longer in your recent broker history, but you can still keep its note below.</p>"
+    else:
+        ctx = (f"<div class='journal-day'><div><b>{trip['symbol']}</b> · {trip['side']} {trip['qty']} "
+               f"<small style='color:#9ca3af'>{trip.get('account','')}</small></div>"
+               f"<div class='{_pnl_cls(trip['pnl'])}'><b>{_money(trip['pnl'])}</b></div></div>"
+               f"<p class='muted'>Entry {trip['entry_price']} → Exit {trip['exit_price']} · closed {str(trip.get('closed_at') or '')[:16].replace('T',' ')}</p>")
+
+    img = f"<div style='margin:10px 0;'><img src='{jr.get('image_path')}' style='max-width:100%;border-radius:12px;border:1px solid #e5e7eb;'></div>" if jr.get("image_path") else ""
+    chips = "".join(
+        f"<span onclick=\"addTag('{tg}')\" style='cursor:pointer;display:inline-block;background:#f1f3f2;border-radius:8px;padding:4px 10px;margin:3px 5px 3px 0;font-size:12px;font-weight:700;'>+ {tg}</span>"
+        for tg in _COMMON_TAGS
+    )
+    content = f'''
+    <div class="header"><div><h2>Trade Journal Entry</h2><p>Tag the setup, write what happened, and attach a screenshot.</p></div>
+      <a class="btn secondary" href="/journal?account={sel}">← Back to Journal</a></div>
+    <div class="card span12">{ctx}</div>
+    <div class="card span12">
+      <form method="post" action="/journal/trip/{key}" enctype="multipart/form-data">
+        <label>Tags / setups (comma-separated)</label>
+        <input id="tags" name="tags" value="{jr.get('tags','') or ''}" placeholder="e.g. A+ setup, Breakout, Followed plan">
+        <div style="margin:6px 0 14px;">{chips}</div>
+        <label>Notes — what happened, what you'd do differently</label>
+        <textarea name="note" rows="6" placeholder="Your trade review...">{jr.get('note','') or ''}</textarea>
+        {img}
+        <label>Screenshot (PNG/JPG/GIF/WEBP, max 5MB)</label>
+        <input type="file" name="image" accept="image/*">
+        <button>Save Entry</button>
+      </form>
+    </div>
+    <script>
+    function addTag(t){{
+      var el=document.getElementById('tags');
+      var cur=el.value.split(',').map(function(x){{return x.trim();}}).filter(Boolean);
+      if(cur.indexOf(t)===-1){{ cur.push(t); el.value=cur.join(', '); }}
+    }}
+    </script>
+    '''
+    return layout(content, user, "journal")
+
+
+@app.post("/journal/trip/{key}")
+async def journal_trip_save(request: Request, key: str, tags: str = Form(""),
+                            note: str = Form(""), image: UploadFile = File(None)):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    image_path = None
+    if image is not None and image.filename:
+        ext = os.path.splitext(image.filename)[1].lower()
+        if ext not in ALLOWED_IMAGE_EXT or not (image.content_type or "").startswith("image/"):
+            return layout(f"<div class='card'><p class='bad'>Only image files allowed.</p><a class='btn secondary' href='/journal/trip/{key}'>Back</a></div>", user, "journal")
+        data = await image.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            return layout(f"<div class='card'><p class='bad'>Image too large (max 5MB).</p><a class='btn secondary' href='/journal/trip/{key}'>Back</a></div>", user, "journal")
+        safe_name = f"u{user['id']}_trip_{key[:10]}_{secrets.token_hex(5)}{ext}"
+        with open(os.path.join(UPLOADS_DIR, safe_name), "wb") as fp:
+            fp.write(data)
+        image_path = f"/uploads/{safe_name}"
+    save_trip_journal(user["id"], key, tags.strip(), note.strip(), image_path)
+    return RedirectResponse(f"/journal/trip/{key}", status_code=302)
 
 
 @app.get("/settings", response_class=HTMLResponse)
