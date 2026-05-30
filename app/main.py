@@ -1515,51 +1515,93 @@ FULL_REFRESH_TICKS = 10    # full state (fills/positions) every N ticks (~10s)
 _WATCH_TICK = 0
 
 
+WATCH_WORKERS = 16  # bounded concurrency for the per-account poll (rate-limit safe)
+
+
+def _poll_one(a: dict, tick: int) -> list:
+    """Risk/heartbeat work for ONE account in a tick. Returns lock/pass events."""
+    out = []
+    try:
+        cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], a["user_id"]))
+        active = _risk_active(cfg)
+        hard = _has_hard_limits(cfg)
+        fast = _ACCT_FAST.get(a["id"], {})
+        in_pos = fast.get("in_position", True)  # assume in-position until first full refresh
+        need_full = active and ((tick % FULL_REFRESH_TICKS == 0) or a["id"] not in _ACCT_FAST)
+
+        if need_full:
+            state = account_live_state(a, cfg)
+            set_heartbeat(a["id"], bool(state.get("ok")))
+            if state.get("ok"):
+                update_account_hwm(a, cfg, state)
+                cfg = get_risk_config(a["id"])
+                ev_pass = check_eval_pass(a, cfg, state)  # eval -> congrats/funded unlock
+                if ev_pass:
+                    out.append(ev_pass)
+                    cfg = get_risk_config(a["id"])
+                ev = _breach_and_lock(a, cfg, state)
+                if ev:
+                    out.append(ev)
+        elif active and hard and in_pos:
+            ev = fast_breach_check(a, cfg)
+            if ev:
+                out.append(ev)
+        elif tick % FULL_REFRESH_TICKS == 0:
+            token = ensure_fresh_token(a)
+            snap = tvo.get_cash_snapshot(a.get("env") or "live", token, a.get("account_id")) if token else None
+            set_heartbeat(a["id"], snap is not None)
+    except Exception:
+        pass
+    return out
+
+
 def poll_tick():
-    """One watchdog tick. Fast snapshot breach-check for risk-active accounts
-    holding a position; periodic full refresh otherwise. Returns lock events."""
+    """One watchdog tick — runs all connected accounts in PARALLEL (bounded) so a
+    single worker handles 1,000+ accounts without serializing broker calls."""
     global _WATCH_TICK
     _WATCH_TICK += 1
-    events = []
+    tick = _WATCH_TICK
     con = db()
     rows = con.execute("SELECT * FROM broker_accounts WHERE status='connected'").fetchall()
     con.close()
-    for r in rows:
-        a = dict(r)
-        try:
-            cfg = _maybe_auto_unlock(ensure_risk_config(a["id"], a["user_id"]))
-            active = _risk_active(cfg)
-            hard = _has_hard_limits(cfg)
-            fast = _ACCT_FAST.get(a["id"], {})
-            in_pos = fast.get("in_position", True)  # assume in-position until first full refresh
-            need_full = active and ((_WATCH_TICK % FULL_REFRESH_TICKS == 0) or a["id"] not in _ACCT_FAST)
-
-            if need_full:
-                state = account_live_state(a, cfg)
-                set_heartbeat(a["id"], bool(state.get("ok")))
-                if state.get("ok"):
-                    update_account_hwm(a, cfg, state)
-                    cfg = get_risk_config(a["id"])
-                    # Evaluation progress -> congrats + funded unlock on pass.
-                    ev_pass = check_eval_pass(a, cfg, state)
-                    if ev_pass:
-                        events.append(ev_pass)
-                        cfg = get_risk_config(a["id"])
-                    ev = _breach_and_lock(a, cfg, state)
-                    if ev:
-                        events.append(ev)
-            elif active and hard and in_pos:
-                ev = fast_breach_check(a, cfg)
-                if ev:
-                    events.append(ev)
-            elif _WATCH_TICK % FULL_REFRESH_TICKS == 0:
-                # Heartbeat-only for accounts with no active risk rules.
-                token = ensure_fresh_token(a)
-                snap = tvo.get_cash_snapshot(a.get("env") or "live", token, a.get("account_id")) if token else None
-                set_heartbeat(a["id"], snap is not None)
-        except Exception:
-            continue
+    accts = [dict(r) for r in rows]
+    if not accts:
+        return []
+    events = []
+    with ThreadPoolExecutor(max_workers=min(WATCH_WORKERS, len(accts))) as pool:
+        for evs in pool.map(lambda a: _poll_one(a, tick), accts):
+            events += evs
     return events
+
+
+# ---- single-worker leader election (so 2+ instances don't double-poll) ----
+_LEADER_CONN = None
+_LEADER_LOCK_KEY = 778201
+
+
+def try_become_leader() -> bool:
+    """Only ONE instance should run the background loops. On SQLite (single
+    instance) always True. On Postgres, grab a session-level advisory lock — the
+    instance that holds it is the worker; if it dies the lock frees and another
+    instance takes over automatically."""
+    global _LEADER_CONN
+    if not dbmod.IS_PG:
+        return True
+    if _LEADER_CONN is not None:
+        return True
+    try:
+        import psycopg
+        conn = psycopg.connect(dbmod.DATABASE_URL, autocommit=True)
+        got = conn.execute("SELECT pg_try_advisory_lock(%s)", (_LEADER_LOCK_KEY,)).fetchone()[0]
+        if got:
+            _LEADER_CONN = conn  # hold for the process lifetime
+            print("RISK WORKER: acquired leader lock")
+            return True
+        conn.close()
+        return False
+    except Exception as e:
+        print("LEADER LOCK ERROR:", e)
+        return False
 
 
 async def risk_watchdog_loop():
@@ -1567,6 +1609,9 @@ async def risk_watchdog_loop():
           % (FAST_INTERVAL, FAST_INTERVAL * FULL_REFRESH_TICKS))
     loop = asyncio.get_event_loop()
     while True:
+        if not await loop.run_in_executor(None, try_become_leader):
+            await asyncio.sleep(15)  # not the worker instance — re-check for failover
+            continue
         try:
             events = await loop.run_in_executor(None, poll_tick)
             for ev in events or []:
@@ -1704,8 +1749,9 @@ async def digest_loop():
     loop = asyncio.get_event_loop()
     while True:
         try:
-            await loop.run_in_executor(None, digest_tick)
-            await loop.run_in_executor(None, _prewarm_calendar)
+            if await loop.run_in_executor(None, try_become_leader):  # worker instance only
+                await loop.run_in_executor(None, digest_tick)
+                await loop.run_in_executor(None, _prewarm_calendar)
         except Exception as e:
             print("DIGEST ERROR:", e)
         await asyncio.sleep(600)
