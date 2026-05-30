@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet
 import os
 import httpx
@@ -1278,13 +1279,38 @@ def flatten_and_lock_account(account: dict, reason: str, now_utc: datetime = Non
     return results
 
 
+def quick_snapshot_state(account: dict, cfg: dict) -> dict:
+    """ONE cash-snapshot call -> equity + penny-exact day PnL. Used on the order
+    hot path so the risk gate never blocks on a heavy multi-call fetch (the 1s
+    poller keeps the full cache warm; this only covers a brand-new account)."""
+    token = ensure_fresh_token(account)
+    if not token or not account.get("account_id"):
+        return {"ok": False}
+    snap = tvo.get_cash_snapshot(account.get("env") or "live", token, account.get("account_id"))
+    if snap is None:
+        return {"ok": False}
+    open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
+    net_liq = _snapshot_value(snap, ("netLiq", "netLiquidatingValue"))
+    sod = _snapshot_value(snap, ("netLiqSOD", "totalCashValueSOD", "cashSODUSD"))
+    cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
+    equity = net_liq if net_liq is not None else (round(cash + (open_pnl or 0), 2) if cash is not None else None)
+    day_pnl = round(equity - sod, 2) if (equity is not None and sod is not None) else None
+    state = {"ok": True, "equity": equity, "open_pnl": open_pnl, "day_pnl": day_pnl,
+             "net_by_root": {}, "open_symbols": [], "flat": True,
+             "high_water_mark": cfg.get("high_water_mark")}
+    ACCOUNT_STATE_CACHE[account.get("id")] = (state, time.time())
+    return state
+
+
 def _cached_state(account: dict, cfg: dict):
-    """Return recent live state for an account: from cache if fresh, else fetch."""
+    """Live state for the order gate. Uses the poller-warmed cache (always 1–10s
+    fresh for active accounts) so the hot path adds ~0 latency. Falls back to a
+    single snapshot only when there is no cache yet — never the 4-call fetch."""
     cached = ACCOUNT_STATE_CACHE.get(account.get("id"))
-    if cached and (time.time() - cached[1]) < STATE_CACHE_TTL:
+    if cached:
         return cached[0]
     try:
-        return account_live_state(account, cfg)
+        return quick_snapshot_state(account, cfg)
     except Exception:
         return {"ok": False}
 
@@ -2482,6 +2508,119 @@ def daily_journal(user_id: int, trips: Optional[list] = None):
         days[day]["pnl"] += float(t.get("pnl") or 0)
 
     return sorted(days.items(), reverse=True)[:10]
+
+
+# ============================================================
+# KhomaTradingJournal — analytics over real closed round-trips
+# ============================================================
+
+_ET = "America/New_York"
+
+
+def _trip_dt(t, key):
+    try:
+        d = datetime.fromisoformat(str(t.get(key) or "").replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception:
+        return None
+
+
+def journal_analytics(trips: list) -> dict:
+    """Full performance analytics over closed round-trips (entry/exit/pnl/side/
+    qty/symbol/opened_at/closed_at). The best of Tradezella/TraderSync, computed
+    from what KhomaAPI actually has from broker fills."""
+    pnls = [float(t.get("pnl") or 0) for t in trips]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    scratches = [p for p in pnls if p == 0]
+    n = len(pnls)
+    gross_profit = round(sum(wins), 2)
+    gross_loss = round(-sum(losses), 2)
+    net = round(sum(pnls), 2)
+    decided = len(wins) + len(losses)
+    win_rate = round(len(wins) / decided * 100, 1) if decided else 0.0
+    avg_win = round(gross_profit / len(wins), 2) if wins else 0.0
+    avg_loss = round(gross_loss / len(losses), 2) if losses else 0.0
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (None if gross_profit == 0 else float("inf"))
+    win_loss_ratio = round(avg_win / avg_loss, 2) if avg_loss > 0 else None
+    expectancy = round((win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss), 2) if decided else 0.0
+
+    # Hold times (minutes).
+    holds = []
+    for t in trips:
+        a, b = _trip_dt(t, "opened_at"), _trip_dt(t, "closed_at")
+        if a and b and b >= a:
+            holds.append((b - a).total_seconds() / 60.0)
+    avg_hold = round(sum(holds) / len(holds), 1) if holds else 0.0
+
+    # Streaks (chronological).
+    chron = sorted(trips, key=lambda x: str(x.get("closed_at", "")))
+    max_w = max_l = cur_w = cur_l = 0
+    for t in chron:
+        p = float(t.get("pnl") or 0)
+        if p > 0:
+            cur_w += 1; cur_l = 0; max_w = max(max_w, cur_w)
+        elif p < 0:
+            cur_l += 1; cur_w = 0; max_l = max(max_l, cur_l)
+
+    # Equity curve (cumulative).
+    equity, run = [], 0.0
+    for t in chron:
+        run += float(t.get("pnl") or 0)
+        equity.append(round(run, 2))
+
+    # Daily P&L (ET date) -> calendar + best/worst day.
+    daily = {}
+    for t in trips:
+        d = _trip_dt(t, "closed_at")
+        if not d:
+            continue
+        key = d.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d")
+        daily[key] = round(daily.get(key, 0) + float(t.get("pnl") or 0), 2)
+    green_days = sum(1 for v in daily.values() if v > 0)
+    red_days = sum(1 for v in daily.values() if v < 0)
+    best_day = max(daily.items(), key=lambda x: x[1]) if daily else None
+    worst_day = min(daily.items(), key=lambda x: x[1]) if daily else None
+    day_win_rate = round(green_days / (green_days + red_days) * 100, 1) if (green_days + red_days) else 0.0
+    avg_daily = round(sum(daily.values()) / len(daily), 2) if daily else 0.0
+
+    # Breakdowns.
+    def bucket(keyfn):
+        b = {}
+        for t in trips:
+            k = keyfn(t)
+            if k is None:
+                continue
+            e = b.setdefault(k, {"pnl": 0.0, "n": 0, "w": 0})
+            p = float(t.get("pnl") or 0)
+            e["pnl"] += p; e["n"] += 1
+            if p > 0:
+                e["w"] += 1
+        for e in b.values():
+            e["pnl"] = round(e["pnl"], 2)
+            e["win_rate"] = round(e["w"] / e["n"] * 100) if e["n"] else 0
+        return b
+
+    by_symbol = bucket(lambda t: (t.get("symbol") or "?"))
+    by_side = bucket(lambda t: (t.get("side") or "?").lower())
+    by_weekday = bucket(lambda t: _trip_dt(t, "closed_at").astimezone(ZoneInfo(_ET)).weekday() if _trip_dt(t, "closed_at") else None)
+    by_hour = bucket(lambda t: _trip_dt(t, "closed_at").astimezone(ZoneInfo(_ET)).hour if _trip_dt(t, "closed_at") else None)
+
+    return {
+        "n": n, "net": net, "gross_profit": gross_profit, "gross_loss": gross_loss,
+        "win_rate": win_rate, "wins": len(wins), "losses": len(losses), "scratches": len(scratches),
+        "avg_win": avg_win, "avg_loss": avg_loss, "profit_factor": profit_factor,
+        "win_loss_ratio": win_loss_ratio, "expectancy": expectancy, "avg_hold": avg_hold,
+        "largest_win": round(max(pnls), 2) if pnls else 0.0,
+        "largest_loss": round(min(pnls), 2) if pnls else 0.0,
+        "max_win_streak": max_w, "max_loss_streak": max_l,
+        "equity": equity, "daily": daily,
+        "green_days": green_days, "red_days": red_days, "day_win_rate": day_win_rate,
+        "avg_daily": avg_daily, "best_day": best_day, "worst_day": worst_day,
+        "by_symbol": by_symbol, "by_side": by_side, "by_weekday": by_weekday, "by_hour": by_hour,
+    }
 
 
 def today_order_count(user_id: int) -> int:
@@ -4155,13 +4294,92 @@ def logs(request: Request):
     return layout(content, user, "logs")
 
 
+def _money(v, dec=2):
+    if v is None:
+        return "—"
+    if v == float("inf"):
+        return "∞"
+    return ("-$" if v < 0 else "$") + f"{abs(v):,.{dec}f}"
+
+
+def _pnl_cls(v):
+    return "good" if (v or 0) > 0 else ("bad" if (v or 0) < 0 else "")
+
+
+def journal_calendar_html(daily: dict, y: int, m: int) -> str:
+    """Tradezella-style monthly P&L heatmap: green/red day cells + weekly totals."""
+    import calendar as _cal
+    cal = _cal.Calendar(firstweekday=6)  # Sunday-first
+    head = "".join(f"<th style='font-size:11px;color:#9ca3af;padding:6px;'>{d}</th>"
+                   for d in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Week"])
+    body = ""
+    for week in cal.monthdayscalendar(y, m):
+        cells = ""
+        wk_total = 0.0
+        wk_has = False
+        for day in week:
+            if day == 0:
+                cells += "<td style='padding:3px;'></td>"
+                continue
+            key = f"{y}-{m:02d}-{day:02d}"
+            pnl = daily.get(key)
+            if pnl is None:
+                bg, txt, val = "#f8faf9", "#9ca3af", ""
+            else:
+                wk_total += pnl; wk_has = True
+                if pnl > 0:
+                    bg, txt = "#eafaf0", "#0f8f45"
+                elif pnl < 0:
+                    bg, txt = "#fdeaea", "#b91c1c"
+                else:
+                    bg, txt = "#f3f4f6", "#6b7280"
+                val = f"<div style='font-size:12px;font-weight:800;'>{_money(pnl,0)}</div>"
+            cells += (f"<td style='padding:3px;vertical-align:top;'>"
+                      f"<div style='background:{bg};border-radius:10px;min-height:54px;padding:6px;'>"
+                      f"<div style='font-size:11px;color:#9ca3af;'>{day}</div>"
+                      f"<div style='color:{txt};'>{val}</div></div></td>")
+        wk_cell = ""
+        if wk_has:
+            wk_cell = (f"<div style='background:#f1fbf5;border:1px solid #cdebd8;border-radius:10px;min-height:54px;padding:6px;'>"
+                       f"<div style='font-size:10px;color:#9ca3af;'>Total</div>"
+                       f"<div style='font-weight:800;font-size:12px;' class='{_pnl_cls(wk_total)}'>{_money(wk_total,0)}</div></div>")
+        cells += f"<td style='padding:3px;vertical-align:top;'>{wk_cell}</td>"
+        body += f"<tr>{cells}</tr>"
+    return f"<table style='width:100%;border-collapse:collapse;'><tr>{head}</tr>{body}</table>"
+
+
+def journal_bars_html(bucket: dict, label_fn, order="label") -> str:
+    """Horizontal P&L bars for a breakdown (by symbol / weekday / hour / side)."""
+    if not bucket:
+        return "<p class='muted'>No data.</p>"
+    maxabs = max((abs(e["pnl"]) for e in bucket.values()), default=1) or 1
+    if order == "pnl":
+        items = sorted(bucket.items(), key=lambda x: -x[1]["pnl"])
+    else:
+        items = sorted(bucket.items(), key=lambda x: x[0])
+    rows = ""
+    for k, e in items:
+        w = abs(e["pnl"]) / maxabs * 100
+        color = "#16a34a" if e["pnl"] >= 0 else "#dc2626"
+        rows += (f"<div style='display:flex;align-items:center;gap:10px;margin:7px 0;'>"
+                 f"<div style='width:74px;font-size:13px;font-weight:700;'>{label_fn(k)}</div>"
+                 f"<div style='flex:1;height:18px;background:#f1f3f2;border-radius:6px;overflow:hidden;'>"
+                 f"<div style='height:100%;width:{w:.0f}%;background:{color};'></div></div>"
+                 f"<div style='width:92px;text-align:right;font-size:13px;font-weight:800;' class='{_pnl_cls(e['pnl'])}'>{_money(e['pnl'],0)}</div>"
+                 f"<div style='width:62px;text-align:right;font-size:11px;color:#9ca3af;'>{e['n']}t · {e['win_rate']}%</div>"
+                 f"</div>")
+    return rows
+
+
+_WEEKDAY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
 @app.get("/journal", response_class=HTMLResponse)
 def journal_page(request: Request):
     user = require_user(request)
     if not user:
         return RedirectResponse("/login")
 
-    # Per-account view: 'all' (combined) or a specific broker_accounts.id.
     sel = request.query_params.get("account", "all") or "all"
     only = None if sel in ("all", "") else sel
     tabs = account_tabs(user["id"], sel, "/journal")
@@ -4171,27 +4389,82 @@ def journal_page(request: Request):
     except Exception:
         trips = []
 
-    journal = daily_journal(user["id"], trips=trips)
-    journal_html = "".join([
-        f"<div class='journal-day'><div><b>{day}</b><small>{vals['executed']} executed • {vals['rejected']} rejected</small></div>"
-        f"<div style='text-align:right'><b class='{'good' if vals['pnl']>0 else ('bad' if vals['pnl']<0 else '')}'>${vals['pnl']:.2f}</b><small>realized PnL</small></div></div>"
-        for day, vals in journal
-    ]) or "<p class='muted'>No journal data yet.</p>"
+    s = journal_analytics(trips)
 
-    # Closed round-trips from real broker fills (scoped to the selected account).
+    # Calendar month: ?month=YYYY-MM, else month of latest trade, else now (ET).
+    month_q = request.query_params.get("month", "")
+    if month_q and re.match(r"^\d{4}-\d{2}$", month_q):
+        cy, cm = int(month_q[:4]), int(month_q[5:7])
+    elif s["daily"]:
+        latest = max(s["daily"].keys())
+        cy, cm = int(latest[:4]), int(latest[5:7])
+    else:
+        now_et = datetime.now(ZoneInfo(_ET))
+        cy, cm = now_et.year, now_et.month
+    prev_m = (date(cy, cm, 1) - timedelta(days=1)).strftime("%Y-%m")
+    next_m = (date(cy, cm, 28) + timedelta(days=7)).strftime("%Y-%m")
+    month_label = date(cy, cm, 1).strftime("%B %Y")
+
+    # Metric cards
+    def card(title, value, sub="", cls=""):
+        return (f"<div class='card span3'><h3>{title}</h3>"
+                f"<div class='metric {cls}'>{value}</div><p class='muted'>{sub}</p></div>")
+
+    pf = s["profit_factor"]
+    pf_disp = "∞" if pf == float("inf") else (f"{pf:.2f}" if pf is not None else "—")
+    cards = (
+        card("Net P&L", _money(s["net"]), f"{s['n']} trades · {s['green_days']}G/{s['red_days']}R days", _pnl_cls(s["net"]))
+        + card("Win Rate", f"{s['win_rate']}%", f"{s['wins']}W · {s['losses']}L")
+        + card("Profit Factor", pf_disp, "gross profit ÷ gross loss")
+        + card("Expectancy", _money(s["expectancy"]), "avg $ per trade", _pnl_cls(s["expectancy"]))
+        + card("Avg Win", _money(s["avg_win"]), f"largest {_money(s['largest_win'],0)}", "good")
+        + card("Avg Loss", _money(-s["avg_loss"]), f"largest {_money(s['largest_loss'],0)}", "bad")
+        + card("Avg Hold", f"{s['avg_hold']:.0f}m", f"win/loss ratio {s['win_loss_ratio'] if s['win_loss_ratio'] is not None else '—'}")
+        + card("Streaks", f"{s['max_win_streak']}W / {s['max_loss_streak']}L", f"avg day {_money(s['avg_daily'],0)}")
+    )
+
+    equity_svg = chart_svg(s["equity"]) if s["equity"] else "<p class='muted'>No closed trades yet.</p>"
+    best = (f"{s['best_day'][0]} ({_money(s['best_day'][1],0)})" if s["best_day"] else "—")
+    worst = (f"{s['worst_day'][0]} ({_money(s['worst_day'][1],0)})" if s["worst_day"] else "—")
+
+    # Recent closed trades (scoped).
     trip_rows = "".join([
-        f"<tr><td>{str(t.get('closed_at') or '')[:19]}</td><td><b>{t['symbol']}</b></td><td>{t.get('account','')}</td>"
+        f"<tr><td>{str(t.get('closed_at') or '')[:16].replace('T',' ')}</td><td><b>{t['symbol']}</b></td><td>{t.get('account','')}</td>"
         f"<td>{t['side']}</td><td>{t['qty']}</td><td>{t['entry_price']}</td><td>{t['exit_price']}</td>"
-        f"<td class=\"{'good' if t['pnl']>0 else ('bad' if t['pnl']<0 else '')}\">${t['pnl']:.2f}</td></tr>"
-        for t in trips
+        f"<td class=\"{_pnl_cls(t['pnl'])}\">{_money(t['pnl'])}</td></tr>"
+        for t in sorted(trips, key=lambda x: str(x.get('closed_at','')), reverse=True)[:60]
     ]) or "<tr><td colspan='8'>No closed trades yet.</td></tr>"
 
     content = f'''
-    <div class="header"><div><h2>Trading Journal</h2><p>Per-account daily realized PnL and every closed trade — straight from your Tradovate fills.</p></div></div>
+    <div class="header"><div><h2>KhomaTradingJournal</h2><p>Full performance analytics from your real Tradovate fills — equity curve, P&amp;L calendar, profit factor, expectancy and breakdowns.</p></div></div>
     {tabs}
     <div class="grid">
-      <div class="card span4"><h3>Daily Summary</h3>{journal_html}</div>
-      <div class="card span8"><h3>Closed Trades</h3><table><tr><th>Closed</th><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>{trip_rows}</table></div>
+      {cards}
+
+      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Cumulative realized P&amp;L across {s['n']} closed trades.</p><div class="equity-wrap">{equity_svg}</div></div>
+      <div class="card span4"><h3>Day Performance</h3>
+        <p class="muted">Winning days <b class="good">{s['green_days']}</b> · Losing days <b class="bad">{s['red_days']}</b> · Day win rate <b>{s['day_win_rate']}%</b></p>
+        <div class="journal-day"><div><b>Best day</b></div><div class="good">{best}</div></div>
+        <div class="journal-day"><div><b>Worst day</b></div><div class="bad">{worst}</div></div>
+        <div class="journal-day"><div><b>Avg daily P&amp;L</b></div><div class="{_pnl_cls(s['avg_daily'])}">{_money(s['avg_daily'])}</div></div>
+        <div class="journal-day"><div><b>Gross profit / loss</b></div><div><span class="good">{_money(s['gross_profit'],0)}</span> / <span class="bad">{_money(-s['gross_loss'],0)}</span></div></div>
+      </div>
+
+      <div class="card span8"><h3>P&amp;L Calendar — {month_label}</h3>
+        <div style="float:right;margin-top:-34px;">
+          <a class="btn secondary" style="padding:6px 11px;" href="/journal?account={sel}&month={prev_m}">‹</a>
+          <a class="btn secondary" style="padding:6px 11px;" href="/journal?account={sel}&month={next_m}">›</a>
+        </div>
+        {journal_calendar_html(s['daily'], cy, cm)}
+      </div>
+      <div class="card span4"><h3>Long vs Short</h3>{journal_bars_html(s['by_side'], lambda k: k.title())}
+        <h3 style="margin-top:16px;">By Day of Week</h3>{journal_bars_html(s['by_weekday'], lambda k: _WEEKDAY[k])}
+      </div>
+
+      <div class="card span6"><h3>By Symbol</h3>{journal_bars_html(s['by_symbol'], lambda k: k, order='pnl')}</div>
+      <div class="card span6"><h3>By Hour (ET)</h3>{journal_bars_html(s['by_hour'], lambda k: f"{k:02d}:00")}</div>
+
+      <div class="card span12"><h3>Closed Trades</h3><table><tr><th>Closed</th><th>Symbol</th><th>Account</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&amp;L</th></tr>{trip_rows}</table></div>
     </div>
     '''
     return layout(content, user, "journal")
