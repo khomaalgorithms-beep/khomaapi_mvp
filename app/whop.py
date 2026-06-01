@@ -14,8 +14,13 @@ import hashlib
 import hmac
 import json
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+
+# Sentinel: the membership no longer exists in Whop (404/410) → revoke. Distinct
+# from None, which means a transient error (don't revoke on a temporary hiccup).
+GONE = "__membership_gone__"
 
 API_BASE = "https://api.whop.com/api/v2"
 SIG_TOLERANCE_SECONDS = 300  # reject webhooks older than 5 min (replay guard)
@@ -94,10 +99,16 @@ def _api_get(path: str, api_key: str):
 
 
 def fetch_membership(membership_id: str, api_key: str):
+    """Return the membership dict, GONE if it no longer exists (404/410), or None
+    on a transient error (caller should NOT revoke on None)."""
     if not (membership_id and api_key):
         return None
     try:
         return _api_get(f"/memberships/{membership_id}", api_key)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            return GONE
+        return None
     except Exception:
         return None
 

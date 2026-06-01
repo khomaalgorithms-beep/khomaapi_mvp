@@ -2227,8 +2227,15 @@ def whop_reverify_tick():
     for r in rows:
         try:
             m = whopmod.fetch_membership(r["whop_membership_id"], WHOP_API_KEY)
-            if not m:
+            if m is whopmod.GONE or m == whopmod.GONE:
+                # Membership deleted in Whop → revoke.
+                con = db()
+                con.execute("UPDATE users SET subscription_status='revoked' WHERE id=?", (r["id"],))
+                con.commit()
+                con.close()
                 continue
+            if not m:
+                continue  # transient API error → leave as-is, retry next cycle
             st = whopmod.membership_state(m)
             con = db()
             con.execute(
@@ -6583,6 +6590,13 @@ async def whop_webhook(request: Request):
     # Source of truth: re-fetch. Fall back to the event body only if the API
     # fetch fails AND the body already looks like a full membership object.
     m = whopmod.fetch_membership(mid, WHOP_API_KEY)
+    if m is whopmod.GONE or m == whopmod.GONE:
+        # Membership deleted → revoke any account linked to it.
+        con = db()
+        con.execute("UPDATE users SET subscription_status='revoked' WHERE whop_membership_id=?", (mid,))
+        con.commit()
+        con.close()
+        return {"ok": True, "membership": mid, "revoked": True}
     if not m or not m.get("id"):
         data = payload.get("data")
         m = data if isinstance(data, dict) and data.get("id") else None

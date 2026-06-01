@@ -207,6 +207,30 @@ def test_whop_webhook_grant_then_revoke(monkeypatch):
     assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402
 
 
+def test_webhook_deleted_membership_revokes(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_revoke_pro")
+    monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
+    uid, _ = make_user(status="active", period_end="2099-01-01T00:00:00+00:00",
+                       membership="mem_gone", plan_id="plan_revoke_pro")
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 200  # active first
+    # Whop hard-deleted the membership → fetch returns GONE.
+    monkeypatch.setattr(appmod.whopmod, "fetch_membership", lambda mid, key: appmod.whopmod.GONE)
+    r = _signed_post({"action": "membership.went_invalid", "data": {"id": "mem_gone"}})
+    assert r.status_code == 200 and r.json().get("revoked") is True
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402  # revoked
+
+
+def test_reverify_revokes_deleted_membership(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_rv2")
+    monkeypatch.setattr(appmod, "WHOP_API_KEY", "k")
+    uid, _ = make_user(status="active", period_end="2099-01-01T00:00:00+00:00",
+                       membership="mem_rv", plan_id="plan_rv2")
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 200
+    monkeypatch.setattr(appmod.whopmod, "fetch_membership", lambda mid, key: appmod.whopmod.GONE)
+    appmod.whop_reverify_tick()
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402  # revoked by re-verify
+
+
 def test_buy_before_signup_links_on_login(monkeypatch):
     monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_wh_pro2")
     monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
