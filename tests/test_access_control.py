@@ -258,6 +258,108 @@ def test_signup_succeeds_for_whop_buyer(monkeypatch):
     assert e.active is True and e.tier == "pro"
 
 
+# --------------------------------------------------------------------------
+# Google OAuth gating + WebSocket + debug lockdown (close every bypass)
+# --------------------------------------------------------------------------
+
+from starlette.websockets import WebSocketDisconnect
+
+
+class _FakeResp:
+    def __init__(self, data):
+        self._d = data
+
+    def json(self):
+        return self._d
+
+
+def _fake_requests(token_data, userinfo):
+    class _R:
+        def post(self, url, **kw):
+            return _FakeResp(token_data)
+
+        def get(self, url, **kw):
+            return _FakeResp(userinfo)
+    return _R()
+
+
+def test_google_login_new_email_no_sub_denied(monkeypatch):
+    monkeypatch.setattr(appmod, "requests",
+                        _fake_requests({"access_token": "tok"},
+                                       {"email": "gnew@test.com", "verified_email": True}))
+    monkeypatch.setattr(appmod, "whop_membership_for_email", lambda e: None)
+    r = client.get("/auth/google/callback?code=abc", follow_redirects=False)
+    assert r.status_code == 302 and "/subscribe" in r.headers.get("location", "")
+    con = appmod.db()
+    row = con.execute("SELECT 1 FROM users WHERE email=?", ("gnew@test.com",)).fetchone()
+    con.close()
+    assert row is None  # no account created for a non-buyer
+
+
+def test_google_login_existing_no_sub_denied(monkeypatch):
+    uid, email = make_user(plan=None)  # existing account, no sub
+    monkeypatch.setattr(appmod, "requests",
+                        _fake_requests({"access_token": "tok"},
+                                       {"email": email, "verified_email": True}))
+    r = client.get("/auth/google/callback?code=abc", follow_redirects=False)
+    sid = r.cookies.get("khoma_session")
+    assert sid  # auth succeeded (session minted)
+    rr = client.get("/api/trades", cookies={"khoma_session": sid})
+    assert rr.status_code == 402  # but access is DENIED
+
+
+def test_google_login_with_sub_allowed(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_g_pro")
+    member = {"id": "mem_g", "user": "user_g", "plan": "plan_g_pro",
+              "email": "gbuyer@test.com", "valid": True, "status": "completed",
+              "renewal_period_end": 1893456000}
+    monkeypatch.setattr(appmod, "requests",
+                        _fake_requests({"access_token": "tok"},
+                                       {"email": "gbuyer@test.com", "verified_email": True}))
+    monkeypatch.setattr(appmod, "whop_membership_for_email", lambda e: member)
+    r = client.get("/auth/google/callback?code=abc", follow_redirects=False)
+    sid = r.cookies.get("khoma_session")
+    assert sid
+    rr = client.get("/api/trades", cookies={"khoma_session": sid})
+    assert rr.status_code != 402  # active Pro → allowed
+
+
+def test_websocket_denied_without_subscription():
+    c = TestClient(appmod.app)  # fresh client, no cookies
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with c.websocket_connect("/ws"):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_websocket_allowed_with_subscription():
+    uid, _ = make_user(plan="pro")
+    c = TestClient(appmod.app)
+    c.cookies.set("khoma_session", appmod.create_session(uid))
+    with c.websocket_connect("/ws") as ws:
+        ws.send_text("ping")  # accepted → no exception
+
+
+def test_session_revoked_when_sub_lapses_midsession():
+    uid, _ = make_user(plan="pro")          # active when the session is minted
+    cookies = cookies_for(uid)
+    assert client.get("/api/trades", cookies=cookies).status_code != 402
+    # Sub lapses (webhook would mark expired). Same long-lived session:
+    con = appmod.db()
+    con.execute("UPDATE users SET manual_plan=NULL, subscription_status='expired', "
+                "whop_membership_id='mem_lapse', whop_plan_id='p' WHERE id=?", (uid,))
+    con.commit()
+    con.close()
+    # Next request on the SAME session is denied (status re-checked server-side).
+    assert client.get("/api/trades", cookies=cookies).status_code == 402
+
+
+def test_debug_endpoints_404_in_production():
+    assert client.get("/debug/db-path").status_code == 404
+    assert client.get("/debug/accounts").status_code == 404
+    assert client.get("/test").status_code == 404
+
+
 def test_whop_webhook_rejects_bad_signature(monkeypatch):
     monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
     body = json.dumps({"action": "membership.went_valid", "data": {"id": "mem_x"}}).encode()

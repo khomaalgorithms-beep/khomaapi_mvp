@@ -110,6 +110,9 @@ ENFORCE_SUBSCRIPTIONS = os.getenv("ENFORCE_SUBSCRIPTIONS", "0") == "1"
 # connected. Never overrides a real (linked) Whop membership, and is ignored
 # entirely unless explicitly enabled. Turn OFF once Whop is the source of truth.
 ALLOW_MANUAL_PLAN = os.getenv("ALLOW_MANUAL_PLAN", "0") == "1"
+# Diagnostic/debug endpoints (e.g. /debug/*, /test, /create-broker-table) can
+# leak internal data — disabled in production. Set DEBUG_ENDPOINTS=1 to enable.
+DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "0") == "1"
 # Where to send users who need to buy / upgrade (marketing pricing page).
 PRICING_URL = os.getenv("PRICING_URL", "https://khomaapi.com/#pricing").strip()
 
@@ -1094,8 +1097,10 @@ _PUBLIC_PREFIXES = (
     "/static", "/uploads", "/auth/google", "/verify-email",
     "/confirm-email-change", "/verify-email-change", "/confirm-password-change",
     "/forgot-password", "/reset-password", "/oauth/callback", "/webhook",
-    "/whop", "/debug",
+    "/whop",
 )
+# Diagnostic endpoints that must 404 in production (DEBUG_ENDPOINTS off).
+_DEBUG_PATHS = ("/debug", "/test", "/debug-static", "/create-broker-table", "/oauth-test")
 
 
 # Rate limiter (per-process, in-memory). Limits are generous flood/brute-force
@@ -1128,6 +1133,11 @@ def _rate_rule(request: Request):
 
 @app.middleware("http")
 async def edge_security(request: Request, call_next):
+    # 0) Diagnostic endpoints are 404 in production (prevent data leakage).
+    if not DEBUG_ENDPOINTS:
+        p = request.url.path
+        if p == "/test" or p.startswith(_DEBUG_PATHS):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
     # 1) Rate-limit sensitive endpoints (per real client IP via Cloudflare).
     rule = _rate_rule(request)
     if rule:
@@ -1149,6 +1159,12 @@ async def edge_security(request: Request, call_next):
 
 @app.middleware("http")
 async def subscription_guard(request: Request, call_next):
+    # Diagnostic endpoints 404 in production (checked first so a lingering
+    # inactive session can't turn a /debug hit into a 402 before this).
+    if not DEBUG_ENDPOINTS:
+        dp = request.url.path
+        if dp == "/test" or dp.startswith(_DEBUG_PATHS):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if not ENFORCE_SUBSCRIPTIONS:
         return await call_next(request)
     path = request.url.path
@@ -2173,6 +2189,38 @@ def _prewarm_calendar():
         pass
 
 
+def whop_reverify_tick():
+    """Safety net: re-check linked ACTIVE users against the Whop API and revoke
+    any whose membership is no longer valid. This makes revocation independent of
+    the webhook firing — a missed cancel/refund webhook is still caught here
+    within one cycle. Comp accounts (manual_plan, no whop_membership_id) are
+    untouched."""
+    if not WHOP_API_KEY:
+        return
+    con = db()
+    rows = con.execute(
+        "SELECT id, whop_membership_id FROM users "
+        "WHERE whop_membership_id IS NOT NULL AND whop_membership_id <> '' "
+        "AND subscription_status = 'active'"
+    ).fetchall()
+    con.close()
+    for r in rows:
+        try:
+            m = whopmod.fetch_membership(r["whop_membership_id"], WHOP_API_KEY)
+            if not m:
+                continue
+            st = whopmod.membership_state(m)
+            con = db()
+            con.execute(
+                "UPDATE users SET subscription_status=?, whop_plan_id=?, current_period_end=? WHERE id=?",
+                (st["status"], st["plan_id"], st["period_end"], r["id"]),
+            )
+            con.commit()
+            con.close()
+        except Exception as e:
+            print(f"whop reverify error uid={r['id']}: {e}")
+
+
 async def digest_loop():
     print("DIGEST scheduler started (10-min cadence)")
     loop = asyncio.get_event_loop()
@@ -2180,6 +2228,7 @@ async def digest_loop():
         try:
             if await loop.run_in_executor(None, try_become_leader):  # worker instance only
                 await loop.run_in_executor(None, digest_tick)
+                await loop.run_in_executor(None, whop_reverify_tick)
                 await loop.run_in_executor(None, _prewarm_calendar)
         except Exception as e:
             print("DIGEST ERROR:", e)
@@ -4185,15 +4234,31 @@ def auth_google_callback(code: str = ""):
     ).json()
 
     email = google_user.get("email")
+    # Only trust Google's VERIFIED email as the identity (v2 userinfo uses
+    # "verified_email"; OpenID uses "email_verified").
+    email_verified = google_user.get("verified_email", google_user.get("email_verified"))
 
     if not email:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Google account email not received."})
+    if email_verified is False:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Your Google email address is not verified."})
 
+    email_norm = email.lower().strip()
     con = db()
-    existing_user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+    existing_user = con.execute("SELECT * FROM users WHERE email=?", (email_norm,)).fetchone()
+    con.close()
+
+    # Gated like every other entry point: a brand-new Google email with NO active
+    # Whop purchase does not get an account — send them to choose a plan.
+    membership = None
+    if not existing_user and ENFORCE_SUBSCRIPTIONS:
+        membership = whop_membership_for_email(email_norm)
+        if not membership:
+            return RedirectResponse("/subscribe", status_code=302)
 
     if not existing_user:
         random_password = secrets.token_hex(24)
+        con = db()
         cur = con.cursor()
         uid = dbmod.insert_returning_id(
             cur,
@@ -4202,7 +4267,7 @@ def auth_google_callback(code: str = ""):
             VALUES(?,?,?,?,?,?)
             """,
             (
-                email.lower().strip(),
+                email_norm,
                 hash_password(random_password),
                 "khoma_live_" + secrets.token_urlsafe(24),
                 secrets.token_hex(20),
@@ -4213,10 +4278,14 @@ def auth_google_callback(code: str = ""):
         cur.execute("INSERT INTO brokers(user_id) VALUES(?)", (uid,))
         con.commit()
         user = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        con.close()
+        if membership:
+            try:
+                link_membership_to_user(membership, by_user_id=uid)
+            except Exception as e:
+                print(f"google whop link failed: {e}")
     else:
         user = existing_user
-
-    con.close()
 
     try_link_whop(user)  # attach an existing Whop membership by email, if any
     sid = create_session(user["id"])
@@ -6926,6 +6995,23 @@ def reset_password(token: str, password: str = Form(...)):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # WebSockets bypass the HTTP middleware, so apply the SAME access rule here:
+    # authenticate via the session cookie and require an active subscription.
+    if ENFORCE_SUBSCRIPTIONS:
+        from starlette.concurrency import run_in_threadpool
+
+        def _allowed():
+            uid = get_session_user_id(websocket.cookies.get("khoma_session"))
+            if not uid:
+                return False
+            con = db()
+            u = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            con.close()
+            return bool(u and user_entitlements(u).active)
+
+        if not await run_in_threadpool(_allowed):
+            await websocket.close(code=1008)  # policy violation
+            return
 
     await manager.connect(websocket)
 
