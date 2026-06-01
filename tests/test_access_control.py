@@ -354,6 +354,27 @@ def test_session_revoked_when_sub_lapses_midsession():
     assert client.get("/api/trades", cookies=cookies).status_code == 402
 
 
+def test_login_post_allowed_from_marketing_site():
+    # Cross-origin POST from our marketing domain must NOT be CSRF-blocked.
+    r = client.post("/login", data={"email": "x@y.com", "password": "nope"},
+                    headers={"origin": "https://khomaapi.com", "referer": "https://khomaapi.com/"})
+    assert r.status_code != 403  # reaches the handler (bad creds), not blocked
+
+
+def test_state_change_blocked_from_untrusted_origin():
+    uid, _ = make_user(plan="pro")
+    r = client.post("/broker/copy/set", data={"account_id": "1", "in_box": "1"},
+                    cookies=cookies_for(uid),
+                    headers={"origin": "https://evil.example", "referer": "https://evil.example/"})
+    assert r.status_code == 403  # cross-site state change still blocked
+
+
+def test_login_page_loads_public():
+    assert client.get("/login").status_code == 200
+    assert client.get("/signup").status_code == 200
+    assert client.get("/subscribe").status_code == 200
+
+
 def test_debug_endpoints_404_in_production():
     assert client.get("/debug/db-path").status_code == 404
     assert client.get("/debug/accounts").status_code == 404

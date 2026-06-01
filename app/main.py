@@ -116,6 +116,16 @@ DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "0") == "1"
 # Where to send users who need to buy / upgrade (marketing pricing page).
 PRICING_URL = os.getenv("PRICING_URL", "https://khomaapi.com/#pricing").strip()
 
+# Our own sibling domains, trusted for cross-origin POSTs (e.g. the marketing
+# site at khomaapi.com posting Sign In to app.khomaapi.com). CSRF still blocks
+# every other origin. Override/extend via TRUSTED_ORIGINS (comma-separated).
+from urllib.parse import urlparse as _urlparse  # noqa: E402
+TRUSTED_ORIGIN_HOSTS = {h.strip().lower() for h in os.getenv("TRUSTED_ORIGINS", "").split(",") if h.strip()}
+TRUSTED_ORIGIN_HOSTS |= {
+    _urlparse(APP_URL).netloc.lower(),
+    "app.khomaapi.com", "khomaapi.com", "www.khomaapi.com",
+}
+
 # Whop billing credentials (env only — never logged or returned).
 WHOP_API_KEY = os.getenv("WHOP_API_KEY", "").strip()
 WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "").strip()
@@ -1109,6 +1119,9 @@ LIMITER = sec.RateLimiter()
 # Webhooks authenticate by token, not cookies, and are legitimately cross-origin
 # (TradingView / Whop), so they're exempt from the same-origin CSRF check.
 _CSRF_EXEMPT = {"/webhook/trade", "/webhook/flatten", "/whop/webhook"}
+# Pre-auth entry endpoints — may be posted from the marketing site; they create
+# (not mutate) a session, so the same-origin requirement is relaxed for them.
+_AUTH_CSRF_EXEMPT = {"/login", "/signup", "/forgot-password"}
 
 
 def _rate_rule(request: Request):
@@ -1146,9 +1159,16 @@ async def edge_security(request: Request, call_next):
         if not allowed:
             return JSONResponse(status_code=429, content={"ok": False, "error": "rate limit exceeded"},
                                 headers={"Retry-After": str(retry)})
-    # 2) CSRF: cookie-authenticated state changes must be same-origin.
+    # 2) CSRF: cookie-authenticated state changes must come from us. Pre-auth
+    #    entry endpoints (login/signup/password-reset) are exempt — they may be
+    #    posted from the marketing site and establish (not mutate) a session;
+    #    SameSite=lax still protects the session afterward. Our sibling domains
+    #    are trusted; every other origin is blocked.
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        if request.url.path not in _CSRF_EXEMPT and not sec.is_same_origin(request):
+        p = request.url.path
+        exempt = (p in _CSRF_EXEMPT or p in _AUTH_CSRF_EXEMPT
+                  or p.startswith("/reset-password"))
+        if not exempt and not sec.is_same_origin(request, TRUSTED_ORIGIN_HOSTS):
             return JSONResponse(status_code=403, content={"ok": False, "error": "cross-origin request blocked"})
     # 3) Process, then attach security headers to every response.
     resp = await call_next(request)

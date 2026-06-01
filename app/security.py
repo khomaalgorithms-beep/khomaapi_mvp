@@ -73,19 +73,22 @@ class RateLimiter:
 
 # ---- Same-origin / CSRF -------------------------------------------------
 
-def is_same_origin(request) -> bool:
+def is_same_origin(request, allowed_hosts=None) -> bool:
     """Defense-in-depth CSRF check for cookie-authenticated state changes.
 
     The session cookie is SameSite=lax (the primary CSRF defense). This adds a
-    header check: if Origin/Referer is present and its host differs from the
-    request host → reject. If neither header is present we allow (some legitimate
-    same-origin posts omit them; SameSite=lax already blocks the cross-site cookie)."""
+    header check: if Origin/Referer is present, its host must be the request host
+    OR one of `allowed_hosts` (our own sibling domains, e.g. the marketing site).
+    If neither header is present we allow (some legitimate same-origin posts omit
+    them; SameSite=lax already blocks the cross-site cookie)."""
     host = (request.headers.get("host") or "").lower()
+    trusted = {host}
+    if allowed_hosts:
+        trusted |= {h.lower() for h in allowed_hosts if h}
     for hdr in ("origin", "referer"):
         val = request.headers.get(hdr)
         if val:
-            netloc = urlparse(val).netloc.lower()
-            return netloc == host
+            return urlparse(val).netloc.lower() in trusted
     return True  # neither header present → rely on SameSite=lax
 
 
