@@ -1056,6 +1056,30 @@ def try_link_whop(user):
         print(f"whop auto-link skipped: {e}")
 
 
+def whop_membership_for_email(email):
+    """Return an ACTIVE Whop membership (on one of our plans) for this email, or
+    None. Checks the local pending table first (recorded by the webhook), then
+    the Whop API. Used to gate account creation to real buyers."""
+    email = (email or "").lower().strip()
+    if not email or not WHOP_API_KEY:
+        return None
+    try:
+        con = db()
+        row = con.execute("SELECT membership_id FROM whop_pending WHERE email=?", (email,)).fetchone()
+        con.close()
+        if row:
+            m = whopmod.fetch_membership(row["membership_id"], WHOP_API_KEY)
+            if m and m.get("valid") and ent.tier_for_plan_id(m.get("plan")):
+                return m
+        m = whopmod.find_membership_by_email(
+            email, WHOP_API_KEY, allowed_plan_ids=list(ent.plan_env_map().keys()))
+        if m and m.get("valid"):
+            return m
+    except Exception as e:
+        print(f"whop membership lookup failed: {e}")
+    return None
+
+
 # Central guard so an active subscription is enforced on EVERY protected HTTP
 # request, not just routes that remember to check. No-op until enforcement is
 # switched on. Public/auth/asset/webhook paths are allow-listed; feature-level
@@ -3908,16 +3932,17 @@ def signup_page():
     <div class="logo">
 <img src="/static/logo.png" style="width:100%;height:100%;object-fit:cover;border-radius:15px;">
 </div>
-    <h1>Create your KhomaAPI account</h1>
-    <p>Access cloud execution, broker connectivity, TradingView webhooks, and institutional risk controls.</p>
+    <h1>Set up your KhomaAPI account</h1>
+    <p>Already purchased a plan? Use the <b>same email you bought with on Whop</b> to set your password and unlock your dashboard.</p>
     {google_login_button()}
     <form method="post" action="/signup">
-      <input name="email" type="email" placeholder="Email" required>
-      <input name="password" type="password" placeholder="Password" minlength="8" required>
+      <input name="email" type="email" placeholder="Email you purchased with" required>
+      <input name="password" type="password" placeholder="Choose a password" minlength="8" required>
       <p style="color:#6b7280;font-size:13px;margin:-6px 0 14px;">At least 8 characters, with an uppercase letter, a number, and a special character.</p>
-      <button>Create Account</button>
+      <button>Activate my account</button>
     </form>
-    <p>Already have an account? <a href="/login">Login</a></p>
+    <p>Haven't picked a plan yet? <a href="/subscribe">Choose a plan</a></p>
+    <p>Already set up? <a href="/login">Sign in</a></p>
     ''')
 
 @app.post("/signup", response_class=HTMLResponse)
@@ -3931,9 +3956,26 @@ def signup(email: str = Form(...), password: str = Form(...)):
     if not ok:
         return login_layout(f"<h1>Weak Password</h1><p>{message}</p>")
 
+    # Gated set-password: when enforcement is ON, only an email with an active
+    # Whop purchase may create an account ("buy first, then set your password").
+    membership = None
+    if ENFORCE_SUBSCRIPTIONS:
+        membership = whop_membership_for_email(email)
+        if not membership:
+            return login_layout(
+                "<h1>No active plan found</h1>"
+                "<p>We couldn't find an active KhomaAPI plan for that email. "
+                "Choose a plan first, then set your password here using the "
+                "<b>same email</b> you bought with.</p>"
+                "<a class='btn' href='/subscribe'>Choose a plan</a>"
+                "<p style='margin-top:14px;'><a href='/login'>Back to sign in</a></p>")
+
     # If email is configured, accounts start unverified and must confirm.
-    # Without SMTP, auto-verify so the app stays usable.
+    # Without SMTP, auto-verify. A confirmed Whop buyer is auto-verified (their
+    # Whop email is proof of purchase) so they aren't blocked behind a second step.
     verified = 0 if email_enabled() else 1
+    if membership:
+        verified = 1
 
     con = db()
     try:
@@ -3960,6 +4002,13 @@ def signup(email: str = Form(...), password: str = Form(...)):
         return login_layout("<h1>Account already exists.</h1><p>That email is already registered.</p><a href='/login'>Go to login</a>")
 
     con.close()
+
+    # Link the verified purchase immediately so the new account is active.
+    if membership:
+        try:
+            link_membership_to_user(membership, by_user_id=uid)
+        except Exception as e:
+            print(f"signup whop link failed: {e}")
 
     if email_enabled():
         token = create_email_token(uid, "signup")
@@ -4012,7 +4061,8 @@ def login_page():
       <button>Login</button>
     </form>
     <p><a href="/forgot-password">Forgot Password?</a></p>
-    <p>New client? <a href="/signup">Create account</a></p>
+    <p>Just purchased a plan? <a href="/signup">Set your password</a></p>
+    <p style="font-size:13px;color:#6b7280;">No account yet? <a href="/subscribe">Choose a plan</a> to get started.</p>
     ''')
 
 

@@ -230,6 +230,34 @@ def test_buy_before_signup_links_on_login(monkeypatch):
     assert client.get("/api/trades", cookies=cookies_for(uid)).status_code != 402
 
 
+def test_signup_blocked_without_whop_plan(monkeypatch):
+    # Gated set-password: no active Whop purchase → cannot create an account.
+    monkeypatch.setattr(appmod, "whop_membership_for_email", lambda e: None)
+    r = client.post("/signup", data={"email": "noplan@test.com", "password": "TestPw123456!"})
+    assert "No active plan" in r.text
+    con = appmod.db()
+    row = con.execute("SELECT 1 FROM users WHERE email=?", ("noplan@test.com",)).fetchone()
+    con.close()
+    assert row is None  # nothing created
+
+
+def test_signup_succeeds_for_whop_buyer(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_signup_pro")
+    member = {"id": "mem_signup", "user": "user_s", "plan": "plan_signup_pro",
+              "email": "buyer2@test.com", "valid": True, "status": "completed",
+              "renewal_period_end": 1893456000}
+    monkeypatch.setattr(appmod, "whop_membership_for_email", lambda e: member)
+    r = client.post("/signup", data={"email": "buyer2@test.com", "password": "TestPw123456!"},
+                    follow_redirects=False)
+    assert r.status_code == 302  # success → sign in
+    con = appmod.db()
+    u = con.execute("SELECT * FROM users WHERE email=?", ("buyer2@test.com",)).fetchone()
+    con.close()
+    assert u is not None
+    e = appmod.user_entitlements(u)
+    assert e.active is True and e.tier == "pro"
+
+
 def test_whop_webhook_rejects_bad_signature(monkeypatch):
     monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
     body = json.dumps({"action": "membership.went_valid", "data": {"id": "mem_x"}}).encode()
