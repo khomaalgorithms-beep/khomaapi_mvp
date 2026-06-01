@@ -854,18 +854,82 @@ def _is_api_request(request: Request) -> bool:
     return "application/json" in accept and "text/html" not in accept
 
 
-def _subscribe_page(title: str, body: str, cta: str = "Choose a plan"):
-    return login_layout(f"""
-      <div class="logo">K</div>
-      <h1>{title}</h1>
-      <p>{body}</p>
-      <a class="btn" href="{PRICING_URL}">{cta}</a>
-      <p style="margin-top:16px;color:#6b7280;font-size:14px;">
-        Already subscribed with a different email?
-        <a href="/settings">Link your Whop account</a>.
-      </p>
-      <p style="margin-top:10px;"><a href="/logout">Log out</a></p>
-    """)
+def whop_checkout_url(plan_id: str) -> str:
+    """Whop hosted checkout for a plan id. Falls back to the marketing page."""
+    pid = (plan_id or "").strip()
+    return f"https://whop.com/checkout/{pid}" if pid else PRICING_URL
+
+
+# Display catalog. Plan ids come from env (never hardcoded); checkout URLs are
+# derived from them. Order = display order.
+_PLAN_CARDS = [
+    {"name": "Solo", "accounts": "2 connected accounts",
+     "feats": ["Real-time risk engine", "Economic calendar", "Journal + live PnL"],
+     "missing": ["Copy trading", "Eval → funded + presets", "Email digests"],
+     "buys": [("WHOP_PLAN_SOLO_M", "$49 / mo"), ("WHOP_PLAN_SOLO_Y", "$490 / yr")]},
+    {"name": "Pro", "accounts": "10 connected accounts", "highlight": True,
+     "feats": ["Everything in Solo", "Copy trading", "Eval → funded + all presets",
+               "Performance email digests"],
+     "missing": [],
+     "buys": [("WHOP_PLAN_PRO_M", "$99 / mo"), ("WHOP_PLAN_PRO_Y", "$990 / yr")]},
+    {"name": "Elite", "accounts": "Unlimited connected accounts",
+     "feats": ["Everything in Pro", "Unlimited accounts", "Priority execution"],
+     "missing": [],
+     "buys": [("WHOP_PLAN_ELITE_M", "$199 / mo"), ("WHOP_PLAN_ELITE_Y", "$1,990 / yr")]},
+    {"name": "Founder", "accounts": "10 accounts · first 100 members",
+     "feats": ["Everything in Pro", "Locked-in founder pricing"],
+     "missing": [],
+     "buys": [("WHOP_PLAN_FOUNDER", "$990 / yr")]},
+]
+
+
+def plans_html(banner: str = "") -> str:
+    """Self-contained, responsive pricing page used for subscribe/upgrade."""
+    cards = []
+    for c in _PLAN_CARDS:
+        buys = "".join(
+            f'<a class="pbtn" href="{whop_checkout_url(os.getenv(k, ""))}">{label}</a>'
+            for k, label in c["buys"] if os.getenv(k, "").strip()
+        )
+        feats = "".join(f'<li class="ok">{f}</li>' for f in c["feats"])
+        feats += "".join(f'<li class="no">{f}</li>' for f in c.get("missing", []))
+        cls = "plan hot" if c.get("highlight") else "plan"
+        tag = '<div class="tag">Most popular</div>' if c.get("highlight") else ""
+        cards.append(f'''<div class="{cls}">{tag}
+          <h3>{c["name"]}</h3><div class="acc">{c["accounts"]}</div>
+          <ul>{feats}</ul><div class="buys">{buys}</div></div>''')
+    grid = "".join(cards)
+    banner_html = f'<div class="banner">{banner}</div>' if banner else ""
+    return f"""<!DOCTYPE html><html><head><title>KhomaAPI — Plans</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+*{{box-sizing:border-box;}}
+body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#f8faf9;color:#111827;}}
+.wrap{{max-width:1100px;margin:0 auto;padding:48px 20px 70px;}}
+.head{{text-align:center;margin-bottom:30px;}}
+.head h1{{font-size:34px;letter-spacing:-1.2px;margin:0 0 8px;}}
+.head p{{color:#6b7280;margin:0;font-size:16px;}}
+.banner{{background:#eaf7ef;border:1px solid #cdebd8;color:#086b34;border-radius:14px;padding:14px 18px;font-weight:700;margin-bottom:24px;text-align:center;}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:18px;}}
+.plan{{background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:24px;display:flex;flex-direction:column;position:relative;box-shadow:0 18px 60px rgba(17,24,39,.05);}}
+.plan.hot{{border-color:#0f8f45;box-shadow:0 24px 70px rgba(15,143,69,.16);}}
+.tag{{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:#0f8f45;color:#fff;font-size:12px;font-weight:800;padding:5px 12px;border-radius:999px;}}
+.plan h3{{font-size:22px;margin:0;letter-spacing:-.4px;}}
+.acc{{color:#6b7280;font-size:13px;margin:4px 0 14px;}}
+.plan ul{{list-style:none;padding:0;margin:0 0 18px;font-size:14px;line-height:1.95;flex:1;}}
+.plan li.ok::before{{content:"✓ ";color:#0f8f45;font-weight:900;}}
+.plan li.no{{color:#9ca3af;}} .plan li.no::before{{content:"— ";}}
+.buys{{display:flex;flex-direction:column;gap:8px;}}
+.pbtn{{display:block;text-align:center;background:linear-gradient(135deg,#12a150,#087135);color:#fff;text-decoration:none;font-weight:800;padding:12px;border-radius:12px;box-shadow:0 12px 28px rgba(15,143,69,.18);}}
+.pbtn:hover{{filter:brightness(1.06);}}
+.foot{{text-align:center;margin-top:28px;color:#6b7280;font-size:14px;}}
+.foot a{{color:#0f8f45;font-weight:800;}}
+</style></head><body><div class="wrap">
+  <div class="head"><h1>Choose your KhomaAPI plan</h1><p>Paid from day one · cancel anytime · access runs to period end</p></div>
+  {banner_html}
+  <div class="grid">{grid}</div>
+  <p class="foot">Already bought with a different email? <a href="/settings">Link your Whop account</a> · <a href="/login">Log in</a> · <a href="/logout">Log out</a></p>
+</div></body></html>"""
 
 
 def deny_response(request: Request, kind: str, feature: str = None, api: bool = None):
@@ -880,19 +944,12 @@ def deny_response(request: Request, kind: str, feature: str = None, api: bool = 
         if api:
             return JSONResponse(status_code=402, content={
                 "ok": False, "error": "no active subscription", "subscribe": PRICING_URL})
-        return _subscribe_page(
-            "Your subscription isn’t active",
-            "Choose a plan to access your KhomaAPI dashboard. You’re paid from day "
-            "one — cancel anytime, access continues until the period ends.")
+        return RedirectResponse("/subscribe", status_code=302)
     # feature upgrade required
     if api:
         return JSONResponse(status_code=403, content={
             "ok": False, "error": f"plan upgrade required: {feature}", "subscribe": PRICING_URL})
-    return _subscribe_page(
-        "Upgrade required",
-        f"{_FEATURE_LABELS.get(feature, feature)} is available on Pro, Elite and "
-        f"Founder plans. Upgrade to unlock it.",
-        cta="Upgrade plan")
+    return RedirectResponse(f"/subscribe?upgrade={feature or '1'}", status_code=302)
 
 
 def gate(request: Request, feature: str = None, api: bool = None):
@@ -5858,7 +5915,7 @@ def settings_page(request: Request):
   {notice}
   <p class="muted" style="margin-top:10px;">{sub_status} {('&nbsp; Renews / ends: ' + period) if period else ''}</p>
   <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
-    <a class="btn" href="{PRICING_URL}">{sub_cta}</a>
+    <a class="btn" href="/subscribe">{sub_cta}</a>
     <form method="post" action="/whop/link" style="margin:0;"><button class="secondary" type="submit">{link_label}</button></form>
   </div>
   <p class="muted" style="margin-top:10px;font-size:13px;">Bought with a different email than this account? Click “{link_label}” to connect your membership.</p>
@@ -6368,6 +6425,18 @@ def whop_link(request: Request):
         return RedirectResponse("/settings?whop=notfound", status_code=302)
     link_membership_to_user(m, by_user_id=user["id"])
     return RedirectResponse("/settings?whop=linked", status_code=302)
+
+
+@app.get("/subscribe", response_class=HTMLResponse)
+@app.get("/upgrade", response_class=HTMLResponse)
+def subscribe_page(request: Request):
+    up = request.query_params.get("upgrade")
+    banner = ""
+    if up and up != "1":
+        banner = f"{_FEATURE_LABELS.get(up, up)} requires the Pro plan or higher — upgrade below to unlock it."
+    elif up:
+        banner = "Upgrade your plan to unlock this feature."
+    return HTMLResponse(plans_html(banner))
 
 
 @app.get("/health")
