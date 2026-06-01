@@ -24,6 +24,7 @@ from app.tradovate_oauth import build_tradovate_login, exchange_code_for_token, 
 from app import tradovate_oauth as tvo
 from app import risk_engine as risk
 from app import db as dbmod
+from app import entitlements as ent
 import asyncio
 import yaml
 import re
@@ -98,6 +99,17 @@ APP_URL = os.getenv("APP_URL", "https://khomaapi.com")
 # Session cookies are Secure (HTTPS-only) by default — correct for production.
 # Set COOKIE_SECURE=0 for local http testing.
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"
+
+# ---- Subscription gating (Whop) -----------------------------------------
+# Master switch. Default OFF so deploying the gating code never locks anyone
+# out before Whop is wired + memberships linked. Flip to 1 at go-live.
+ENFORCE_SUBSCRIPTIONS = os.getenv("ENFORCE_SUBSCRIPTIONS", "0") == "1"
+# Lets a `manual_plan` column simulate an active plan for testing BEFORE Whop is
+# connected. Never overrides a real (linked) Whop membership, and is ignored
+# entirely unless explicitly enabled. Turn OFF once Whop is the source of truth.
+ALLOW_MANUAL_PLAN = os.getenv("ALLOW_MANUAL_PLAN", "0") == "1"
+# Where to send users who need to buy / upgrade (marketing pricing page).
+PRICING_URL = os.getenv("PRICING_URL", "https://khomaapi.com/#pricing").strip()
 
 
 def google_login_button() -> str:
@@ -556,6 +568,14 @@ def init_db():
     ensure_column("broker_accounts", "group_type", "TEXT DEFAULT 'independent'")
     ensure_column("trades", "fill_price", "REAL")
     ensure_column("trades", "pnl", "REAL")
+    # Whop billing link + subscription state (Whop is the source of truth).
+    ensure_column("users", "whop_user_id", "TEXT")
+    ensure_column("users", "whop_membership_id", "TEXT")
+    ensure_column("users", "whop_plan_id", "TEXT")
+    ensure_column("users", "subscription_status", "TEXT")
+    ensure_column("users", "current_period_end", "TEXT")
+    # Testing-only plan override (gated by ALLOW_MANUAL_PLAN; never beats Whop).
+    ensure_column("users", "manual_plan", "TEXT")
 
     # Backfill group_type from the legacy in_copy_box flag, then normalize nulls.
     cur.execute("UPDATE broker_accounts SET group_type='copy' WHERE in_copy_box=1 AND (group_type IS NULL OR group_type='independent')")
@@ -743,6 +763,195 @@ def current_user(request: Request):
 
 def require_user(request: Request):
     return current_user(request)
+
+
+# ============================================================
+# SUBSCRIPTION / ENTITLEMENT ENFORCEMENT (Whop)
+# ============================================================
+
+class Entitlement:
+    """A user's resolved live access: active?, which tier, and where it came
+    from. Feature/cap answers delegate to the pure `entitlements` module."""
+    __slots__ = ("active", "tier", "source")
+
+    def __init__(self, active, tier, source):
+        self.active = bool(active)
+        self.tier = tier
+        self.source = source  # "whop" | "manual" | "none"
+
+    @property
+    def max_accounts(self):
+        return ent.max_accounts(self.tier) if self.active else 0
+
+    def has(self, feature):
+        return self.active and ent.has_feature(self.tier, feature)
+
+
+def _ucol(user, key):
+    """Read a column from a sqlite Row / psycopg dict / plain dict, safely."""
+    if user is None:
+        return None
+    try:
+        return user[key]
+    except (KeyError, IndexError, TypeError):
+        getter = getattr(user, "get", None)
+        return getter(key) if getter else None
+
+
+def user_entitlements(user) -> Entitlement:
+    """Resolve a user's entitlement. Whop is authoritative: if the account is
+    linked to a membership, only Whop's status counts. The manual test flag
+    applies ONLY when there is no Whop linkage AND ALLOW_MANUAL_PLAN is on — so
+    a local flag can never grant access Whop says is inactive."""
+    if user is None:
+        return Entitlement(False, None, "none")
+
+    membership = _ucol(user, "whop_membership_id")
+    if membership:
+        tier = ent.tier_for_plan_id(_ucol(user, "whop_plan_id"))
+        active = ent.subscription_active(
+            _ucol(user, "subscription_status"),
+            _ucol(user, "current_period_end"),
+        ) and tier is not None
+        return Entitlement(active, tier if active else None, "whop")
+
+    if ALLOW_MANUAL_PLAN:
+        mp = ent.normalize_tier(_ucol(user, "manual_plan"))
+        if mp:
+            return Entitlement(True, mp, "manual")
+
+    return Entitlement(False, None, "none")
+
+
+_FEATURE_LABELS = {
+    ent.COPY_TRADING: "Copy Trading",
+    ent.EVAL_FUNDED: "Eval → Funded tracking & prop presets",
+    ent.EMAIL_DIGESTS: "Performance email digests",
+}
+
+
+def _is_api_request(request: Request) -> bool:
+    p = request.url.path
+    if p.startswith("/api") or p.startswith("/webhook"):
+        return True
+    accept = request.headers.get("accept", "")
+    return "application/json" in accept and "text/html" not in accept
+
+
+def _subscribe_page(title: str, body: str, cta: str = "Choose a plan"):
+    return login_layout(f"""
+      <div class="logo">K</div>
+      <h1>{title}</h1>
+      <p>{body}</p>
+      <a class="btn" href="{PRICING_URL}">{cta}</a>
+      <p style="margin-top:16px;color:#6b7280;font-size:14px;">
+        Already subscribed with a different email?
+        <a href="/settings">Link your Whop account</a>.
+      </p>
+      <p style="margin-top:10px;"><a href="/logout">Log out</a></p>
+    """)
+
+
+def deny_response(request: Request, kind: str, feature: str = None, api: bool = None):
+    """kind: 'auth' (not logged in) | 'inactive' (no active sub) | 'feature'."""
+    if api is None:
+        api = _is_api_request(request)
+    if kind == "auth":
+        if api:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "not authenticated"})
+        return RedirectResponse("/login", status_code=302)
+    if kind == "inactive":
+        if api:
+            return JSONResponse(status_code=402, content={
+                "ok": False, "error": "no active subscription", "subscribe": PRICING_URL})
+        return _subscribe_page(
+            "Your subscription isn’t active",
+            "Choose a plan to access your KhomaAPI dashboard. You’re paid from day "
+            "one — cancel anytime, access continues until the period ends.")
+    # feature upgrade required
+    if api:
+        return JSONResponse(status_code=403, content={
+            "ok": False, "error": f"plan upgrade required: {feature}", "subscribe": PRICING_URL})
+    return _subscribe_page(
+        "Upgrade required",
+        f"{_FEATURE_LABELS.get(feature, feature)} is available on Pro, Elite and "
+        f"Founder plans. Upgrade to unlock it.",
+        cta="Upgrade plan")
+
+
+def gate(request: Request, feature: str = None, api: bool = None):
+    """Per-route guard. Returns (user, entitlement, deny_response_or_None).
+
+    When ENFORCE_SUBSCRIPTIONS is off it only enforces login (preserving current
+    behavior for a safe rollout). When on, it also requires an active
+    subscription and, if `feature` is given, that the plan includes it.
+    Pass api=True for JSON/XHR endpoints so denials come back as JSON, not HTML."""
+    user = current_user(request)
+    if not user:
+        return None, None, deny_response(request, "auth", api=api)
+    e = user_entitlements(user)
+    if ENFORCE_SUBSCRIPTIONS:
+        if not e.active:
+            return user, e, deny_response(request, "inactive", api=api)
+        if feature and not e.has(feature):
+            return user, e, deny_response(request, "feature", feature=feature, api=api)
+    return user, e, None
+
+
+def account_cap_remaining(user, e: Entitlement):
+    """How many more accounts this user may connect. None = unlimited.
+    No-op (unlimited) when enforcement is off, so nothing breaks pre-go-live."""
+    if not ENFORCE_SUBSCRIPTIONS:
+        return None
+    cap = e.max_accounts
+    if cap is None:
+        return None
+    current = len(get_broker_accounts(user["id"], connected_only=True))
+    return max(0, cap - current)
+
+
+def webhook_subscription_ok(user) -> bool:
+    """Active-subscription check for the trade webhook (auth is by payload, not
+    session). No-op when enforcement is off."""
+    if not ENFORCE_SUBSCRIPTIONS:
+        return True
+    return user_entitlements(user).active
+
+
+# Central guard so an active subscription is enforced on EVERY protected HTTP
+# request, not just routes that remember to check. No-op until enforcement is
+# switched on. Public/auth/asset/webhook paths are allow-listed; feature-level
+# gates (copy trading, eval→funded, digests) and account caps live in the
+# individual routes.
+_PUBLIC_PATHS = {
+    "/", "/login", "/signup", "/logout", "/health", "/status", "/api/status",
+    "/subscribe", "/upgrade", "/test", "/debug-static",
+    "/favicon.ico", "/favicon.png",
+}
+_PUBLIC_PREFIXES = (
+    "/static", "/uploads", "/auth/google", "/verify-email",
+    "/confirm-email-change", "/verify-email-change", "/confirm-password-change",
+    "/forgot-password", "/reset-password", "/oauth/callback", "/webhook",
+    "/whop", "/debug",
+)
+
+
+@app.middleware("http")
+async def subscription_guard(request: Request, call_next):
+    if not ENFORCE_SUBSCRIPTIONS:
+        return await call_next(request)
+    path = request.url.path
+    if path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES):
+        return await call_next(request)
+    # Run the cookie+DB lookup off the event loop.
+    from starlette.concurrency import run_in_threadpool
+    user = await run_in_threadpool(current_user, request)
+    if user is None:
+        # Not logged in → let the route's existing /login redirect handle it.
+        return await call_next(request)
+    if not user_entitlements(user).active:
+        return deny_response(request, "inactive")
+    return await call_next(request)
 
 
 def mask_value(value: str, visible: int = 5) -> str:
@@ -1705,6 +1914,10 @@ def digest_tick():
     for u in users:
         u = dict(u)
         if not u.get("email"):
+            continue
+        # Plan gate: digests are a Pro/Elite/Founder feature and require an
+        # active subscription. No-op when enforcement is off.
+        if ENFORCE_SUBSCRIPTIONS and not user_entitlements(u).has(ent.EMAIL_DIGESTS):
             continue
         try:
             trips, _o = account_trade_history(u["id"])
@@ -4048,9 +4261,9 @@ def broker_page(request: Request):
 
 @app.post("/broker/copy/set")
 def broker_copy_set(request: Request, account_id: int = Form(...), in_box: str = Form(...)):
-    user = require_user(request)
-    if not user:
-        return JSONResponse(status_code=401, content={"ok": False, "error": "Not logged in"})
+    user, _e, deny = gate(request, feature=ent.COPY_TRADING, api=True)
+    if deny:
+        return deny
     group_type = "copy" if in_box in ("1", "true", "True", "on") else "independent"
     set_account_group(user["id"], account_id, group_type)
     return {"ok": True}
@@ -4068,9 +4281,11 @@ def broker_disconnect(request: Request, account_id: int):
 
 @app.post("/broker/connect")
 def broker_connect(request: Request, env: str = Form(...), username: str = Form(...), password: str = Form(...)):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+    user, e, deny = gate(request)
+    if deny:
+        return deny
+    if account_cap_remaining(user, e) == 0:
+        return RedirectResponse("/broker?error=plan_limit", status_code=302)
 
     con = db()
     try:
@@ -4555,12 +4770,17 @@ def _risk_owns(user, account_id):
 
 @app.post("/risk/account/{account_id}/save")
 async def risk_account_save(request: Request, account_id: int):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+    user, e, deny = gate(request)
+    if deny:
+        return deny
     if not _risk_owns(user, account_id):
         return RedirectResponse("/risk")
     form = await request.form()
+
+    # Eval→funded phase tracking + prop presets are a Pro/Elite/Founder feature.
+    # Solo still gets the core risk engine (daily loss, drawdown, kill-switch),
+    # just pinned to the 'standard' phase.
+    eval_allowed = e.has(ent.EVAL_FUNDED)
 
     def numf(key):
         v = (form.get(key) or "").strip()
@@ -4579,6 +4799,9 @@ async def risk_account_save(request: Request, account_id: int):
         phase = "standard"
     if form.get("activate_funded"):
         phase = "funded"
+    # Plan gate: only Pro+ may use evaluation/funded phases.
+    if phase in ("evaluation", "funded") and not eval_allowed:
+        phase = "standard"
 
     values = {
         "enabled": 1 if form.get("enabled") else 0,
@@ -5593,9 +5816,9 @@ def settings_page(request: Request):
 
 @app.post("/settings/digests")
 async def settings_digests(request: Request):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+    user, _e, deny = gate(request, feature=ent.EMAIL_DIGESTS)
+    if deny:
+        return deny
     form = await request.form()
     con = db()
     con.execute(
@@ -5611,9 +5834,9 @@ async def settings_digests(request: Request):
 @app.get("/settings/digests/sample")
 def settings_digest_sample(request: Request):
     """Send the user a sample performance digest right now (preview)."""
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+    user, _e, deny = gate(request, feature=ent.EMAIL_DIGESTS)
+    if deny:
+        return deny
     try:
         trips, _o = account_trade_history(user["id"])
     except Exception:
@@ -5735,9 +5958,12 @@ class WebhookFlatten(BaseModel):
 
 @app.get("/auth/tradovate/connect")
 def tradovate_connect(request: Request):
-    user = require_user(request)
-    if not user:
-        return RedirectResponse("/login")
+    user, e, deny = gate(request)
+    if deny:
+        return deny
+    # Plan account cap — block starting a connect that can't add any account.
+    if account_cap_remaining(user, e) == 0:
+        return RedirectResponse("/broker?error=plan_limit", status_code=302)
 
     # Which environment(s) to import. A single Tradovate login exposes BOTH demo
     # and live. Demo -> demo root; Live -> live root; Prop Firm -> both (eval
@@ -5796,12 +6022,26 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
                      "detail": accounts_result.get("error")},
         )
 
+    # Plan account cap: import only up to the user's remaining allowance so a
+    # Solo plan can't exceed 2 accounts even though one Tradovate login may
+    # expose more. Extra accounts are skipped (the user is told to upgrade).
+    capped = False
+    if ENFORCE_SUBSCRIPTIONS:
+        con = db()
+        u = con.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        con.close()
+        remaining = account_cap_remaining(u, user_entitlements(u))
+        if remaining is not None and len(accounts) > remaining:
+            accounts = accounts[:max(0, remaining)]
+            capped = True
+
     # Save each account tagged with the environment it actually came from
     # (demo vs live), so the user never trades the wrong one by accident.
     for account in accounts:
         save_broker_account(user_id, account.get("_env", "live"), account, access_token, expires_at)
 
-    return RedirectResponse(url="/broker?connected=1", status_code=302)
+    dest = "/broker?connected=1" + ("&capped=1" if capped else "")
+    return RedirectResponse(url=dest, status_code=302)
 
 
 @app.post("/webhook/trade")
@@ -5815,6 +6055,17 @@ def webhook_trade(payload: WebhookTrade):
 
     if not user:
         return JSONResponse(status_code=200, content={"ok": False, "error": "Client not found."})
+
+    # Subscription gate: no active plan → reject the order and log it. (No-op
+    # until enforcement is switched on.)
+    if not webhook_subscription_ok(user):
+        latency = round((time.perf_counter() - start_time) * 1000, 3)
+        log_trade(user["id"], request_id, str(payload.symbol or "").upper(),
+                  str(payload.side or ""), clean_qty(payload.qty), "rejected",
+                  "REJECTED", latency, "blocked: no active subscription", {})
+        return JSONResponse(status_code=402, content={
+            "ok": False, "status": "REJECTED",
+            "error": "blocked: no active subscription"})
 
     try:
         target_name = (payload.account or "").strip()
@@ -5911,6 +6162,13 @@ def webhook_flatten(payload: WebhookFlatten):
 
     if not user:
         return {"ok": False, "error": "Client not found."}
+
+    if not webhook_subscription_ok(user):
+        latency = round((time.perf_counter() - start_time) * 1000, 3)
+        log_trade(user["id"], request_id, str(payload.symbol or "").upper(), "flatten", 0,
+                  "rejected", "REJECTED", latency, "blocked: no active subscription", {})
+        return JSONResponse(status_code=402, content={
+            "ok": False, "status": "REJECTED", "error": "blocked: no active subscription"})
 
     try:
         if payload.auth != user["webhook_secret"]:
