@@ -26,6 +26,7 @@ from app import risk_engine as risk
 from app import db as dbmod
 from app import entitlements as ent
 from app import whop as whopmod
+from app import security as sec
 import asyncio
 import yaml
 import re
@@ -1071,6 +1072,55 @@ _PUBLIC_PREFIXES = (
     "/forgot-password", "/reset-password", "/oauth/callback", "/webhook",
     "/whop", "/debug",
 )
+
+
+# Rate limiter (per-process, in-memory). Limits are generous flood/brute-force
+# guards, not strict throttles — sized not to drop legitimate traffic.
+LIMITER = sec.RateLimiter()
+# Webhooks authenticate by token, not cookies, and are legitimately cross-origin
+# (TradingView / Whop), so they're exempt from the same-origin CSRF check.
+_CSRF_EXEMPT = {"/webhook/trade", "/webhook/flatten", "/whop/webhook"}
+
+
+def _rate_rule(request: Request):
+    """(limit, window_seconds) for sensitive POSTs, else None."""
+    if request.method != "POST":
+        return None
+    p = request.url.path
+    if p == "/login":
+        return (30, 300)
+    if p == "/signup":
+        return (10, 3600)
+    if p == "/forgot-password":
+        return (8, 3600)
+    if p.startswith("/reset-password"):
+        return (20, 3600)
+    if p in ("/webhook/trade", "/webhook/flatten"):
+        return (1200, 60)   # flood guard only; per-user throttle is dedup+max_orders
+    if p == "/whop/webhook":
+        return (600, 60)
+    return None
+
+
+@app.middleware("http")
+async def edge_security(request: Request, call_next):
+    # 1) Rate-limit sensitive endpoints (per real client IP via Cloudflare).
+    rule = _rate_rule(request)
+    if rule:
+        ip = sec.client_ip(request)
+        allowed, retry = LIMITER.hit(f"rl:{request.url.path}:{ip}", rule[0], rule[1])
+        if not allowed:
+            return JSONResponse(status_code=429, content={"ok": False, "error": "rate limit exceeded"},
+                                headers={"Retry-After": str(retry)})
+    # 2) CSRF: cookie-authenticated state changes must be same-origin.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if request.url.path not in _CSRF_EXEMPT and not sec.is_same_origin(request):
+            return JSONResponse(status_code=403, content={"ok": False, "error": "cross-origin request blocked"})
+    # 3) Process, then attach security headers to every response.
+    resp = await call_next(request)
+    for k, v in sec.SECURITY_HEADERS.items():
+        resp.headers.setdefault(k, v)
+    return resp
 
 
 @app.middleware("http")
@@ -3967,13 +4017,24 @@ def login_page():
 
 
 @app.post("/login", response_class=HTMLResponse)
-def login(email: str = Form(...), password: str = Form(...)):
+def login(request: Request, email: str = Form(...), password: str = Form(...)):
+    email_norm = email.lower().strip()
+    ip = sec.client_ip(request)
+    fail_key = f"loginfail:{ip}:{email_norm}"
+    # Backoff: too many recent failures for this email or IP → make them wait.
+    if LIMITER.count(fail_key, 900) >= 8 or LIMITER.count(f"loginfail:{ip}", 900) >= 25:
+        return login_layout("<h1>Too many attempts</h1><p>Please wait a few minutes before trying again.</p><a href='/login'>Back</a>")
+
     con = db()
-    user = con.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+    user = con.execute("SELECT * FROM users WHERE email=?", (email_norm,)).fetchone()
     con.close()
 
     if not user or not verify_password(password, user["password_hash"]):
+        LIMITER.add(fail_key)
+        LIMITER.add(f"loginfail:{ip}")
         return login_layout("<h1>Invalid login</h1><p>Email or password is wrong.</p><a href='/login'>Try again</a>")
+
+    LIMITER.clear(fail_key)  # successful login resets the counter
 
     if email_enabled() and not user["is_verified"]:
         # Re-send the verification link. If email delivery is failing, activate
