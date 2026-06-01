@@ -25,6 +25,7 @@ from app import tradovate_oauth as tvo
 from app import risk_engine as risk
 from app import db as dbmod
 from app import entitlements as ent
+from app import whop as whopmod
 import asyncio
 import yaml
 import re
@@ -110,6 +111,10 @@ ENFORCE_SUBSCRIPTIONS = os.getenv("ENFORCE_SUBSCRIPTIONS", "0") == "1"
 ALLOW_MANUAL_PLAN = os.getenv("ALLOW_MANUAL_PLAN", "0") == "1"
 # Where to send users who need to buy / upgrade (marketing pricing page).
 PRICING_URL = os.getenv("PRICING_URL", "https://khomaapi.com/#pricing").strip()
+
+# Whop billing credentials (env only — never logged or returned).
+WHOP_API_KEY = os.getenv("WHOP_API_KEY", "").strip()
+WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "").strip()
 
 
 def google_login_button() -> str:
@@ -545,6 +550,17 @@ def init_db():
     )
     """)
 
+    # Whop memberships seen by webhook BEFORE a matching KhomaAPI account exists
+    # (buy-first-then-signup). Lets login link by a cheap local lookup instead of
+    # scanning the Whop API on every login.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS whop_pending(
+        email TEXT PRIMARY KEY,
+        membership_id TEXT,
+        updated_at TEXT
+    )
+    """)
+
     # --- Additive column migrations (safe on existing DBs) ---
     def ensure_column(table, column, decl):
         try:
@@ -916,6 +932,70 @@ def webhook_subscription_ok(user) -> bool:
     if not ENFORCE_SUBSCRIPTIONS:
         return True
     return user_entitlements(user).active
+
+
+def _apply_membership_state(user_id, st):
+    con = db()
+    con.execute(
+        "UPDATE users SET whop_user_id=?, whop_membership_id=?, whop_plan_id=?, "
+        "subscription_status=?, current_period_end=? WHERE id=?",
+        (st["user_id"], st["membership_id"], st["plan_id"], st["status"],
+         st["period_end"], user_id),
+    )
+    con.commit()
+    con.close()
+
+
+def link_membership_to_user(membership, by_user_id=None):
+    """Persist a Whop membership's state onto the matching KhomaAPI user. Matches
+    by explicit user id, then by membership id (so renewals/revokes find the same
+    account even if emails differ), then by email (first link). Only memberships
+    on one of OUR plans are linked — the separate manual-signals product is
+    ignored."""
+    st = whopmod.membership_state(membership)
+    if st["plan_id"] and ent.tier_for_plan_id(st["plan_id"]) is None:
+        return None
+    con = db()
+    row = None
+    if by_user_id is not None:
+        row = con.execute("SELECT id FROM users WHERE id=?", (by_user_id,)).fetchone()
+    if not row and st["membership_id"]:
+        row = con.execute("SELECT id FROM users WHERE whop_membership_id=?",
+                          (st["membership_id"],)).fetchone()
+    if not row and st["email"]:
+        row = con.execute("SELECT id FROM users WHERE email=?", (st["email"],)).fetchone()
+    con.close()
+    if not row:
+        return None
+    _apply_membership_state(row["id"], st)
+    return row["id"]
+
+
+def try_link_whop(user):
+    """Cheap auto-link on login: if the account isn't linked and the webhook
+    previously recorded a pending membership for this email, attach it. A normal
+    login by a non-customer costs one indexed SELECT (no Whop API call). Never
+    raises into the login flow."""
+    try:
+        if not WHOP_API_KEY or _ucol(user, "whop_membership_id"):
+            return
+        email = (_ucol(user, "email") or "").lower().strip()
+        if not email:
+            return
+        con = db()
+        row = con.execute("SELECT membership_id FROM whop_pending WHERE email=?", (email,)).fetchone()
+        con.close()
+        if not row:
+            return
+        m = whopmod.fetch_membership(row["membership_id"], WHOP_API_KEY)
+        if m and ent.tier_for_plan_id(m.get("plan")):
+            link_membership_to_user(m, by_user_id=user["id"])
+        con = db()
+        con.execute("DELETE FROM whop_pending WHERE email=?", (email,))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"whop auto-link skipped: {e}")
 
 
 # Central guard so an active subscription is enforced on EVERY protected HTTP
@@ -3859,6 +3939,7 @@ def login(email: str = Form(...), password: str = Form(...)):
         con.commit()
         con.close()
 
+    try_link_whop(user)  # attach an existing Whop membership by email, if any
     sid = create_session(user["id"])
     response = RedirectResponse("/dashboard", status_code=302)
     response.set_cookie(
@@ -3969,6 +4050,7 @@ def auth_google_callback(code: str = ""):
 
     con.close()
 
+    try_link_whop(user)  # attach an existing Whop membership by email, if any
     sid = create_session(user["id"])
     response = RedirectResponse("/dashboard", status_code=302)
     response.set_cookie(
@@ -5747,10 +5829,41 @@ def settings_page(request: Request):
     if not user:
         return RedirectResponse("/login")
 
+    e = user_entitlements(user)
+    linked = _ucol(user, "whop_membership_id")
+    period = _ucol(user, "current_period_end") or ""
+    whop_msg = request.query_params.get("whop")
+    notice = ""
+    if whop_msg == "linked":
+        notice = "<div class='copy-note'>✓ Whop membership linked.</div>"
+    elif whop_msg == "notfound":
+        notice = ("<div class='copy-note' style='background:#fef2f2;color:#b91c1c;border-color:#fecaca;'>"
+                  "No active KhomaAPI membership found for your email. Use the same email you bought with on Whop, or contact support.</div>")
+    elif whop_msg == "unconfigured":
+        notice = ("<div class='copy-note' style='background:#fff7ed;color:#9a3412;border-color:#fed7aa;'>"
+                  "Billing isn’t fully configured yet.</div>")
+    if e.active:
+        sub_status = f"<span class='pill'>● Active — {(e.tier or '').title()} plan</span>"
+    else:
+        sub_status = "<span class='pill gray'>● No active subscription</span>"
+    sub_cta = "Manage / change plan" if e.active else "Choose a plan"
+    link_label = "Re-sync my Whop status" if linked else "Link my Whop account"
+
     content = f'''
     <div class="header"><div><h2>Settings</h2><p>Profile, authentication, and account security.</p></div></div>
     <div class="grid">
-      
+
+<div class="card span12">
+  <h3>Subscription</h3>
+  {notice}
+  <p class="muted" style="margin-top:10px;">{sub_status} {('&nbsp; Renews / ends: ' + period) if period else ''}</p>
+  <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
+    <a class="btn" href="{PRICING_URL}">{sub_cta}</a>
+    <form method="post" action="/whop/link" style="margin:0;"><button class="secondary" type="submit">{link_label}</button></form>
+  </div>
+  <p class="muted" style="margin-top:10px;font-size:13px;">Bought with a different email than this account? Click “{link_label}” to connect your membership.</p>
+</div>
+
 <div class="card span6">
 <h3>Profile</h3>
 
@@ -6184,6 +6297,77 @@ def webhook_flatten(payload: WebhookFlatten):
         return {"ok": False, "error": str(e), "latency_ms": latency}
 
 
+# ============================================================
+# WHOP BILLING
+# ============================================================
+
+@app.post("/whop/webhook")
+async def whop_webhook(request: Request):
+    """Signature-verified Whop webhook. The body is only a trigger — we re-fetch
+    the membership from the Whop API and use its authoritative `valid` flag to
+    grant/revoke, so a forged or stale body can't unlock anything."""
+    raw = await request.body()
+    ok, reason = whopmod.verify_signature(raw, request.headers, WHOP_WEBHOOK_SECRET)
+    if not ok:
+        print(f"WHOP webhook REJECTED: {reason}")
+        return JSONResponse(status_code=401, content={"ok": False, "error": "invalid signature"})
+
+    try:
+        payload = json.loads(raw.decode() or "{}")
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad json"})
+
+    action = payload.get("action") or payload.get("event") or ""
+    mid = whopmod.extract_membership_id(payload)
+    print(f"WHOP webhook accepted ({reason}) action={action} membership={mid}")
+    if not mid:
+        return {"ok": True, "note": "no membership in event"}
+
+    # Source of truth: re-fetch. Fall back to the event body only if the API
+    # fetch fails AND the body already looks like a full membership object.
+    m = whopmod.fetch_membership(mid, WHOP_API_KEY)
+    if not m or not m.get("id"):
+        data = payload.get("data")
+        m = data if isinstance(data, dict) and data.get("id") else None
+    if not m:
+        return {"ok": True, "note": "membership not retrievable"}
+
+    linked = link_membership_to_user(m)
+
+    # Buy-before-signup: no account matches yet. Record it (keyed by email) so
+    # the buyer's first login links instantly without an API scan.
+    if linked is None:
+        st = whopmod.membership_state(m)
+        if st["email"] and ent.tier_for_plan_id(st["plan_id"]):
+            con = db()
+            con.execute(
+                "INSERT INTO whop_pending(email, membership_id, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(email) DO UPDATE SET membership_id=excluded.membership_id, "
+                "updated_at=excluded.updated_at",
+                (st["email"], st["membership_id"], datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+            con.close()
+
+    return {"ok": True, "membership": mid, "linked_user_id": linked}
+
+
+@app.post("/whop/link")
+def whop_link(request: Request):
+    """'Link my Whop' button — finds the logged-in user's membership by email
+    and attaches it (hybrid fallback when the buyer's Whop email differs)."""
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    if not WHOP_API_KEY:
+        return RedirectResponse("/settings?whop=unconfigured", status_code=302)
+    m = whopmod.find_membership_by_email(
+        _ucol(user, "email"), WHOP_API_KEY,
+        allowed_plan_ids=list(ent.plan_env_map().keys()))
+    if not m:
+        return RedirectResponse("/settings?whop=notfound", status_code=302)
+    link_membership_to_user(m, by_user_id=user["id"])
+    return RedirectResponse("/settings?whop=linked", status_code=302)
 
 
 @app.get("/health")

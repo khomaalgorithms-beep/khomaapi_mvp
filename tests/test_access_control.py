@@ -5,8 +5,13 @@ so we exercise the live middleware, gate(), and webhook checks — the things th
 must never let a non-payer trade or lock out a paying customer.
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import os
 import tempfile
+import time
 
 # Configure env BEFORE importing the app (these are read at import time).
 os.environ["KHOMA_DB_PATH"] = tempfile.mktemp(suffix=".db")
@@ -27,11 +32,11 @@ client = TestClient(appmod.app)
 _counter = [0]
 
 
-def make_user(plan=None, status=None, period_end=None, membership=None, plan_id=None):
+def make_user(plan=None, status=None, period_end=None, membership=None, plan_id=None, email=None):
     """Create a user row with the given subscription state and return its id."""
     _counter[0] += 1
     n = _counter[0]
-    email = f"u{n}@test.com"
+    email = email or f"u{n}@test.com"
     con = appmod.db()
     cur = con.cursor()
     uid = appmod.dbmod.insert_returning_id(
@@ -155,3 +160,80 @@ def test_manual_flag_cannot_override_inactive_whop():
                        membership="mem_dead", plan_id="plan_pro_test")
     r = client.get("/api/trades", cookies=cookies_for(uid))
     assert r.status_code == 402
+
+
+# --------------------------------------------------------------------------
+# Whop webhook: end-to-end grant → revoke (Whop API fetch mocked)
+# --------------------------------------------------------------------------
+
+_WH_SECRET_RAW = b"webhook-signing-key-32-bytes!!!!"
+_WH_SECRET = "whsec_" + base64.b64encode(_WH_SECRET_RAW).decode()
+
+
+def _signed_post(body_dict):
+    body = json.dumps(body_dict).encode()
+    wid, wts = "msg_test", str(int(time.time()))
+    mac = base64.b64encode(
+        hmac.new(_WH_SECRET_RAW, f"{wid}.{wts}.".encode() + body, hashlib.sha256).digest()
+    ).decode()
+    headers = {"webhook-id": wid, "webhook-timestamp": wts,
+               "webhook-signature": f"v1,{mac}", "content-type": "application/json"}
+    return client.post("/whop/webhook", content=body, headers=headers)
+
+
+def test_whop_webhook_grant_then_revoke(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_wh_pro")
+    monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
+
+    uid, email = make_user(plan=None)  # no access yet
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402
+
+    # Whop says this membership is valid → grant.
+    valid_member = {"id": "mem_live", "user": "user_1", "plan": "plan_wh_pro",
+                    "email": email, "valid": True, "status": "completed",
+                    "renewal_period_end": 1893456000}
+    monkeypatch.setattr(appmod.whopmod, "fetch_membership", lambda mid, key: valid_member)
+    r = _signed_post({"action": "membership.went_valid", "data": {"id": "mem_live"}})
+    assert r.status_code == 200
+    # Access granted (Pro): copy trading now allowed.
+    assert client.post("/broker/copy/set", data={"account_id": "1", "in_box": "1"},
+                       cookies=cookies_for(uid)).status_code == 200
+
+    # Now Whop says invalid → revoke.
+    dead_member = dict(valid_member, valid=False, status="expired")
+    monkeypatch.setattr(appmod.whopmod, "fetch_membership", lambda mid, key: dead_member)
+    r = _signed_post({"action": "membership.went_invalid", "data": {"id": "mem_live"}})
+    assert r.status_code == 200
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402
+
+
+def test_buy_before_signup_links_on_login(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_PRO_M", "plan_wh_pro2")
+    monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
+    monkeypatch.setattr(appmod, "WHOP_API_KEY", "test-key")  # gate try_link_whop on
+    buyer = "buyer_first@test.com"
+    member = {"id": "mem_pending", "user": "user_p", "plan": "plan_wh_pro2",
+              "email": buyer, "valid": True, "status": "completed",
+              "renewal_period_end": 1893456000}
+    monkeypatch.setattr(appmod.whopmod, "fetch_membership", lambda mid, key: member)
+
+    # 1) Webhook arrives BEFORE the buyer has an account → recorded as pending.
+    r = _signed_post({"action": "membership.went_valid", "data": {"id": "mem_pending"}})
+    assert r.status_code == 200 and r.json()["linked_user_id"] is None
+
+    # 2) Buyer signs up with that email, then logs in → auto-linked.
+    uid, _ = make_user(plan=None, email=buyer)
+    lr = client.post("/login", data={"email": buyer, "password": "pw"},
+                     follow_redirects=False)
+    assert lr.status_code in (302, 303)
+    # 3) Now active (Pro) — no longer blocked.
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code != 402
+
+
+def test_whop_webhook_rejects_bad_signature(monkeypatch):
+    monkeypatch.setattr(appmod, "WHOP_WEBHOOK_SECRET", _WH_SECRET)
+    body = json.dumps({"action": "membership.went_valid", "data": {"id": "mem_x"}}).encode()
+    r = client.post("/whop/webhook", content=body, headers={
+        "webhook-id": "m", "webhook-timestamp": str(int(time.time())),
+        "webhook-signature": "v1,not-a-real-signature"})
+    assert r.status_code == 401
