@@ -65,6 +65,12 @@ def plan_env_map():
         pid = (os.getenv(env_name) or "").strip()
         if pid:
             out[pid] = tier
+    # ATS-program free plans → Elite (comma-separated plan ids; comp access that
+    # comes bundled with the high-ticket ATS program, granted via a $0 Whop plan).
+    for pid in (os.getenv("WHOP_PLAN_ATS") or "").split(","):
+        pid = pid.strip()
+        if pid:
+            out[pid] = "elite"
     return out
 
 

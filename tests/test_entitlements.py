@@ -129,6 +129,12 @@ def test_plan_id_to_tier_from_env(monkeypatch):
     assert ent.tier_for_plan_id(None) is None
 
 
+def test_ats_free_plans_map_to_elite(monkeypatch):
+    monkeypatch.setenv("WHOP_PLAN_ATS", "plan_ats_free, plan_ats_two")
+    assert ent.tier_for_plan_id("plan_ats_free") == "elite"
+    assert ent.tier_for_plan_id("plan_ats_two") == "elite"
+
+
 def test_unconfigured_plan_ids_are_ignored(monkeypatch):
     for k in ("WHOP_PLAN_SOLO_M", "WHOP_PLAN_SOLO_Y", "WHOP_PLAN_PRO_M",
               "WHOP_PLAN_PRO_Y", "WHOP_PLAN_ELITE_M", "WHOP_PLAN_ELITE_Y",
