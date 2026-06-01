@@ -1174,6 +1174,11 @@ async def edge_security(request: Request, call_next):
     resp = await call_next(request)
     for k, v in sec.SECURITY_HEADERS.items():
         resp.headers.setdefault(k, v)
+    # Never let the browser/CDN cache dynamic app pages — prevents a stale error
+    # (e.g. an old 403) from being replayed. Static assets keep normal caching.
+    p = request.url.path
+    if not (p.startswith("/static") or p.startswith("/uploads")):
+        resp.headers.setdefault("Cache-Control", "no-store")
     return resp
 
 
