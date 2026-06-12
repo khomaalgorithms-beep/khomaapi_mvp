@@ -575,6 +575,25 @@ def init_db():
     )
     """)
 
+    # Persistent daily PnL / equity snapshot per account. The 1s poller computes
+    # penny-exact day_pnl (equity - netLiqSOD) but only in memory; we save it here
+    # so the journal, calendar, equity curve, and email reports have a permanent
+    # record independent of Tradovate's limited fill history.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS daily_equity(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL,
+        account_name TEXT,
+        trade_date TEXT NOT NULL,
+        net_liq REAL,
+        net_liq_sod REAL,
+        day_pnl REAL,
+        updated_at TEXT,
+        UNIQUE(account_id, trade_date)
+    )
+    """)
+
     # --- Additive column migrations (safe on existing DBs) ---
     def ensure_column(table, column, decl):
         try:
@@ -2008,14 +2027,21 @@ def _poll_one(a: dict, tick: int) -> list:
                 ev = _breach_and_lock(a, cfg, state)
                 if ev:
                     out.append(ev)
+                record_daily_equity(a, state)  # persist daily PnL history
         elif active and hard and in_pos:
             ev = fast_breach_check(a, cfg)
             if ev:
                 out.append(ev)
+            record_daily_equity(a, ACCOUNT_STATE_CACHE.get(a["id"], ({},))[0])
         elif tick % FULL_REFRESH_TICKS == 0:
+            # Even with no risk rules, snapshot equity so the journal/reports work.
             token = ensure_fresh_token(a)
             snap = tvo.get_cash_snapshot(a.get("env") or "live", token, a.get("account_id")) if token else None
             set_heartbeat(a["id"], snap is not None)
+            if snap is not None:
+                st = _snapshot_to_state(snap)
+                ACCOUNT_STATE_CACHE[a["id"]] = ({**ACCOUNT_STATE_CACHE.get(a["id"], ({},))[0], **st}, time.time())
+                record_daily_equity(a, st)
     except Exception:
         pass
     return out
@@ -2094,6 +2120,95 @@ async def risk_watchdog_loop():
 # PERFORMANCE EMAIL DIGESTS (daily / weekly / monthly)
 # ============================================================
 
+def _snapshot_to_state(snap):
+    """Equity + penny-exact day PnL from a raw cash snapshot (mirrors the risk
+    loop), so accounts WITHOUT risk rules still get their daily PnL recorded."""
+    if snap is None:
+        return {"ok": False}
+    open_pnl = _snapshot_value(snap, ("openPnL", "openPnl", "unrealizedPnL"))
+    net_liq = _snapshot_value(snap, ("netLiq", "netLiquidatingValue"))
+    sod = _snapshot_value(snap, ("netLiqSOD", "totalCashValueSOD", "cashSODUSD"))
+    cash = _snapshot_value(snap, ("totalCashValue", "totalCashBalance", "cashBalance", "amount"))
+    equity = net_liq if net_liq is not None else (round(cash + (open_pnl or 0), 2) if cash is not None else None)
+    day_pnl = round(equity - sod, 2) if (equity is not None and sod is not None) else None
+    return {"ok": True, "equity": equity, "open_pnl": open_pnl, "day_pnl": day_pnl}
+
+
+_LAST_EQUITY_SNAP: Dict[Any, tuple] = {}   # account_id -> (trade_date, last_write_ts)
+_EQUITY_SNAP_MIN_INTERVAL = 120            # throttle DB writes to once / 2 min per account
+
+
+def record_daily_equity(account: dict, state: dict):
+    """Persist today's equity + day-PnL for one account (throttled). This is the
+    permanent record the journal, calendar, equity curve, and email reports read
+    from — independent of Tradovate's limited fill history."""
+    try:
+        if not state or not state.get("ok"):
+            return
+        day_pnl = state.get("day_pnl")
+        net_liq = state.get("equity")
+        if day_pnl is None and net_liq is None:
+            return
+        now_utc = datetime.now(timezone.utc)
+        trade_date = now_utc.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d")
+        aid = account.get("id")
+        prev = _LAST_EQUITY_SNAP.get(aid)
+        nowts = time.time()
+        # Always write when the day rolls over; otherwise throttle.
+        if prev and prev[0] == trade_date and (nowts - prev[1]) < _EQUITY_SNAP_MIN_INTERVAL:
+            return
+        net_liq_sod = round(net_liq - day_pnl, 2) if (net_liq is not None and day_pnl is not None) else None
+        con = db()
+        con.execute(
+            "INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,net_liq,net_liq_sod,day_pnl,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(account_id,trade_date) DO UPDATE SET "
+            "net_liq=excluded.net_liq, net_liq_sod=excluded.net_liq_sod, "
+            "day_pnl=excluded.day_pnl, updated_at=excluded.updated_at",
+            (account.get("user_id"), aid, account.get("account_name"), trade_date,
+             net_liq, net_liq_sod, day_pnl, now_utc.isoformat()),
+        )
+        con.commit()
+        con.close()
+        _LAST_EQUITY_SNAP[aid] = (trade_date, nowts)
+    except Exception as e:
+        print(f"record_daily_equity error acct={account.get('id')}: {e}")
+
+
+def daily_pnl_map(user_id: int, start_date: str = None, end_date: str = None, only_account_id=None) -> dict:
+    """{ 'YYYY-MM-DD': summed day_pnl across the user's accounts } from persisted
+    snapshots. Dates are ET 'YYYY-MM-DD' strings, inclusive."""
+    q = "SELECT trade_date, SUM(day_pnl) AS pnl FROM daily_equity WHERE user_id=?"
+    params = [user_id]
+    if only_account_id not in (None, "", "all"):
+        q += " AND account_id=?"
+        params.append(only_account_id)
+    if start_date:
+        q += " AND trade_date>=?"
+        params.append(start_date)
+    if end_date:
+        q += " AND trade_date<=?"
+        params.append(end_date)
+    q += " GROUP BY trade_date"
+    con = db()
+    rows = con.execute(q, tuple(params)).fetchall()
+    con.close()
+    return {r["trade_date"]: (r["pnl"] or 0) for r in rows}
+
+
+def period_pnl_stats(user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
+    """Net + per-day stats over a date range, from persisted daily PnL."""
+    m = daily_pnl_map(user_id, start_date, end_date, only_account_id)
+    days = sorted(m.items())
+    net = round(sum(v for _, v in days), 2)
+    green = sum(1 for _, v in days if v > 0)
+    red = sum(1 for _, v in days if v < 0)
+    best = max(days, key=lambda x: x[1]) if days else None
+    worst = min(days, key=lambda x: x[1]) if days else None
+    return {"net": net, "green_days": green, "red_days": red,
+            "best_day": best, "worst_day": worst, "active_days": len(days)}
+
+
 def _trips_in_range(trips, start_utc, end_utc):
     out = []
     for t in trips:
@@ -2133,11 +2248,13 @@ def digest_email_html(period_label: str, s: dict) -> str:
     )
 
 
-def _send_one_digest(user_row: dict, period_label: str, subject: str, trips: list) -> bool:
-    if not trips:
-        s = journal_analytics([])
-    else:
-        s = journal_analytics(trips)
+def _send_one_digest(user_row: dict, period_label: str, subject: str, trips: list,
+                     pnl_override: dict = None) -> bool:
+    s = journal_analytics(trips or [])
+    # Net P&L + per-day stats come from PERSISTED daily PnL (reliable history);
+    # trip-level stats (win rate, profit factor) stay from fills when available.
+    if pnl_override:
+        s.update(pnl_override)
     html_body = digest_email_html(period_label, s)
     text = f"{period_label} performance — Net {_money(s['net'])}, win rate {s['win_rate']}%, {s['n']} trades."
     return send_branded_email(
@@ -2181,7 +2298,9 @@ def digest_tick():
             pid = now_et.strftime("%Y-%m-%d")
             if u.get("digest_daily_sent") != pid:
                 start = risk.session_anchor(now_utc)
-                if _send_one_digest(u, "daily", "Your KhomaAPI daily performance", _trips_in_range(trips, start, now_utc)):
+                pnl = period_pnl_stats(u["id"], pid, pid)
+                if _send_one_digest(u, "daily", "Your KhomaAPI daily performance",
+                                    _trips_in_range(trips, start, now_utc), pnl_override=pnl):
                     _mark_digest_sent(u["id"], "digest_daily_sent", pid)
 
         # WEEKLY — Saturday morning, covering the last 7 days.
@@ -2189,7 +2308,10 @@ def digest_tick():
             pid = now_et.strftime("%G-W%V")
             if u.get("digest_weekly_sent") != pid:
                 start = now_utc - timedelta(days=7)
-                if _send_one_digest(u, "weekly", "Your KhomaAPI weekly performance", _trips_in_range(trips, start, now_utc)):
+                d0 = (now_et - timedelta(days=7)).strftime("%Y-%m-%d")
+                pnl = period_pnl_stats(u["id"], d0, now_et.strftime("%Y-%m-%d"))
+                if _send_one_digest(u, "weekly", "Your KhomaAPI weekly performance",
+                                    _trips_in_range(trips, start, now_utc), pnl_override=pnl):
                     _mark_digest_sent(u["id"], "digest_weekly_sent", pid)
 
         # MONTHLY — on the 1st, covering the previous calendar month.
@@ -2201,7 +2323,9 @@ def digest_tick():
             if u.get("digest_monthly_sent") != pid:
                 start = first_prev.astimezone(timezone.utc)
                 end = first_this.astimezone(timezone.utc)
-                if _send_one_digest(u, first_prev.strftime("%B %Y"), f"Your KhomaAPI {first_prev.strftime('%B')} performance", _trips_in_range(trips, start, end)):
+                pnl = period_pnl_stats(u["id"], first_prev.strftime("%Y-%m-%d"), last_prev.strftime("%Y-%m-%d"))
+                if _send_one_digest(u, first_prev.strftime("%B %Y"), f"Your KhomaAPI {first_prev.strftime('%B')} performance",
+                                    _trips_in_range(trips, start, end), pnl_override=pnl):
                     _mark_digest_sent(u["id"], "digest_monthly_sent", pid)
 
 
@@ -6223,8 +6347,11 @@ def settings_digest_sample(request: Request):
         trips, _o = account_trade_history(user["id"])
     except Exception:
         trips = []
+    now_et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
+    pnl = period_pnl_stats(user["id"], (now_et - timedelta(days=30)).strftime("%Y-%m-%d"), now_et.strftime("%Y-%m-%d"))
     sent = _send_one_digest(dict(user), "sample (last 30 days)", "Your KhomaAPI performance — sample",
-                            _trips_in_range(trips, datetime.now(timezone.utc) - timedelta(days=30), datetime.now(timezone.utc)))
+                            _trips_in_range(trips, datetime.now(timezone.utc) - timedelta(days=30), datetime.now(timezone.utc)),
+                            pnl_override=pnl)
     return login_layout(
         ("<h1>Sample sent</h1><p>Check your inbox for a sample performance report.</p>" if sent
          else f"<h1>Couldn't send</h1><p>{LAST_EMAIL_ERROR}</p>")
