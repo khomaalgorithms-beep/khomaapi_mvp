@@ -676,6 +676,9 @@ def init_db():
     ensure_column("account_risk_config", "buffer_zone", "REAL")           # funded cushion before max loss
     ensure_column("account_risk_config", "funded_daily_loss", "REAL")
     ensure_column("account_risk_config", "funded_max_loss", "REAL")
+    # Intraday give-back limit (separate from trailing DD) + consistency rule (%).
+    ensure_column("account_risk_config", "intraday_dd", "REAL")
+    ensure_column("account_risk_config", "consistency_pct", "REAL")
     # Accounts that were defaulted to 'evaluation' but have no prop goal set are
     # really standard accounts -> stop the misleading EVALUATION badge.
     cur.execute("""UPDATE account_risk_config SET account_phase='standard'
@@ -1424,7 +1427,8 @@ def set_account_group(user_id: int, account_db_id: int, group_type: str) -> None
 # ============================================================
 
 RISK_FIELDS = (
-    "daily_loss_limit", "trailing_dd", "trailing_basis", "profit_target",
+    "daily_loss_limit", "trailing_dd", "trailing_basis", "intraday_dd",
+    "consistency_pct", "profit_target",
     "max_position", "max_contracts_per_order", "max_open_positions",
     "daily_trade_cap", "hours_start", "hours_end", "tz", "reset_hour", "enabled",
     # Prop-firm evaluation -> funded lifecycle.
@@ -1916,7 +1920,8 @@ def account_connectivity(account: dict) -> str:
 
 def _has_hard_limits(cfg: dict) -> bool:
     eff = effective_risk_cfg(cfg)
-    return any(risk._num(eff.get(k)) for k in ("daily_loss_limit", "trailing_dd", "profit_target"))
+    return any(risk._num(eff.get(k)) for k in
+               ("daily_loss_limit", "trailing_dd", "profit_target", "intraday_dd", "consistency_pct"))
 
 
 def _risk_active(cfg: dict) -> bool:
@@ -1983,7 +1988,8 @@ def fast_breach_check(a: dict, cfg: dict):
         day_pnl = round(dr + (open_pnl or 0), 2)
     state = {"ok": True, "equity": equity, "open_pnl": open_pnl, "cash": cash,
              "day_realized": dr, "day_pnl": day_pnl, "flat": False,
-             "session_anchor": anchor, "high_water_mark": cfg.get("high_water_mark")}
+             "session_anchor": anchor, "high_water_mark": cfg.get("high_water_mark"),
+             "intraday_peak": intraday_peak_for(a, cfg, equity)}
     # Keep the shared cache warm so the order gate + dashboard see live numbers.
     prev = ACCOUNT_STATE_CACHE.get(a["id"], ({},))[0]
     merged = {**prev, **state}
@@ -2018,6 +2024,9 @@ def _poll_one(a: dict, tick: int) -> list:
             state = account_live_state(a, cfg)
             set_heartbeat(a["id"], bool(state.get("ok")))
             if state.get("ok"):
+                # Intraday give-back peak + all-time profit for the new rules.
+                state["intraday_peak"] = intraday_peak_for(a, cfg, state.get("equity"))
+                state["total_profit"] = account_total_profit(a["id"])
                 update_account_hwm(a, cfg, state)
                 cfg = get_risk_config(a["id"])
                 ev_pass = check_eval_pass(a, cfg, state)  # eval -> congrats/funded unlock
@@ -2207,6 +2216,34 @@ def period_pnl_stats(user_id: int, start_date: str, end_date: str, only_account_
     worst = min(days, key=lambda x: x[1]) if days else None
     return {"net": net, "green_days": green, "red_days": red,
             "best_day": best, "worst_day": worst, "active_days": len(days)}
+
+
+_ACCT_INTRADAY_PEAK: Dict[Any, tuple] = {}   # account_id -> (session_anchor_iso, peak_equity)
+
+
+def intraday_peak_for(account: dict, cfg: dict, equity, now_utc=None):
+    """Highest live equity since this session's start (resets each session), for
+    the intraday give-back limit. Kept in memory — resets daily anyway."""
+    aid = account.get("id")
+    if equity is None:
+        prev = _ACCT_INTRADAY_PEAK.get(aid)
+        return prev[1] if prev else None
+    now_utc = now_utc or datetime.now(timezone.utc)
+    anchor = risk.session_anchor(now_utc, int(cfg.get("reset_hour") or 17),
+                                 cfg.get("tz") or "America/New_York").isoformat()
+    prev = _ACCT_INTRADAY_PEAK.get(aid)
+    peak = max(prev[1], equity) if (prev and prev[0] == anchor) else equity
+    _ACCT_INTRADAY_PEAK[aid] = (anchor, peak)
+    return peak
+
+
+def account_total_profit(account_id) -> float:
+    """All-time realized profit for one account, from persisted daily PnL — the
+    denominator for the consistency rule."""
+    con = db()
+    row = con.execute("SELECT SUM(day_pnl) AS t FROM daily_equity WHERE account_id=?", (account_id,)).fetchone()
+    con.close()
+    return round((row["t"] if row and row["t"] is not None else 0) or 0, 2)
 
 
 def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
@@ -5145,6 +5182,8 @@ def risk_account_card(user, a, cfg, state, pf=None) -> str:
           <div><label>Daily loss limit ($)</label><input name="daily_loss_limit" value="{f('daily_loss_limit')}" placeholder="e.g. 1000"></div>
           <div><label>Max drawdown ($)</label><input name="trailing_dd" value="{f('trailing_dd')}" placeholder="e.g. 2000"></div>
           <div><label>Drawdown basis</label><select name="trailing_basis"><option value="intraday" {"selected" if basis=="intraday" else ""}>Intraday equity</option><option value="closed" {"selected" if basis=="closed" else ""}>Closed balance</option></select></div>
+          <div><label>Intraday drawdown ($)</label><input name="intraday_dd" value="{f('intraday_dd')}" placeholder="give-back from today's peak, e.g. 800"></div>
+          <div><label>Consistency rule (%)</label><input name="consistency_pct" value="{f('consistency_pct')}" placeholder="max % of total profit in one day, e.g. 50"></div>
           <div><label>Profit auto-stop ($, optional)</label><input name="profit_target" value="{f('profit_target')}" placeholder="optional"></div>
         </div>
 
@@ -5315,6 +5354,8 @@ async def risk_account_save(request: Request, account_id: int):
         "daily_loss_limit": numf("daily_loss_limit"),
         "trailing_dd": numf("trailing_dd"),
         "trailing_basis": "closed" if form.get("trailing_basis") == "closed" else "intraday",
+        "intraday_dd": numf("intraday_dd"),
+        "consistency_pct": numf("consistency_pct"),
         "profit_target": numf("profit_target"),
         "buffer_zone": numf("buffer_zone"),
         "funded_daily_loss": numf("funded_daily_loss"),

@@ -111,6 +111,23 @@ def evaluate_breach(config: dict, state: dict):
     if tdd is not None and hwm is not None and equity is not None and (hwm - equity) >= tdd:
         return f"Trailing drawdown breached: ${hwm - equity:,.2f} below peak (limit ${tdd:,.2f})"
 
+    # Intraday drawdown: max give-back from TODAY's live-equity peak (resets each
+    # session). Separate from the account trailing DD so a firm with both rules is
+    # fully covered. state['intraday_peak'] = highest equity since session start.
+    idd = _num(config.get("intraday_dd"))
+    ipeak = state.get("intraday_peak")
+    if idd is not None and ipeak is not None and equity is not None and (ipeak - equity) >= idd:
+        return f"Intraday drawdown breached: ${ipeak - equity:,.2f} below today's peak (limit ${idd:,.2f})"
+
+    # Consistency rule: no single day may exceed N% of total (all-time) profit.
+    # Locks the day once today's profit reaches that share, so it can't break it.
+    cons = _num(config.get("consistency_pct"))
+    total = state.get("total_profit")
+    if (cons is not None and total is not None and total > 0
+            and day_pnl is not None and day_pnl > 0 and day_pnl >= (cons / 100.0) * total):
+        return (f"Consistency rule: today's ${day_pnl:,.2f} reached {cons:.0f}% of total "
+                f"profit (${total:,.2f}) — locked to stay within the rule")
+
     target = _num(config.get("profit_target"))
     if target is not None and day_pnl is not None and day_pnl >= target:
         return f"Profit target reached: today's PnL ${day_pnl:,.2f} ≥ ${target:,.2f}"

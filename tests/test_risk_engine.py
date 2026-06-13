@@ -289,3 +289,30 @@ def test_funded_buffer_breaches_before_hard_max():
     state = {"equity": 8500, "high_water_mark": 10000, "day_pnl": 0}
     eff = {"trailing_dd": tdd}
     assert evaluate_breach(eff, state) is not None  # 1500 >= 1000 effective
+
+
+# --- Intraday drawdown + consistency rule (added for prop-firm parity) ---
+
+def test_intraday_drawdown_lockout():
+    cfg = {"intraday_dd": 500}
+    # gave back 550 from today's peak (>= 500) -> breach
+    assert evaluate_breach(cfg, {"equity": 50450, "intraday_peak": 51000}) is not None
+    # gave back 300 (< 500) -> ok
+    assert evaluate_breach(cfg, {"equity": 50700, "intraday_peak": 51000}) is None
+    # no peak yet -> never breaches
+    assert evaluate_breach(cfg, {"equity": 50000}) is None
+    # not configured -> ok
+    assert evaluate_breach({}, {"equity": 1, "intraday_peak": 999999}) is None
+
+
+def test_consistency_rule_lockout():
+    cfg = {"consistency_pct": 50}
+    # today 600 is >= 50% of total 1000 (=500) -> breach
+    assert evaluate_breach(cfg, {"day_pnl": 600, "total_profit": 1000}) is not None
+    # today 400 < 500 -> ok
+    assert evaluate_breach(cfg, {"day_pnl": 400, "total_profit": 1000}) is None
+    # non-positive total or day -> skip (consistency only constrains gains)
+    assert evaluate_breach(cfg, {"day_pnl": 600, "total_profit": 0}) is None
+    assert evaluate_breach(cfg, {"day_pnl": -100, "total_profit": 1000}) is None
+    # not configured -> ok
+    assert evaluate_breach({}, {"day_pnl": 600, "total_profit": 1000}) is None
