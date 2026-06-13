@@ -89,6 +89,31 @@ def test_period_stats_empty_is_zero_not_crash():
     assert s["net"] == 0 and s["green_days"] == 0 and s["best_day"] is None
 
 
+def test_apply_persisted_pnl_overrides_journal():
+    uid = _new_user()
+    con = appmod.db()
+    for d, p in [("2026-05-01", 100.0), ("2026-05-02", -30.0)]:
+        con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) VALUES(?,?,?,?,?,?)",
+                    (uid, 80_001, "A", d, p, "x"))
+    con.commit()
+    con.close()
+    s = appmod.journal_analytics([])           # empty fills → net 0, daily {}
+    assert s["net"] == 0
+    s = appmod.apply_persisted_pnl(s, uid, "2026-05-01", "2026-05-31")
+    assert s["net"] == 70.0
+    assert s["daily"] == {"2026-05-01": 100.0, "2026-05-02": -30.0}
+    assert s["green_days"] == 1 and s["red_days"] == 1
+    assert s["best_day"] == ("2026-05-01", 100.0)
+    assert s["equity"] == [100.0, 70.0]        # cumulative daily equity curve
+
+
+def test_apply_persisted_pnl_noop_when_no_snapshots():
+    uid = _new_user()
+    s = appmod.journal_analytics([])
+    s2 = appmod.apply_persisted_pnl(s, uid, None, None)
+    assert s2["net"] == 0 and s2["daily"] == {}
+
+
 def test_daily_pnl_map_scoped_to_account():
     uid = _new_user()
     con = appmod.db()

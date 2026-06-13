@@ -2209,6 +2209,34 @@ def period_pnl_stats(user_id: int, start_date: str, end_date: str, only_account_
             "best_day": best, "worst_day": worst, "active_days": len(days)}
 
 
+def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
+    """Override a journal_analytics() result's daily PnL, net, day stats, and
+    equity curve with PERSISTED daily PnL (penny-exact, full history). Trip-level
+    stats (win rate, profit factor, per-trade) are left as-is. If no snapshots
+    exist yet (e.g. right after first deploy), the trip-based values are kept."""
+    persisted = daily_pnl_map(user_id, start_date, end_date, only_account_id)
+    if not persisted:
+        return s
+    daily = {**s.get("daily", {}), **persisted}  # persisted value wins per day
+    vals = list(daily.values())
+    s["daily"] = daily
+    s["net"] = round(sum(vals), 2)
+    s["green_days"] = sum(1 for v in vals if v > 0)
+    s["red_days"] = sum(1 for v in vals if v < 0)
+    s["best_day"] = max(daily.items(), key=lambda x: x[1]) if daily else None
+    s["worst_day"] = min(daily.items(), key=lambda x: x[1]) if daily else None
+    gr = s["green_days"] + s["red_days"]
+    s["day_win_rate"] = round(s["green_days"] / gr * 100, 1) if gr else 0.0
+    s["avg_daily"] = round(sum(vals) / len(vals), 2) if vals else 0.0
+    # Equity curve = cumulative daily PnL, chronological (days/months/years).
+    eq, run = [], 0.0
+    for d in sorted(daily.keys()):
+        run += daily[d]
+        eq.append(round(run, 2))
+    s["equity"] = eq
+    return s
+
+
 def _trips_in_range(trips, start_utc, end_utc):
     out = []
     for t in trips:
@@ -5595,6 +5623,11 @@ def journal_page(request: Request):
 
     tmap = get_trip_journal_map(user["id"])
     s = journal_analytics(trips, tags_map=tmap)
+    # Override daily PnL / net / calendar / equity curve with PERSISTED history
+    # (real per-day PnL), so past days aren't $0 from Tradovate's missing fills.
+    _sd = start_utc.astimezone(et).strftime("%Y-%m-%d") if start_utc else None
+    _ed = end_utc.astimezone(et).strftime("%Y-%m-%d") if end_utc else None
+    s = apply_persisted_pnl(s, user["id"], _sd, _ed, only)
 
     # Calendar month: ?month=YYYY-MM, else month of latest trade, else now (ET).
     month_q = request.query_params.get("month", "")
@@ -5662,7 +5695,7 @@ def journal_page(request: Request):
       {range_bar}
       {cards}
 
-      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Cumulative realized P&amp;L across {s['n']} closed trades.</p><div class="equity-wrap">{equity_svg}</div></div>
+      <div class="card span8"><h3>Equity Curve</h3><p class="muted">Cumulative daily realized P&amp;L over time.</p><div class="equity-wrap">{equity_svg}</div></div>
       <div class="card span4"><h3>Day Performance</h3>
         <p class="muted">Winning days <b class="good">{s['green_days']}</b> · Losing days <b class="bad">{s['red_days']}</b> · Day win rate <b>{s['day_win_rate']}%</b></p>
         <div class="journal-day"><div><b>Best day</b></div><div class="good">{best}</div></div>
