@@ -679,6 +679,8 @@ def init_db():
     # Intraday give-back limit (separate from trailing DD) + consistency rule (%).
     ensure_column("account_risk_config", "intraday_dd", "REAL")
     ensure_column("account_risk_config", "consistency_pct", "REAL")
+    # 'manual' (one-click block) vs 'auto' (materialized from a recurring rule).
+    ensure_column("news_windows", "source", "TEXT DEFAULT 'manual'")
     # Accounts that were defaulted to 'evaluation' but have no prop goal set are
     # really standard accounts -> stop the misleading EVALUATION badge.
     cur.execute("""UPDATE account_risk_config SET account_phase='standard'
@@ -695,6 +697,22 @@ def init_db():
         starts_at TEXT NOT NULL,                    -- ISO UTC
         ends_at TEXT NOT NULL,
         label TEXT DEFAULT '',
+        source TEXT DEFAULT 'manual',               -- 'manual' | 'auto' (from a rule)
+        created_at TEXT
+    )
+    """)
+
+    # Recurring news lockout RULES: "never trade CPI/FOMC/PPI…". Matched against
+    # the live calendar each cycle to auto-create news_windows (source='auto').
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS news_rules(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        account_id INTEGER,                         -- NULL = all accounts
+        keyword TEXT NOT NULL,                      -- case-insensitive substring of event title
+        minutes_before INTEGER DEFAULT 15,
+        minutes_after INTEGER DEFAULT 15,
+        enabled INTEGER DEFAULT 1,
         created_at TEXT
     )
     """)
@@ -2403,6 +2421,49 @@ def _prewarm_calendar():
         pass
 
 
+def sync_recurring_news_locks():
+    """Materialize auto news_windows from each user's recurring rules + the live
+    calendar, so 'never trade CPI' blocks every CPI automatically. Idempotent:
+    rebuilds future auto windows each run; manual one-click blocks are untouched."""
+    try:
+        now = datetime.now(timezone.utc)
+        events, _multi = fetch_calendar_events("this", now)
+        con = db()
+        rules = [dict(r) for r in con.execute("SELECT * FROM news_rules WHERE enabled=1").fetchall()]
+        con.close()
+        if not rules:
+            return
+        con = db()
+        # Rebuild: drop future auto windows, then re-create from current rules.
+        con.execute("DELETE FROM news_windows WHERE source='auto' AND ends_at>=?", (now.isoformat(),))
+        made = 0
+        for r in rules:
+            kw = (r.get("keyword") or "").lower().strip()
+            if not kw:
+                continue
+            before = int(r.get("minutes_before") or 15)
+            after = int(r.get("minutes_after") or 15)
+            for e in (events or []):
+                dt = e.get("dt")
+                if not dt or kw not in (e.get("title") or "").lower():
+                    continue
+                end = dt + timedelta(minutes=after)
+                if end < now:
+                    continue  # already over
+                con.execute(
+                    "INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,source,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (r["user_id"], r.get("account_id"), (dt - timedelta(minutes=before)).isoformat(),
+                     end.isoformat(), f"Auto: {e.get('title')}", "auto", now.isoformat()))
+                made += 1
+        con.commit()
+        con.close()
+        if made:
+            print(f"news rules: materialized {made} auto lockout window(s)")
+    except Exception as ex:
+        print("news rule sync error:", ex)
+
+
 def whop_reverify_tick():
     """Safety net: re-check linked ACTIVE users against the Whop API and revoke
     any whose membership is no longer valid. This makes revocation independent of
@@ -2451,6 +2512,7 @@ async def digest_loop():
                 await loop.run_in_executor(None, digest_tick)
                 await loop.run_in_executor(None, whop_reverify_tick)
                 await loop.run_in_executor(None, _prewarm_calendar)
+                await loop.run_in_executor(None, sync_recurring_news_locks)
         except Exception as e:
             print("DIGEST ERROR:", e)
         await asyncio.sleep(600)
@@ -6154,6 +6216,38 @@ def economic_calendar_page(request: Request):
                      f'<div id="cd-timer" data-ts="{int(next_hi[0].timestamp())}" style="font-size:28px;font-weight:850;letter-spacing:-1px;">—</div>'
                      f'</div></div>')
 
+    # Recurring news-lockout rules ("never trade CPI/FOMC/PPI…").
+    con = db()
+    _rules = [dict(r) for r in con.execute(
+        "SELECT * FROM news_rules WHERE user_id=? ORDER BY id", (user["id"],)).fetchall()]
+    con.close()
+
+    def _rule_row(r):
+        return (f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"padding:9px 0;border-bottom:1px solid var(--line);'>"
+                f"<span>🔒 <b>{r['keyword']}</b> <span class='muted'>· blocks ±{r['minutes_before']}/{r['minutes_after']} min around every match</span></span>"
+                f"<form method='post' action='/calendar/rule/{r['id']}/delete' style='margin:0;'>"
+                f"<button class='secondary' style='padding:5px 11px;margin:0;'>Remove</button></form></div>")
+    _rules_list = ("".join(_rule_row(r) for r in _rules)
+                   or "<p class='muted'>No recurring rules yet — add one below and it auto-blocks every time that event hits the calendar.</p>")
+
+    def _preset(kw):
+        return (f"<button type='button' class='secondary' style='padding:6px 11px;margin:0 6px 6px 0;' "
+                f"onclick=\"document.getElementById('rk').value='{kw}'\">{kw}</button>")
+    recurring_html = f'''
+      <div class="card span12">
+        <h3>Recurring News Lockout</h3>
+        <p class="muted">Set it once — KhomaAPI auto-pauses trading around these events <b>every</b> time they occur (every CPI, every FOMC, every PPI). No weekly setup, applied to all your accounts.</p>
+        <div style="margin:12px 0;">{_rules_list}</div>
+        <form method="post" action="/calendar/rule/add" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-top:6px;">
+          <div style="width:100%;">{_preset('CPI')}{_preset('FOMC')}{_preset('PPI')}{_preset('Non-Farm')}{_preset('Unemployment')}{_preset('Interest Rate')}</div>
+          <div style="flex:1;min-width:180px;margin:0;"><label>Event keyword</label><input id="rk" name="keyword" placeholder="e.g. CPI" required style="margin:6px 0 0;"></div>
+          <div style="width:120px;margin:0;"><label>Min before</label><input name="minutes_before" value="15" style="margin:6px 0 0;"></div>
+          <div style="width:120px;margin:0;"><label>Min after</label><input name="minutes_after" value="15" style="margin:6px 0 0;"></div>
+          <button style="margin:0;">Add rule</button>
+        </form>
+      </div>'''
+
     content = f'''
     <div class="header"><div><h2>Economic Calendar</h2><p>Major market-moving events. Choose a lockout length and block trading around red-folder news in one click — your accounts auto-pause during the window.</p></div></div>
     <div class="grid">
@@ -6179,6 +6273,7 @@ def economic_calendar_page(request: Request):
         <span class="muted" style="font-size:12px;margin-right:6px;">Currency:</span>{cur_buttons}
         <span class="muted" style="margin-left:auto;font-size:12px;">🔴 High · 🟠 Medium · 🟡 Low · times in ET</span>
       </div>
+      {recurring_html}
       {countdown}
       {rows_html}
     </div>
@@ -6288,6 +6383,55 @@ async def calendar_block_all(request: Request):
     con.commit()
     con.close()
     return RedirectResponse(f"/calendar?week={week}&impact=high&cur={cur}", status_code=302)
+
+
+@app.post("/calendar/rule/add")
+async def calendar_rule_add(request: Request):
+    """Add a recurring news-lockout rule (e.g. always block CPI)."""
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    kw = (form.get("keyword") or "").strip()[:60]
+
+    def _i(v, d):
+        try:
+            return max(0, min(720, int(float(v))))
+        except Exception:
+            return d
+    if kw:
+        con = db()
+        con.execute(
+            "INSERT INTO news_rules(user_id,account_id,keyword,minutes_before,minutes_after,enabled,created_at) "
+            "VALUES(?,?,?,?,?,1,?)",
+            (user["id"], None, kw, _i(form.get("minutes_before"), 15),
+             _i(form.get("minutes_after"), 15), datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        con.close()
+        try:
+            sync_recurring_news_locks()  # apply right away
+        except Exception:
+            pass
+    return RedirectResponse("/calendar", status_code=302)
+
+
+@app.post("/calendar/rule/{rid}/delete")
+def calendar_rule_delete(request: Request, rid: int):
+    user = require_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    con = db()
+    con.execute("DELETE FROM news_rules WHERE id=? AND user_id=?", (rid, user["id"]))
+    # Drop this user's auto windows; the re-sync rebuilds them from remaining rules.
+    con.execute("DELETE FROM news_windows WHERE user_id=? AND source='auto'", (user["id"],))
+    con.commit()
+    con.close()
+    try:
+        sync_recurring_news_locks()
+    except Exception:
+        pass
+    return RedirectResponse("/calendar", status_code=302)
 
 
 @app.get("/settings", response_class=HTMLResponse)
