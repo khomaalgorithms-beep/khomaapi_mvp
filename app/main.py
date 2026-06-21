@@ -7195,24 +7195,42 @@ def _track_payload():
         data = {"ok": False}
     else:
         ids = _public_track_account_ids(user)
-        stats = _track_stats(public_daily_map(ids))
+        daily = public_daily_map(ids)
+        stats = _track_stats(daily)
         live = public_live_snapshot(ids)
         et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
+        pf = stats["pf"]
         data = {
             "ok": True,
+            "name": PUBLIC_TRACK_NAME,
             "net": stats["net"], "net_disp": _money(stats["net"]),
             "today": live["today"] if live["today"] is not None else 0,
             "today_disp": (_money(live["today"]) if live["today"] is not None else "—"),
             "equity_disp": (_money(live["equity"]) if live["equity"] else "—"),
+            "win_rate": stats["win_rate"],
+            "pf_disp": ("∞" if pf == float("inf") else (f"{pf:.2f}" if pf is not None else "—")),
+            "best": list(stats["best"]) if stats["best"] else None,
+            "worst": list(stats["worst"]) if stats["worst"] else None,
+            "days": stats["days"], "green": stats["green"], "red": stats["red"],
+            "daily": daily,   # {YYYY-MM-DD: pnl} — for the calendar + equity curve
             "updated": et.strftime("%b %d, %Y · %I:%M:%S %p ET"),
         }
     _TRACK_LIVE_CACHE.update(ts=now, data=data)
     return data
 
 
+# Public, CORS-enabled so a SEPARATELY-HOSTED static marketing site can read it.
+_TRACK_CORS = {"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"}
+
+
 @app.get("/verified/live")
 def verified_live():
-    return JSONResponse(_track_payload(), headers={"Cache-Control": "no-store"})
+    return JSONResponse(_track_payload(), headers=_TRACK_CORS)
+
+
+@app.get("/verified/data")
+def verified_data():
+    return JSONResponse(_track_payload(), headers=_TRACK_CORS)
 
 
 @app.get("/verified", response_class=HTMLResponse)

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verified Trading Results</title>
+<meta name="description" content="Real, broker-verified trading results — pulled live from Tradovate, updated in real time.">
+<style>
+  /* ---- Standalone verified-results site. No dependency on the trading app
+         beyond a single public, read-only JSON feed. ---- */
+  :root{ --bg:#0b0f15; --card:#121823; --line:#1e2836; --muted:#8aa0b8; --txt:#e7edf5;
+         --green:#16d97e; --red:#ff5470; }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;-webkit-font-smoothing:antialiased;}
+  a{color:inherit;text-decoration:none;}
+  .wrap{max-width:1080px;margin:0 auto;padding:34px 20px 80px;}
+  .topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:26px;}
+  .brand{font-size:23px;font-weight:850;letter-spacing:-.6px;}
+  .vbadge{display:inline-flex;align-items:center;gap:6px;background:rgba(22,217,126,.12);color:var(--green);border:1px solid rgba(22,217,126,.32);padding:6px 12px;border-radius:999px;font-size:12px;font-weight:800;}
+  .live{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;margin-left:auto;}
+  .live .dot{width:8px;height:8px;border-radius:999px;background:var(--green);animation:pulse 1.6s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,217,126,.5);}70%{box-shadow:0 0 0 8px rgba(22,217,126,0);}100%{box-shadow:0 0 0 0 rgba(22,217,126,0);}}
+  .hero{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;margin-bottom:16px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;}
+  .k{color:var(--muted);font-size:13px;font-weight:650;}
+  .big{font-size:44px;font-weight:900;letter-spacing:-1.8px;margin-top:6px;}
+  .pos{color:var(--green);} .neg{color:var(--red);} .flat{color:var(--muted);}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:18px;}
+  .cards .v{font-size:22px;font-weight:850;margin-top:7px;letter-spacing:-.5px;}
+  .sec-h{font-size:13px;font-weight:800;color:#aeb9c6;text-transform:uppercase;letter-spacing:.09em;margin:0 0 14px;}
+  .eq-wrap{height:250px;width:100%;}
+  .tcal-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+  .tcal-month{font-weight:850;font-size:16px;}
+  .tcal-nav{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:10px;font-size:18px;cursor:pointer;user-select:none;}
+  .tcal-nav:hover{background:#18212e;}
+  .tcal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:7px;}
+  .tcal-h{color:#6c7c90;font-size:11px;font-weight:700;text-align:center;text-transform:uppercase;}
+  .tcal-c{min-height:66px;border:1px solid #1a2230;border-radius:12px;padding:7px 9px;background:#0e141d;}
+  .tcal-c.empty{background:transparent;border:none;}
+  .tcal-c.pos{background:rgba(22,217,126,.10);border-color:rgba(22,217,126,.28);}
+  .tcal-c.neg{background:rgba(255,84,112,.10);border-color:rgba(255,84,112,.28);}
+  .tcal-d{font-size:11px;color:var(--muted);}
+  .tcal-p{font-size:14px;font-weight:850;margin-top:9px;}
+  .tcal-c.pos .tcal-p{color:var(--green);} .tcal-c.neg .tcal-p{color:var(--red);}
+  .foot{color:#6c7c90;font-size:12px;text-align:center;margin-top:34px;line-height:1.7;}
+  .note{color:var(--muted);text-align:center;padding:40px;}
+  @media(max-width:760px){.hero{grid-template-columns:1fr;}.big{font-size:34px;}.tcal-c{min-height:52px;}.tcal-p{font-size:12px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <span class="brand" id="brand">Verified Trading Results</span>
+    <span class="vbadge">✓ VERIFIED · LIVE FROM TRADOVATE</span>
+    <span class="live"><span class="dot"></span>Updated <span id="upd">…</span></span>
+  </div>
+  <div id="content"><div class="note">Loading live results…</div></div>
+  <div class="foot">
+    Real brokerage results pulled directly from Tradovate via KhomaAPI — updated live every few seconds.<br>
+    Past performance is not indicative of future results. Trading futures involves substantial risk of loss.
+  </div>
+</div>
+
+<script>
+  // ---- The ONLY link to the platform: a public, read-only, cached JSON feed. ----
+  var API = "https://app.khomaapi.com/verified/data";
+
+  var viewMonth = null;   // 'YYYY-MM' currently shown on the calendar
+  var last = null;        // last payload
+
+  function money(v, dec){
+    if(v===null||v===undefined) return "—";
+    var n = Number(v);
+    return (n<0?"-$":"$") + Math.abs(n).toLocaleString("en-US",{minimumFractionDigits:dec,maximumFractionDigits:dec});
+  }
+  function cls(v){ return v>0?"pos":(v<0?"neg":"flat"); }
+
+  function equitySVG(daily){
+    var keys = Object.keys(daily).sort();
+    var vals=[], run=0;
+    for(var i=0;i<keys.length;i++){ run+=Number(daily[keys[i]]); vals.push(Math.round(run*100)/100); }
+    if(vals.length===0) vals=[0,0];
+    if(vals.length===1) vals=[0,vals[0]];
+    var w=920,h=250,pad=16, mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals), span=(mx-mn)||1;
+    var pts=[];
+    for(var j=0;j<vals.length;j++){
+      var x=pad+(w-2*pad)*(j/((vals.length-1)||1));
+      var y=h-pad-(h-2*pad)*((vals[j]-mn)/span);
+      pts.push((Math.round(x*10)/10)+","+(Math.round(y*10)/10));
+    }
+    var line=pts.join(" ");
+    var col = vals[vals.length-1]>=0 ? "#16d97e" : "#ff5470";
+    var area = pad+","+(h-pad)+" "+line+" "+(w-pad)+","+(h-pad);
+    return '<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" style="width:100%;height:100%;">'
+      + '<polygon points="'+area+'" fill="'+col+'" opacity="0.10"/>'
+      + '<polyline points="'+line+'" fill="none" stroke="'+col+'" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+  }
+
+  function calendarHTML(daily, ym){
+    var y=parseInt(ym.slice(0,4),10), m=parseInt(ym.slice(5,7),10);
+    var first=new Date(Date.UTC(y,m-1,1));
+    var offset=first.getUTCDay(); // Sun=0
+    var ndays=new Date(Date.UTC(y,m,0)).getUTCDate();
+    var heads=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(function(d){return "<div class='tcal-h'>"+d+"</div>";}).join("");
+    var cells=""; for(var o=0;o<offset;o++) cells+="<div class='tcal-c empty'></div>";
+    var monthTotal=0;
+    for(var day=1;day<=ndays;day++){
+      var key=y+"-"+String(m).padStart(2,"0")+"-"+String(day).padStart(2,"0");
+      if(daily[key]===undefined){ cells+="<div class='tcal-c'><div class='tcal-d'>"+day+"</div></div>"; }
+      else{
+        var v=Number(daily[key]); monthTotal+=v;
+        cells+="<div class='tcal-c "+cls(v)+"'><div class='tcal-d'>"+day+"</div><div class='tcal-p'>"+money(v,0)+"</div></div>";
+      }
+    }
+    var label=new Date(Date.UTC(y,m-1,1)).toLocaleString("en-US",{month:"long",year:"numeric",timeZone:"UTC"});
+    var mtCls = monthTotal>=0?"pos":"neg";
+    return "<div class='tcal-top'>"
+      + "<div class='tcal-nav' onclick='navMonth(-1)'>&lsaquo;</div>"
+      + "<div class='tcal-month'>"+label+" &middot; <span class='"+mtCls+"'>"+money(monthTotal,0)+"</span></div>"
+      + "<div class='tcal-nav' onclick='navMonth(1)'>&rsaquo;</div></div>"
+      + "<div class='tcal-grid'>"+heads+cells+"</div>";
+  }
+
+  function navMonth(delta){
+    if(!viewMonth) return;
+    var y=parseInt(viewMonth.slice(0,4),10), m=parseInt(viewMonth.slice(5,7),10)-1+delta;
+    var d=new Date(Date.UTC(y,m,1));
+    viewMonth=d.getUTCFullYear()+"-"+String(d.getUTCMonth()+1).padStart(2,"0");
+    if(last) render(last);
+  }
+
+  function render(d){
+    document.getElementById("brand").textContent = d.name || "Verified Trading Results";
+    document.title = d.name || "Verified Trading Results";
+    document.getElementById("upd").textContent = d.updated || "";
+    var daily = d.daily || {};
+    var hasData = Object.keys(daily).length>0 || (d.today!==0 && d.today!==null);
+    if(!hasData){
+      document.getElementById("content").innerHTML =
+        "<div class='note'>📈 Live results begin accumulating as trades are taken. This page updates in real time — check back soon.</div>";
+      return;
+    }
+    if(!viewMonth){
+      var keys=Object.keys(daily).sort();
+      viewMonth = keys.length ? keys[keys.length-1].slice(0,7)
+                              : (d.updated, new Date().toISOString().slice(0,7));
+    }
+    var best=d.best?(d.best[0]+" · "+money(d.best[1],0)):"—";
+    var worst=d.worst?(d.worst[0]+" · "+money(d.worst[1],0)):"—";
+    document.getElementById("content").innerHTML =
+      '<div class="hero">'
+      + '<div class="card"><div class="k">Total Verified Net P&L</div>'
+      +   '<div class="big '+cls(d.net)+'">'+d.net_disp+'</div>'
+      +   '<div class="k">'+d.days+' trading days · '+d.green+'G / '+d.red+'R</div></div>'
+      + '<div class="card"><div class="k">Today (live)</div>'
+      +   '<div class="big '+cls(d.today)+'">'+d.today_disp+'</div>'
+      +   '<div class="k">Account equity: '+d.equity_disp+'</div></div>'
+      + '</div>'
+      + '<div class="cards">'
+      +   '<div class="card"><div class="k">Win Rate (days)</div><div class="v">'+d.win_rate+'%</div></div>'
+      +   '<div class="card"><div class="k">Profit Factor</div><div class="v">'+d.pf_disp+'</div></div>'
+      +   '<div class="card"><div class="k">Best Day</div><div class="v pos">'+best+'</div></div>'
+      +   '<div class="card"><div class="k">Worst Day</div><div class="v neg">'+worst+'</div></div>'
+      + '</div>'
+      + '<div class="card" style="margin-bottom:16px;"><div class="sec-h">Equity Curve</div><div class="eq-wrap">'+equitySVG(daily)+'</div></div>'
+      + '<div class="card"><div class="sec-h">Daily P&L Calendar</div>'+calendarHTML(daily, viewMonth)+'</div>';
+  }
+
+  async function tick(){
+    try{
+      var r = await fetch(API, {cache:"no-store"});
+      var d = await r.json();
+      if(d && d.ok){ last=d; render(d); }
+    }catch(e){}
+  }
+  tick();
+  setInterval(tick, 3000);
+</script>
+</body>
+</html>
