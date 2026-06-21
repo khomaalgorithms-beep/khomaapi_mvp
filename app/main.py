@@ -601,6 +601,22 @@ def init_db():
     )
     """)
 
+    # Permanent per-trade log: each CLOSED round-trip saved once (dedup by
+    # trip_key) so the verified page keeps a forever trade-by-trade record,
+    # independent of Tradovate's limited fill history.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        account_id INTEGER,
+        trip_key TEXT NOT NULL,
+        side TEXT, symbol TEXT, qty INTEGER,
+        entry_price REAL, exit_price REAL, pnl REAL,
+        opened_at TEXT, closed_at TEXT, created_at TEXT,
+        UNIQUE(user_id, trip_key)
+    )
+    """)
+
     # --- Additive column migrations (safe on existing DBs) ---
     def ensure_column(table, column, decl):
         try:
@@ -2520,6 +2536,7 @@ async def digest_loop():
                 await loop.run_in_executor(None, whop_reverify_tick)
                 await loop.run_in_executor(None, _prewarm_calendar)
                 await loop.run_in_executor(None, sync_recurring_news_locks)
+                await loop.run_in_executor(None, persist_track_trades)
         except Exception as e:
             print("DIGEST ERROR:", e)
         await asyncio.sleep(600)
@@ -7117,6 +7134,64 @@ def public_live_snapshot(account_ids):
     return {"today": round(today, 2) if have else None, "equity": round(equity, 2) if equity else None}
 
 
+def persist_track_trades():
+    """Permanently log each CLOSED trade from the public-track account(s). Runs in
+    the leader loop so every trade taken on the connected account is recorded
+    forever — that's what feeds the live 'Verified via Tradovate' section."""
+    try:
+        user = _public_track_user()
+        if not user:
+            return
+        for aid in _public_track_account_ids(user):
+            try:
+                trips, _o = account_trade_history(user["id"], only_account_id=aid)
+            except Exception:
+                continue
+            if not trips:
+                continue
+            con = db()
+            now = datetime.now(timezone.utc).isoformat()
+            for t in trips:
+                if not t.get("closed_at"):
+                    continue
+                con.execute(
+                    "INSERT INTO trade_log(user_id,account_id,trip_key,side,symbol,qty,entry_price,"
+                    "exit_price,pnl,opened_at,closed_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id,trip_key) DO NOTHING",
+                    (user["id"], aid, trip_key(t), t.get("side"), t.get("symbol"), t.get("qty"),
+                     t.get("entry_price"), t.get("exit_price"), t.get("pnl"),
+                     t.get("opened_at"), t.get("closed_at"), now),
+                )
+            con.commit()
+            con.close()
+    except Exception as e:
+        print("persist_track_trades error:", e)
+
+
+def _track_live_trades(account_ids):
+    if not account_ids:
+        return []
+    ph = ",".join("?" for _ in account_ids)
+    con = db()
+    rows = con.execute(
+        f"SELECT side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
+        f"WHERE account_id IN ({ph}) ORDER BY closed_at", tuple(account_ids)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _trade_stats(trades):
+    pnls = [float(t.get("pnl") or 0) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    gl = -sum(losses)
+    pf = round(sum(wins) / gl, 2) if gl > 0 else (None if not wins else float("inf"))
+    n = len(pnls)
+    return {"net": round(sum(pnls), 2), "trades": n, "wins": len(wins), "losses": len(losses),
+            "win_rate": round(len(wins) / n * 100, 1) if n else 0.0,
+            "pf_disp": ("∞" if pf == float("inf") else (f"{pf:.2f}" if pf is not None else "—"))}
+
+
 def _track_stats(daily):
     days = sorted(daily.items())
     vals = [v for _, v in days]
@@ -7198,6 +7273,8 @@ def _track_payload():
         daily = public_daily_map(ids)
         stats = _track_stats(daily)
         live = public_live_snapshot(ids)
+        trades = _track_live_trades(ids)          # permanent per-trade log
+        ts = _trade_stats(trades)
         et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
         pf = stats["pf"]
         data = {
@@ -7212,7 +7289,14 @@ def _track_payload():
             "best": list(stats["best"]) if stats["best"] else None,
             "worst": list(stats["worst"]) if stats["worst"] else None,
             "days": stats["days"], "green": stats["green"], "red": stats["red"],
-            "daily": daily,   # {YYYY-MM-DD: pnl} — for the calendar + equity curve
+            "daily": daily,   # {YYYY-MM-DD: pnl} — live, for the calendar
+            # Live trade-by-trade log + trade-based stats for the "Verified" section.
+            "trades": [{"side": t.get("side"), "date": str(t.get("closed_at") or "")[:10],
+                        "entry": t.get("entry_price"), "exit": t.get("exit_price"),
+                        "qty": t.get("qty"), "pnl": t.get("pnl")} for t in trades],
+            "trade_net_disp": _money(ts["net"]), "trade_count": ts["trades"],
+            "trade_win_rate": ts["win_rate"], "trade_pf_disp": ts["pf_disp"],
+            "trade_wins": ts["wins"], "trade_losses": ts["losses"],
             "updated": et.strftime("%b %d, %Y · %I:%M:%S %p ET"),
         }
     _TRACK_LIVE_CACHE.update(ts=now, data=data)
