@@ -7093,7 +7093,9 @@ def _public_track_user():
     return row
 
 
-def _public_track_account_ids(user):
+def _public_connected_ids(user):
+    """Accounts to LOG from: the pinned list if set, else every account currently
+    connected to this user's KhomaAPI dashboard ('any connected account')."""
     if PUBLIC_TRACK_ACCOUNT_IDS:
         out = []
         for x in PUBLIC_TRACK_ACCOUNT_IDS:
@@ -7103,6 +7105,26 @@ def _public_track_account_ids(user):
                 pass
         return out
     return [a["id"] for a in get_broker_accounts(user["id"], connected_only=True)]
+
+
+def _public_track_account_ids(user):
+    """Accounts to DISPLAY: connected accounts PLUS any account that already has
+    logged history — so the track record keeps showing past trades even after an
+    account disconnects. (A pinned list overrides everything.)"""
+    if PUBLIC_TRACK_ACCOUNT_IDS:
+        return _public_connected_ids(user)
+    ids = set(_public_connected_ids(user))
+    con = db()
+    for tbl in ("daily_equity", "trade_log"):
+        try:
+            for r in con.execute(f"SELECT DISTINCT account_id FROM {tbl} WHERE user_id=?",
+                                 (user["id"],)).fetchall():
+                if r["account_id"] is not None:
+                    ids.add(r["account_id"])
+        except Exception:
+            pass
+    con.close()
+    return sorted(ids)
 
 
 def public_daily_map(account_ids):
@@ -7142,7 +7164,7 @@ def persist_track_trades():
         user = _public_track_user()
         if not user:
             return
-        for aid in _public_track_account_ids(user):
+        for aid in _public_connected_ids(user):   # log from any connected account
             try:
                 trips, _o = account_trade_history(user["id"], only_account_id=aid)
             except Exception:

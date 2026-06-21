@@ -35,7 +35,7 @@ def test_trade_stats_math():
 def test_persist_track_trades_dedup(monkeypatch):
     uid = _user()
     monkeypatch.setattr(appmod, "_public_track_user", lambda: {"id": uid})
-    monkeypatch.setattr(appmod, "_public_track_account_ids", lambda u: [777])
+    monkeypatch.setattr(appmod, "_public_connected_ids", lambda u: [777])
     trips = [
         {"account": "A", "symbol": "MNQ", "side": "Long", "qty": 2, "entry_price": 100,
          "exit_price": 110, "pnl": 20, "opened_at": "2026-06-01T10:00", "closed_at": "2026-06-01T10:30"},
