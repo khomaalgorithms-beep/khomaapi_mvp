@@ -130,6 +130,13 @@ TRUSTED_ORIGIN_HOSTS |= {
 WHOP_API_KEY = os.getenv("WHOP_API_KEY", "").strip()
 WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "").strip()
 
+# Public verified-results page: whose performance to publish, which account(s),
+# and the display name. PUBLIC_TRACK_ACCOUNT_IDS (CSV of broker_accounts.id)
+# scopes it to specific real accounts; empty = all of that user's accounts.
+PUBLIC_TRACK_EMAIL = os.getenv("PUBLIC_TRACK_EMAIL", "khomadima89@gmail.com").strip().lower()
+PUBLIC_TRACK_NAME = os.getenv("PUBLIC_TRACK_NAME", "KhomaAPI — Verified Results").strip()
+PUBLIC_TRACK_ACCOUNT_IDS = [s.strip() for s in os.getenv("PUBLIC_TRACK_ACCOUNT_IDS", "").split(",") if s.strip()]
+
 
 def google_login_button() -> str:
     """Render the Google sign-in button ONLY when Google OAuth is configured,
@@ -1147,7 +1154,7 @@ _PUBLIC_PREFIXES = (
     "/static", "/uploads", "/auth/google", "/verify-email",
     "/confirm-email-change", "/verify-email-change", "/confirm-password-change",
     "/forgot-password", "/reset-password", "/oauth/callback", "/webhook",
-    "/whop",
+    "/whop", "/verified",
 )
 # Diagnostic endpoints that must 404 in production (DEBUG_ENDPOINTS off).
 _DEBUG_PATHS = ("/debug", "/test", "/debug-static", "/create-broker-table", "/oauth-test")
@@ -7001,6 +7008,288 @@ def subscribe_page(request: Request):
     elif up:
         banner = "Upgrade your plan to unlock this feature."
     return HTMLResponse(plans_html(banner))
+
+
+# ============================================================
+# PUBLIC VERIFIED-RESULTS PAGE (live, read-only, no login)
+# ============================================================
+
+_TRACK_CSS = """
+*{box-sizing:border-box;}
+body{margin:0;background:#0b0f15;color:#e7edf5;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;}
+a{color:inherit;text-decoration:none;}
+.wrap{max-width:1080px;margin:0 auto;padding:30px 20px 70px;}
+.topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:24px;}
+.brand{font-size:22px;font-weight:850;letter-spacing:-.6px;}
+.vbadge{display:inline-flex;align-items:center;gap:6px;background:rgba(22,217,126,.12);color:#16d97e;border:1px solid rgba(22,217,126,.32);padding:6px 11px;border-radius:999px;font-size:12px;font-weight:800;}
+.live{display:inline-flex;align-items:center;gap:7px;color:#8aa0b8;font-size:12px;margin-left:auto;}
+.live .dot{width:8px;height:8px;border-radius:999px;background:#16d97e;animation:pulse 1.6s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,217,126,.5);}70%{box-shadow:0 0 0 8px rgba(22,217,126,0);}100%{box-shadow:0 0 0 0 rgba(22,217,126,0);}}
+.hero{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;margin-bottom:16px;}
+.card{background:#121823;border:1px solid #1e2836;border-radius:18px;padding:22px;}
+.k{color:#8aa0b8;font-size:13px;font-weight:650;}
+.big{font-size:42px;font-weight:900;letter-spacing:-1.6px;margin-top:6px;}
+.pos{color:#16d97e;} .neg{color:#ff5470;} .flat{color:#8aa0b8;}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:18px;}
+.cards .v{font-size:22px;font-weight:850;margin-top:7px;letter-spacing:-.5px;}
+.sec-h{font-size:13px;font-weight:800;color:#aeb9c6;text-transform:uppercase;letter-spacing:.09em;margin:0 0 14px;}
+.eq-wrap{height:250px;width:100%;}
+.tcal-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+.tcal-month{font-weight:850;font-size:16px;}
+.tcal-nav{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #1e2836;border-radius:10px;font-size:18px;}
+.tcal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:7px;}
+.tcal-h{color:#6c7c90;font-size:11px;font-weight:700;text-align:center;text-transform:uppercase;}
+.tcal-c{min-height:66px;border:1px solid #1a2230;border-radius:12px;padding:7px 9px;background:#0e141d;}
+.tcal-c.empty{background:transparent;border:none;}
+.tcal-c.pos{background:rgba(22,217,126,.10);border-color:rgba(22,217,126,.28);}
+.tcal-c.neg{background:rgba(255,84,112,.10);border-color:rgba(255,84,112,.28);}
+.tcal-d{font-size:11px;color:#8aa0b8;}
+.tcal-p{font-size:14px;font-weight:850;margin-top:9px;}
+.tcal-c.pos .tcal-p{color:#16d97e;} .tcal-c.neg .tcal-p{color:#ff5470;}
+.foot{color:#6c7c90;font-size:12px;text-align:center;margin-top:32px;line-height:1.7;}
+.empty-note{color:#8aa0b8;text-align:center;padding:36px;}
+@media(max-width:760px){.hero{grid-template-columns:1fr;}.big{font-size:34px;}.tcal-c{min-height:54px;}.tcal-p{font-size:12px;}}
+"""
+
+_TRACK_JS = """
+async function tick(){
+  try{
+    const r = await fetch('/verified/live', {cache:'no-store'});
+    const d = await r.json();
+    if(!d.ok) return;
+    var net=document.getElementById('net');
+    if(net){ net.textContent=d.net_disp; net.className='big '+(d.net>=0?'pos':'neg'); }
+    var today=document.getElementById('today');
+    if(today){ today.textContent=d.today_disp; today.className='big '+(d.today>0?'pos':(d.today<0?'neg':'flat')); }
+    var eq=document.getElementById('equity'); if(eq) eq.textContent=d.equity_disp;
+    var up=document.getElementById('upd'); if(up) up.textContent=d.updated;
+  }catch(e){}
+}
+tick(); setInterval(tick, 3000);
+"""
+
+
+def _public_track_user():
+    con = db()
+    row = con.execute("SELECT * FROM users WHERE email=?", (PUBLIC_TRACK_EMAIL,)).fetchone()
+    con.close()
+    return row
+
+
+def _public_track_account_ids(user):
+    if PUBLIC_TRACK_ACCOUNT_IDS:
+        out = []
+        for x in PUBLIC_TRACK_ACCOUNT_IDS:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+    return [a["id"] for a in get_broker_accounts(user["id"], connected_only=True)]
+
+
+def public_daily_map(account_ids):
+    """{ 'YYYY-MM-DD': summed day_pnl } across the chosen accounts (persisted)."""
+    if not account_ids:
+        return {}
+    ph = ",".join("?" for _ in account_ids)
+    con = db()
+    rows = con.execute(
+        f"SELECT trade_date, SUM(day_pnl) AS p FROM daily_equity WHERE account_id IN ({ph}) GROUP BY trade_date",
+        tuple(account_ids),
+    ).fetchall()
+    con.close()
+    return {r["trade_date"]: (r["p"] or 0) for r in rows}
+
+
+def public_live_snapshot(account_ids):
+    """Live today-PnL + equity summed from the warm poller cache (~1s fresh)."""
+    today, equity, have = 0.0, 0.0, False
+    for aid in account_ids:
+        c = ACCOUNT_STATE_CACHE.get(int(aid))
+        if not c:
+            continue
+        st = c[0]
+        if st.get("day_pnl") is not None:
+            today += st["day_pnl"]; have = True
+        if st.get("equity") is not None:
+            equity += st["equity"]
+    return {"today": round(today, 2) if have else None, "equity": round(equity, 2) if equity else None}
+
+
+def _track_stats(daily):
+    days = sorted(daily.items())
+    vals = [v for _, v in days]
+    net = round(sum(vals), 2)
+    green = sum(1 for v in vals if v > 0)
+    red = sum(1 for v in vals if v < 0)
+    gw = sum(v for v in vals if v > 0)
+    gl = -sum(v for v in vals if v < 0)
+    pf = round(gw / gl, 2) if gl > 0 else (None if gw == 0 else float("inf"))
+    wr = round(green / (green + red) * 100, 1) if (green + red) else 0.0
+    return {"net": net, "green": green, "red": red, "days": len(vals), "win_rate": wr,
+            "pf": pf, "best": (max(days, key=lambda x: x[1]) if days else None),
+            "worst": (min(days, key=lambda x: x[1]) if days else None)}
+
+
+def _track_equity_svg(values):
+    if not values:
+        values = [0, 0]
+    if len(values) == 1:
+        values = [0, values[0]]
+    w, h, pad = 920, 250, 16
+    mn, mx = min(values), max(values)
+    span = (mx - mn) or 1
+    n = len(values)
+    pts = []
+    for i, v in enumerate(values):
+        x = pad + (w - 2 * pad) * (i / ((n - 1) or 1))
+        y = h - pad - (h - 2 * pad) * ((v - mn) / span)
+        pts.append((round(x, 1), round(y, 1)))
+    line = " ".join(f"{x},{y}" for x, y in pts)
+    area = f"{pad},{h-pad} " + line + f" {w-pad},{h-pad}"
+    col = "#16d97e" if values[-1] >= 0 else "#ff5470"
+    return (f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" style="width:100%;height:100%;">'
+            f'<polygon points="{area}" fill="{col}" opacity="0.10"/>'
+            f'<polyline points="{line}" fill="none" stroke="{col}" stroke-width="2.5" '
+            f'stroke-linejoin="round" stroke-linecap="round"/></svg>')
+
+
+def _track_calendar_html(daily, y, m):
+    import calendar as _calmod
+    _wd, ndays = _calmod.monthrange(y, m)
+    offset = (date(y, m, 1).weekday() + 1) % 7  # Sunday-first grid
+    heads = "".join(f"<div class='tcal-h'>{d}</div>" for d in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])
+    cells = ["<div class='tcal-c empty'></div>"] * offset
+    month_total = 0.0
+    for day in range(1, ndays + 1):
+        key = f"{y:04d}-{m:02d}-{day:02d}"
+        v = daily.get(key)
+        if v is None:
+            cells.append(f"<div class='tcal-c'><div class='tcal-d'>{day}</div></div>")
+        else:
+            month_total += v
+            cls = "pos" if v > 0 else ("neg" if v < 0 else "flat")
+            cells.append(f"<div class='tcal-c {cls}'><div class='tcal-d'>{day}</div>"
+                         f"<div class='tcal-p'>{_money(v, 0)}</div></div>")
+    label = date(y, m, 1).strftime("%B %Y")
+    prev = (date(y, m, 1) - timedelta(days=1)).strftime("%Y-%m")
+    nxt = (date(y, m, 28) + timedelta(days=7)).strftime("%Y-%m")
+    mt_cls = "pos" if month_total >= 0 else "neg"
+    return (f"<div class='tcal-top'><a class='tcal-nav' href='/verified?month={prev}'>&lsaquo;</a>"
+            f"<div class='tcal-month'>{label} &middot; <span class='{mt_cls}'>{_money(month_total, 0)}</span></div>"
+            f"<a class='tcal-nav' href='/verified?month={nxt}'>&rsaquo;</a></div>"
+            f"<div class='tcal-grid'>{heads}{''.join(cells)}</div>")
+
+
+_TRACK_LIVE_CACHE = {"ts": 0.0, "data": None}
+
+
+def _track_payload():
+    """Cached (~2s) live payload so many public viewers don't hammer the DB."""
+    now = time.time()
+    if _TRACK_LIVE_CACHE["data"] and (now - _TRACK_LIVE_CACHE["ts"]) < 2:
+        return _TRACK_LIVE_CACHE["data"]
+    user = _public_track_user()
+    if not user:
+        data = {"ok": False}
+    else:
+        ids = _public_track_account_ids(user)
+        stats = _track_stats(public_daily_map(ids))
+        live = public_live_snapshot(ids)
+        et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
+        data = {
+            "ok": True,
+            "net": stats["net"], "net_disp": _money(stats["net"]),
+            "today": live["today"] if live["today"] is not None else 0,
+            "today_disp": (_money(live["today"]) if live["today"] is not None else "—"),
+            "equity_disp": (_money(live["equity"]) if live["equity"] else "—"),
+            "updated": et.strftime("%b %d, %Y · %I:%M:%S %p ET"),
+        }
+    _TRACK_LIVE_CACHE.update(ts=now, data=data)
+    return data
+
+
+@app.get("/verified/live")
+def verified_live():
+    return JSONResponse(_track_payload(), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/verified", response_class=HTMLResponse)
+@app.get("/results", response_class=HTMLResponse)
+def verified_page(request: Request):
+    user = _public_track_user()
+    name = PUBLIC_TRACK_NAME
+    if not user:
+        body = "<div class='empty-note'>Results are being set up. Check back shortly.</div>"
+        return HTMLResponse(_verified_shell(name, body), headers={"Cache-Control": "no-store"})
+
+    ids = _public_track_account_ids(user)
+    daily = public_daily_map(ids)
+    stats = _track_stats(daily)
+    live = public_live_snapshot(ids)
+
+    # Calendar month: ?month=YYYY-MM, else latest data month, else current ET.
+    mq = request.query_params.get("month", "")
+    if re.match(r"^\d{4}-\d{2}$", mq or ""):
+        cy, cm = int(mq[:4]), int(mq[5:7])
+    elif daily:
+        latest = max(daily.keys())
+        cy, cm = int(latest[:4]), int(latest[5:7])
+    else:
+        nowet = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
+        cy, cm = nowet.year, nowet.month
+
+    eq, run = [], 0.0
+    for d in sorted(daily.keys()):
+        run += daily[d]
+        eq.append(round(run, 2))
+
+    net_disp = _money(stats["net"])
+    today_disp = _money(live["today"]) if live["today"] is not None else "—"
+    equity_disp = _money(live["equity"]) if live["equity"] else "—"
+    pf_disp = "∞" if stats["pf"] == float("inf") else (f"{stats['pf']:.2f}" if stats["pf"] is not None else "—")
+    best_disp = (f"{stats['best'][0]} · {_money(stats['best'][1], 0)}" if stats["best"] else "—")
+    worst_disp = (f"{stats['worst'][0]} · {_money(stats['worst'][1], 0)}" if stats["worst"] else "—")
+
+    if not daily and live["today"] is None:
+        inner = "<div class='empty-note'>📈 Live results begin accumulating as trades are taken. Check back soon — this page updates in real time.</div>"
+    else:
+        inner = f"""
+      <div class="hero">
+        <div class="card"><div class="k">Total Verified Net P&amp;L</div>
+          <div id="net" class="big {('pos' if stats['net']>=0 else 'neg')}">{net_disp}</div>
+          <div class="k">{stats['days']} trading days · {stats['green']}G / {stats['red']}R</div></div>
+        <div class="card"><div class="k">Today (live)</div>
+          <div id="today" class="big {('pos' if (live['today'] or 0)>0 else ('neg' if (live['today'] or 0)<0 else 'flat'))}">{today_disp}</div>
+          <div class="k">Account equity: <span id="equity">{equity_disp}</span></div></div>
+      </div>
+      <div class="cards">
+        <div class="card"><div class="k">Win Rate (days)</div><div class="v">{stats['win_rate']}%</div></div>
+        <div class="card"><div class="k">Profit Factor</div><div class="v">{pf_disp}</div></div>
+        <div class="card"><div class="k">Best Day</div><div class="v pos">{best_disp}</div></div>
+        <div class="card"><div class="k">Worst Day</div><div class="v neg">{worst_disp}</div></div>
+      </div>
+      <div class="card" style="margin-bottom:16px;"><div class="sec-h">Equity Curve</div>
+        <div class="eq-wrap">{_track_equity_svg(eq)}</div></div>
+      <div class="card"><div class="sec-h">Daily P&amp;L Calendar</div>{_track_calendar_html(daily, cy, cm)}</div>
+        """
+    return HTMLResponse(_verified_shell(name, inner), headers={"Cache-Control": "no-store"})
+
+
+def _verified_shell(name, inner):
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{name}</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>{_TRACK_CSS}</style></head><body><div class="wrap">
+  <div class="topbar">
+    <span class="brand">{name}</span>
+    <span class="vbadge">✓ VERIFIED · LIVE FROM TRADOVATE</span>
+    <span class="live"><span class="dot"></span>Updated <span id="upd">just now</span></span>
+  </div>
+  {inner}
+  <div class="foot">Real brokerage results pulled directly from Tradovate via KhomaAPI — updated live every few seconds.<br>
+  Past performance is not indicative of future results. Trading futures involves substantial risk.</div>
+</div><script>{_TRACK_JS}</script></body></html>"""
 
 
 @app.get("/health")
