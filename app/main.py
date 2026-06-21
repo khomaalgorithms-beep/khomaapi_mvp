@@ -1163,7 +1163,7 @@ def whop_membership_for_email(email):
 # individual routes.
 _PUBLIC_PATHS = {
     "/", "/login", "/signup", "/logout", "/health", "/status", "/api/status",
-    "/subscribe", "/upgrade", "/test", "/debug-static",
+    "/subscribe", "/upgrade", "/test", "/debug-static", "/results",
     "/favicon.ico", "/favicon.png",
 }
 _PUBLIC_PREFIXES = (
@@ -7339,8 +7339,19 @@ def verified_data():
     return JSONResponse(_track_payload(), headers=_TRACK_CORS)
 
 
-@app.get("/verified", response_class=HTMLResponse)
 @app.get("/results", response_class=HTMLResponse)
+def public_results_page():
+    """Public marketing results page — serves the standalone verified-site file
+    (documented backtest + live 'Verified via Tradovate' section). Read-only,
+    cached; no auth, no effect on trading."""
+    try:
+        html = (BASE_DIR / "verified_site" / "index.html").read_text(encoding="utf-8")
+    except Exception:
+        html = "<!DOCTYPE html><h1 style='font-family:sans-serif'>Results are being set up — check back shortly.</h1>"
+    return HTMLResponse(html, headers={"Cache-Control": "public, max-age=60"})
+
+
+@app.get("/verified", response_class=HTMLResponse)
 def verified_page(request: Request):
     user = _public_track_user()
     name = PUBLIC_TRACK_NAME
