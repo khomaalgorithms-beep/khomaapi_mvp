@@ -89,9 +89,25 @@ def debug_static():
 DB_PATH = Path(os.getenv("KHOMA_DB_PATH", str(BASE_DIR / "khomaapi_v31.db")))
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
 
-if not KEY_PATH.exists():
-    KEY_PATH.write_text(Fernet.generate_key().decode(), encoding="utf-8")
-FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
+# CRITICAL: the encryption key MUST be stable across deploys/restarts, or every
+# stored broker token becomes undecryptable and every client is forced to
+# reconnect. On Railway the container filesystem is ephemeral, so a file-based key
+# silently rotates on each restart. Pin it to the KHOMA_ENC_KEY env var (persistent
+# config) as the source of truth; fall back to the on-disk key only for local dev.
+def _load_fernet():
+    env_key = (os.getenv("KHOMA_ENC_KEY") or "").strip()
+    if env_key:
+        try:
+            return Fernet(env_key.encode()), "env"
+        except Exception as e:
+            print(f"KHOMA_ENC_KEY is set but invalid ({e}); falling back to key file")
+    if not KEY_PATH.exists():
+        KEY_PATH.write_text(Fernet.generate_key().decode(), encoding="utf-8")
+    return Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode()), "file"
+
+
+FERNET, _FERNET_SOURCE = _load_fernet()
+print(f"FERNET key source: {_FERNET_SOURCE}")
 
 # Maps a short-lived OAuth `state` value -> user_id, so the Tradovate
 # callback can be tied back to the user who started the connect flow.
@@ -214,7 +230,16 @@ def enc(value: str) -> str:
 
 
 def dec(value: Optional[str]) -> str:
-    return FERNET.decrypt(value.encode()).decode() if value else ""
+    # A token encrypted with a different/rotated key raises Fernet's InvalidToken,
+    # whose message is BLANK — which previously surfaced as an empty 'REJECTED' with
+    # no reason. Treat any decrypt failure as "no usable token" so the caller cleanly
+    # asks the user to reconnect instead of throwing an unexplained error.
+    if not value:
+        return ""
+    try:
+        return FERNET.decrypt(value.encode()).decode()
+    except Exception:
+        return ""
 
 
 def hash_password(password: str) -> str:
