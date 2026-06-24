@@ -2278,7 +2278,8 @@ def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None,
     for ONE user — the authoritative realized-P&L source (same data the public
     results page uses), so the journal calendar matches the trade history instead of
     relying on the unreliable daily_equity equity snapshots. ET dates, inclusive."""
-    q = "SELECT pnl, closed_at FROM trade_log WHERE user_id=?"
+    q = ("SELECT account_id, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
+         "FROM trade_log WHERE user_id=?")
     params = [user_id]
     if only_account_id not in (None, "", "all"):
         try:
@@ -2289,8 +2290,13 @@ def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None,
     con = db()
     rows = con.execute(q, tuple(params)).fetchall()
     con.close()
-    out = {}
+    out, seen = {}, set()
     for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
         day = _et_day(r["closed_at"])
         if not day:
             continue
@@ -7440,6 +7446,26 @@ def _track_live_trades(account_ids):
     return out
 
 
+def _track_user_trades(user_id):
+    """All closed round-trips for the public-track USER (every account they've ever
+    owned), keyed by user_id — so the verified record survives reconnects that change
+    the volatile broker_accounts.id (account 44 -> 55 -> ...). Intrinsic-deduped."""
+    con = db()
+    rows = con.execute(
+        "SELECT account_id,side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
+        "WHERE user_id=? ORDER BY closed_at", (user_id,)).fetchall()
+    con.close()
+    out, seen = [], set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(dict(r))
+    return out
+
+
 def _trade_stats(trades):
     pnls = [float(t.get("pnl") or 0) for t in trades]
     wins = [p for p in pnls if p > 0]
@@ -7529,11 +7555,14 @@ def _track_payload():
     if not user:
         data = {"ok": False}
     else:
-        ids = _public_track_account_ids(user)
-        daily = public_daily_map(ids)
+        # Scope the verified record to the track USER (their email), not a volatile
+        # broker_accounts.id — so it survives every reconnect (account 44 -> 55 -> ...)
+        # and always reflects exactly this one KhomaAPI account's real trades.
+        uid = user["id"]
+        daily = ledger_daily_map(uid)
         stats = _track_stats(daily)
-        live = public_live_snapshot(ids)
-        trades = _track_live_trades(ids)          # permanent per-trade log
+        live = public_live_snapshot(_public_connected_ids(user))   # today's intraday, connected accts
+        trades = _track_user_trades(uid)          # permanent per-trade log, all of the user's accounts
         ts = _trade_stats(trades)
         et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
         pf = stats["pf"]
@@ -7597,10 +7626,10 @@ def verified_page(request: Request):
         body = "<div class='empty-note'>Results are being set up. Check back shortly.</div>"
         return HTMLResponse(_verified_shell(name, body), headers={"Cache-Control": "no-store"})
 
-    ids = _public_track_account_ids(user)
-    daily = public_daily_map(ids)
+    # Scope to the track USER (email), not a volatile broker_accounts.id — survives reconnects.
+    daily = ledger_daily_map(user["id"])
     stats = _track_stats(daily)
-    live = public_live_snapshot(ids)
+    live = public_live_snapshot(_public_connected_ids(user))
 
     # Calendar month: ?month=YYYY-MM, else latest data month, else current ET.
     mq = request.query_params.get("month", "")
