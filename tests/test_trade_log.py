@@ -26,6 +26,27 @@ def _user():
     return uid
 
 
+def test_ledger_persist_and_merge_unions_history():
+    # The fix: realized P&L survives Tradovate's short fill window because every
+    # trip is persisted and account_trade_history returns ledger ∪ live fills.
+    uid = _user()
+    old = {"account": "A", "_account_id": 44, "symbol": "MNQ", "side": "long", "qty": 2,
+           "entry_price": 100, "exit_price": 90, "pnl": -40.0,
+           "opened_at": "2026-06-01T10:00:00Z", "closed_at": "2026-06-01T10:30:00Z"}
+    appmod._ledger_persist_trips(uid, [old])
+    appmod._ledger_persist_trips(uid, [old])          # idempotent
+    # A fresh fill Tradovate still returns today:
+    new = {"account": "A", "_account_id": 44, "symbol": "MNQ", "side": "short", "qty": 2,
+           "entry_price": 120, "exit_price": 110, "pnl": 40.0,
+           "opened_at": "2026-06-24T10:00:00Z", "closed_at": "2026-06-24T10:30:00Z"}
+    merged = appmod._ledger_merge(uid, [new])
+    assert len(merged) == 2                            # old (ledger) + new (live), no dupes
+    assert round(sum(t["pnl"] for t in merged), 2) == 0.0
+    # Account scoping holds.
+    assert len(appmod._ledger_merge(uid, [], only_account_id=44)) == 1
+    assert len(appmod._ledger_merge(uid, [], only_account_id=999)) == 0
+
+
 def test_trade_stats_math():
     s = appmod._trade_stats([{"pnl": 100}, {"pnl": -40}, {"pnl": 60}])
     assert s["net"] == 120 and s["trades"] == 3 and s["wins"] == 2 and s["losses"] == 1

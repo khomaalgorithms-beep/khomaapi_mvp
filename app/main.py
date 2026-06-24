@@ -609,6 +609,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         account_id INTEGER,
+        account_name TEXT,
         trip_key TEXT NOT NULL,
         side TEXT, symbol TEXT, qty INTEGER,
         entry_price REAL, exit_price REAL, pnl REAL,
@@ -704,6 +705,7 @@ def init_db():
     ensure_column("account_risk_config", "consistency_pct", "REAL")
     # 'manual' (one-click block) vs 'auto' (materialized from a recurring rule).
     ensure_column("news_windows", "source", "TEXT DEFAULT 'manual'")
+    ensure_column("trade_log", "account_name", "TEXT")
     # Accounts that were defaulted to 'evaluation' but have no prop goal set are
     # really standard accounts -> stop the misleading EVALUATION badge.
     cur.execute("""UPDATE account_risk_config SET account_phase='standard'
@@ -3153,13 +3155,68 @@ def account_trade_history(user_id: int, only_account_id=None):
         trips, openp = build_round_trips(acct_fills, name_for)
         for t in trips:
             t["account"] = a["account_name"]
+            t["_account_id"] = a["id"]
         for o in openp:
             o["account"] = a["account_name"]
         all_trips += trips
         all_open += openp
 
+    # Tradovate's get_fills only returns a short recent window, so realized P&L
+    # would vanish from old days. Persist every trip we see into a permanent
+    # ledger and return the ledger ∪ live fills, so the dashboard/journal always
+    # show the full realized P&L (deduped by trip_key).
+    _ledger_persist_trips(user_id, all_trips)
+    all_trips = _ledger_merge(user_id, all_trips, only_account_id)
     all_trips.sort(key=lambda x: str(x.get("closed_at", "")), reverse=True)
     return all_trips, all_open
+
+
+def _ledger_persist_trips(user_id, trips):
+    """Save newly-seen closed round-trips into the permanent ledger (idempotent)."""
+    rows = [t for t in (trips or []) if t.get("closed_at")]
+    if not rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    con = db()
+    for t in rows:
+        con.execute(
+            "INSERT INTO trade_log(user_id,account_id,account_name,trip_key,side,symbol,qty,"
+            "entry_price,exit_price,pnl,opened_at,closed_at,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,trip_key) DO NOTHING",
+            (user_id, t.get("_account_id"), t.get("account"), trip_key(t), t.get("side"),
+             t.get("symbol"), t.get("qty"), t.get("entry_price"), t.get("exit_price"),
+             t.get("pnl"), t.get("opened_at"), t.get("closed_at"), now),
+        )
+    con.commit()
+    con.close()
+
+
+def _ledger_merge(user_id, live_trips, only_account_id=None):
+    """Return live trips UNION the permanent ledger (deduped by trip_key). Live
+    values win; the ledger backfills days Tradovate no longer returns."""
+    q = ("SELECT trip_key, account_id, account_name, side, symbol, qty, entry_price, "
+         "exit_price, pnl, opened_at, closed_at FROM trade_log WHERE user_id=?")
+    params = [user_id]
+    if only_account_id not in (None, "", "all"):
+        try:
+            q += " AND account_id=?"
+            params.append(int(only_account_id))
+        except (TypeError, ValueError):
+            pass
+    con = db()
+    rows = con.execute(q, tuple(params)).fetchall()
+    con.close()
+    by_key = {}
+    for r in rows:
+        by_key[r["trip_key"]] = {
+            "account": r["account_name"] or "", "_account_id": r["account_id"],
+            "side": r["side"], "symbol": r["symbol"], "qty": r["qty"],
+            "entry_price": r["entry_price"], "exit_price": r["exit_price"],
+            "pnl": r["pnl"], "opened_at": r["opened_at"], "closed_at": r["closed_at"],
+        }
+    for t in (live_trips or []):     # live (fresh) wins
+        by_key[trip_key(t)] = t
+    return list(by_key.values())
 
 
 def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
