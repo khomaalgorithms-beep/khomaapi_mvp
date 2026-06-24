@@ -90,20 +90,26 @@ def test_period_stats_empty_is_zero_not_crash():
 
 
 def test_apply_persisted_pnl_overrides_journal():
+    # The journal calendar/net are driven by the REALIZED trade ledger (trade_log),
+    # NOT the daily_equity snapshots (which include unrealized open-position P&L).
     uid = _new_user()
-    con = appmod.db()
-    for d, p in [("2026-05-01", 100.0), ("2026-05-02", -30.0)]:
-        con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) VALUES(?,?,?,?,?,?)",
-                    (uid, 80_001, "A", d, p, "x"))
-    con.commit()
-    con.close()
+    appmod._ledger_persist_trips(uid, [
+        {"account": "A", "_account_id": 80_001, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 200, "pnl": 100.0,
+         "opened_at": "2026-05-01T14:00:00Z", "closed_at": "2026-05-01T15:00:00Z"},
+        {"account": "A", "_account_id": 80_001, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 70, "pnl": -30.0,
+         "opened_at": "2026-05-02T14:00:00Z", "closed_at": "2026-05-02T15:00:00Z"},
+    ])
+    d1 = appmod._et_day("2026-05-01T15:00:00Z")
+    d2 = appmod._et_day("2026-05-02T15:00:00Z")
     s = appmod.journal_analytics([])           # empty fills → net 0, daily {}
     assert s["net"] == 0
     s = appmod.apply_persisted_pnl(s, uid, "2026-05-01", "2026-05-31")
     assert s["net"] == 70.0
-    assert s["daily"] == {"2026-05-01": 100.0, "2026-05-02": -30.0}
+    assert s["daily"] == {d1: 100.0, d2: -30.0}
     assert s["green_days"] == 1 and s["red_days"] == 1
-    assert s["best_day"] == ("2026-05-01", 100.0)
+    assert s["best_day"] == (d1, 100.0)
     assert s["equity"] == [100.0, 70.0]        # cumulative daily equity curve
 
 
@@ -124,17 +130,19 @@ def test_persisted_zero_does_not_override_live_pnl():
 
 
 def test_persisted_fills_gaps_not_covered_by_live():
-    # Persisted still fills OLDER days the live fills don't cover.
+    # The ledger backfills OLDER days the current live fills no longer cover (the
+    # fills aged out of Tradovate's window), while live trips win for days they cover.
     uid = _new_user()
-    con = appmod.db()
-    con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) "
-                "VALUES(?,?,?,?,?,?)", (uid, 90_002, "A", "2026-04-01", 180.0, "x"))
-    con.commit()
-    con.close()
+    appmod._ledger_persist_trips(uid, [
+        {"account": "A", "_account_id": 90_002, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 280, "pnl": 180.0,
+         "opened_at": "2026-04-01T14:00:00Z", "closed_at": "2026-04-01T15:00:00Z"},
+    ])
+    d_old = appmod._et_day("2026-04-01T15:00:00Z")
     s = {"daily": {"2026-05-10": 250.0}, "net": 250.0, "green_days": 1, "red_days": 0,
          "best_day": ("2026-05-10", 250.0), "worst_day": ("2026-05-10", 250.0)}
     s = appmod.apply_persisted_pnl(s, uid, "2026-04-01", "2026-05-31")
-    assert s["daily"]["2026-04-01"] == 180.0   # gap filled
+    assert s["daily"][d_old] == 180.0          # ledger fills the gap
     assert s["daily"]["2026-05-10"] == 250.0   # live kept
     assert s["net"] == 430.0
 

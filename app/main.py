@@ -2348,21 +2348,23 @@ def account_total_profit(account_id) -> float:
 
 
 def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
-    """Override a journal_analytics() result's daily PnL, net, day stats, and
-    equity curve with PERSISTED daily PnL (penny-exact, full history). Trip-level
-    stats (win rate, profit factor, per-trade) are left as-is. If no snapshots
-    exist yet (e.g. right after first deploy), the trip-based values are kept."""
-    snapshots = daily_pnl_map(user_id, start_date, end_date, only_account_id)   # legacy equity snapshots
+    """Override a journal_analytics() result's daily PnL, net, day stats, and equity
+    curve with the permanent trade ledger — REALIZED closed round-trips only, the
+    exact same source as the trade list and /results. Trip-level stats (win rate,
+    profit factor, per-trade) are left as-is.
+
+    Deliberately does NOT use the daily_equity snapshot table: those snapshots record
+    netLiq day P&L (realized + UNREALIZED open positions), which would put a phantom
+    value on the calendar for a day that has an open position but no closed trade
+    (e.g. an open short shows '+$307' while the trade list shows nothing). Ledger-only
+    keeps the calendar perfectly consistent with the trades."""
     ledger = ledger_daily_map(user_id, start_date, end_date, only_account_id)   # authoritative trade_log
-    if not snapshots and not ledger:
+    if not ledger:
         return s
-    # Precedence (each day's value taken from the highest-priority source, never
-    # summed): LIVE trips (freshest broker record) > permanent ledger (authoritative
-    # realized P&L, same source as /results) > equity snapshots (legacy gap-fill for
-    # pre-ledger history only). So a real trade day never shows a stale snapshot, and
-    # the journal calendar matches the trade history.
+    # LIVE trips (freshest broker record) win for any day they cover; the ledger
+    # backfills days whose fills have aged out of Tradovate's window. Never summed.
     trip_daily = s.get("daily", {})
-    daily = {**snapshots, **ledger, **trip_daily}
+    daily = {**ledger, **trip_daily}
     vals = list(daily.values())
     s["daily"] = daily
     s["net"] = round(sum(vals), 2)
@@ -3270,13 +3272,25 @@ def account_trade_history(user_id: int, only_account_id=None):
 
 def _trip_ident(t):
     """Stable INTRINSIC identity of a closed round-trip, used to dedup the permanent
-    ledger. Deliberately excludes the account NAME (trip_key includes it for journal
-    mapping, but the name drifts to NULL as a trip round-trips through the ledger,
-    which would split one real trade into duplicates and double-count its P&L)."""
-    return "|".join(str(x) for x in (
-        t.get("_account_id", ""), t.get("symbol", ""), t.get("side", ""),
-        t.get("qty", ""), t.get("entry_price", ""), t.get("exit_price", ""),
-        t.get("closed_at", ""),
+    ledger UNION live fills. Keyed on the account NAME, which is STABLE across
+    reconnects (broker_accounts.id rotates 44->55->56..., but the Tradovate account
+    name does not) — so a trade still inside the live fills window when a user
+    reconnects is not counted twice. Distinct accounts keep distinct identities, so
+    copy-trade fills across accounts are never collapsed. Falls back to the row id
+    only for legacy rows that predate the account_name column (always out of the live
+    window, so they never produce a live duplicate)."""
+    acct = t.get("account") or t.get("_account_id", "")
+
+    def _n(v):   # normalize numbers so int 100 and float 100.0 share one identity
+        try:
+            return format(float(v), ".4f")
+        except (TypeError, ValueError):
+            return str(v)
+
+    return "|".join((
+        str(acct), str(t.get("symbol", "")), str(t.get("side", "")),
+        _n(t.get("qty", "")), _n(t.get("entry_price", "")), _n(t.get("exit_price", "")),
+        str(t.get("closed_at", "")),
     ))
 
 
@@ -3698,7 +3712,7 @@ def daily_journal(user_id: int, trips: Optional[list] = None):
     days: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
-        day = (r["ts"] or "")[:10]
+        day = _et_day(r["ts"])           # ET, to agree with the journal calendar
         if not day:
             continue
         days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})
@@ -3708,14 +3722,15 @@ def daily_journal(user_id: int, trips: Optional[list] = None):
         if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED"):
             days[day]["executed"] += 1
 
-    # Realized PnL per day from actual broker fills (closed round-trips).
+    # Realized PnL per day from actual broker fills (closed round-trips), keyed by ET
+    # close date so the dashboard mini-journal matches the journal calendar exactly.
     if trips is None:
         try:
             trips, _open = account_trade_history(user_id)
         except Exception:
             trips = []
     for t in trips:
-        day = str(t.get("closed_at") or "")[:10]
+        day = _et_day(t.get("closed_at"))
         if not day:
             continue
         days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})

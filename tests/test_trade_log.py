@@ -89,6 +89,41 @@ def test_et_day_converts_to_eastern():
     assert appmod._et_day("") == "" and appmod._et_day("garbage")[:4] == "garb"
 
 
+def test_ledger_merge_dedups_across_reconnect_account_id_change():
+    # Reconnect rotates broker_accounts.id (44 -> 55) but the Tradovate account NAME
+    # is stable. A trade still in the live fills window after a reconnect must NOT be
+    # double-counted just because its row id changed.
+    uid = _user()
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO856420", "_account_id": 44, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 100, "exit_price": 90, "pnl": -40.0,
+        "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}])
+    live = [{   # same physical trade, re-read live after reconnect: NEW id, SAME name
+        "account": "DEMO856420", "_account_id": 55, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 100, "exit_price": 90, "pnl": -40.0,
+        "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}]
+    merged = appmod._ledger_merge(uid, live)
+    assert len(merged) == 1                              # not double-counted
+    assert round(sum(t["pnl"] for t in merged), 2) == -40.0
+
+
+def test_ledger_merge_keeps_distinct_accounts_separate():
+    # Copy trading: the SAME signal on TWO different accounts (different names) must
+    # stay as two separate trades — never collapsed by the dedup.
+    uid = _user()
+    live = [
+        {"account": "ACCT-A", "_account_id": 70, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+         "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"},
+        {"account": "ACCT-B", "_account_id": 71, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+         "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"},
+    ]
+    merged = appmod._ledger_merge(uid, live)
+    assert len(merged) == 2                              # distinct accounts not collapsed
+    assert round(sum(t["pnl"] for t in merged), 2) == 20.0
+
+
 def test_trade_stats_math():
     s = appmod._trade_stats([{"pnl": 100}, {"pnl": -40}, {"pnl": 60}])
     assert s["net"] == 120 and s["trades"] == 3 and s["wins"] == 2 and s["losses"] == 1
