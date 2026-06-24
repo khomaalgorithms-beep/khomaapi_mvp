@@ -2295,7 +2295,11 @@ def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, o
     persisted = daily_pnl_map(user_id, start_date, end_date, only_account_id)
     if not persisted:
         return s
-    daily = {**s.get("daily", {}), **persisted}  # persisted value wins per day
+    # LIVE trip data wins for any day it covers (it's the accurate broker record);
+    # persisted only fills OLDER days Tradovate no longer returns fills for. This
+    # prevents a persisted $0 from wiping out a client's real P&L.
+    trip_daily = s.get("daily", {})
+    daily = {**persisted, **trip_daily}
     vals = list(daily.values())
     s["daily"] = daily
     s["net"] = round(sum(vals), 2)
@@ -2355,12 +2359,12 @@ def digest_email_html(period_label: str, s: dict) -> str:
 
 
 def _send_one_digest(user_row: dict, period_label: str, subject: str, trips: list,
-                     pnl_override: dict = None) -> bool:
+                     start_date: str = None, end_date: str = None) -> bool:
     s = journal_analytics(trips or [])
-    # Net P&L + per-day stats come from PERSISTED daily PnL (reliable history);
-    # trip-level stats (win rate, profit factor) stay from fills when available.
-    if pnl_override:
-        s.update(pnl_override)
+    # Live broker fills are authoritative; persisted daily P&L only fills OLDER
+    # days Tradovate no longer returns (never overrides real, recent P&L).
+    if start_date:
+        s = apply_persisted_pnl(s, user_row["id"], start_date, end_date)
     html_body = digest_email_html(period_label, s)
     text = f"{period_label} performance — Net {_money(s['net'])}, win rate {s['win_rate']}%, {s['n']} trades."
     return send_branded_email(
@@ -2404,9 +2408,8 @@ def digest_tick():
             pid = now_et.strftime("%Y-%m-%d")
             if u.get("digest_daily_sent") != pid:
                 start = risk.session_anchor(now_utc)
-                pnl = period_pnl_stats(u["id"], pid, pid)
                 if _send_one_digest(u, "daily", "Your KhomaAPI daily performance",
-                                    _trips_in_range(trips, start, now_utc), pnl_override=pnl):
+                                    _trips_in_range(trips, start, now_utc), start_date=pid, end_date=pid):
                     _mark_digest_sent(u["id"], "digest_daily_sent", pid)
 
         # WEEKLY — Saturday morning, covering the last 7 days.
@@ -2415,9 +2418,8 @@ def digest_tick():
             if u.get("digest_weekly_sent") != pid:
                 start = now_utc - timedelta(days=7)
                 d0 = (now_et - timedelta(days=7)).strftime("%Y-%m-%d")
-                pnl = period_pnl_stats(u["id"], d0, now_et.strftime("%Y-%m-%d"))
                 if _send_one_digest(u, "weekly", "Your KhomaAPI weekly performance",
-                                    _trips_in_range(trips, start, now_utc), pnl_override=pnl):
+                                    _trips_in_range(trips, start, now_utc), start_date=d0, end_date=now_et.strftime("%Y-%m-%d")):
                     _mark_digest_sent(u["id"], "digest_weekly_sent", pid)
 
         # MONTHLY — on the 1st, covering the previous calendar month.
@@ -2429,9 +2431,9 @@ def digest_tick():
             if u.get("digest_monthly_sent") != pid:
                 start = first_prev.astimezone(timezone.utc)
                 end = first_this.astimezone(timezone.utc)
-                pnl = period_pnl_stats(u["id"], first_prev.strftime("%Y-%m-%d"), last_prev.strftime("%Y-%m-%d"))
                 if _send_one_digest(u, first_prev.strftime("%B %Y"), f"Your KhomaAPI {first_prev.strftime('%B')} performance",
-                                    _trips_in_range(trips, start, end), pnl_override=pnl):
+                                    _trips_in_range(trips, start, end),
+                                    start_date=first_prev.strftime("%Y-%m-%d"), end_date=last_prev.strftime("%Y-%m-%d")):
                     _mark_digest_sent(u["id"], "digest_monthly_sent", pid)
 
 
@@ -6590,10 +6592,9 @@ def settings_digest_sample(request: Request):
     except Exception:
         trips = []
     now_et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
-    pnl = period_pnl_stats(user["id"], (now_et - timedelta(days=30)).strftime("%Y-%m-%d"), now_et.strftime("%Y-%m-%d"))
     sent = _send_one_digest(dict(user), "sample (last 30 days)", "Your KhomaAPI performance — sample",
                             _trips_in_range(trips, datetime.now(timezone.utc) - timedelta(days=30), datetime.now(timezone.utc)),
-                            pnl_override=pnl)
+                            start_date=(now_et - timedelta(days=30)).strftime("%Y-%m-%d"), end_date=now_et.strftime("%Y-%m-%d"))
     return login_layout(
         ("<h1>Sample sent</h1><p>Check your inbox for a sample performance report.</p>" if sent
          else f"<h1>Couldn't send</h1><p>{LAST_EMAIL_ERROR}</p>")

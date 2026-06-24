@@ -107,6 +107,38 @@ def test_apply_persisted_pnl_overrides_journal():
     assert s["equity"] == [100.0, 70.0]        # cumulative daily equity curve
 
 
+def test_persisted_zero_does_not_override_live_pnl():
+    # Regression: an idle/demo account's persisted $0 must NOT replace the real
+    # P&L from live broker fills for a day they both cover.
+    uid = _new_user()
+    con = appmod.db()
+    con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) "
+                "VALUES(?,?,?,?,?,?)", (uid, 90_001, "A", "2026-05-10", 0.0, "x"))
+    con.commit()
+    con.close()
+    s = {"daily": {"2026-05-10": 250.0}, "net": 250.0, "green_days": 1, "red_days": 0,
+         "best_day": ("2026-05-10", 250.0), "worst_day": ("2026-05-10", 250.0)}
+    s = appmod.apply_persisted_pnl(s, uid, "2026-05-01", "2026-05-31")
+    assert s["daily"]["2026-05-10"] == 250.0   # live wins over persisted $0
+    assert s["net"] == 250.0
+
+
+def test_persisted_fills_gaps_not_covered_by_live():
+    # Persisted still fills OLDER days the live fills don't cover.
+    uid = _new_user()
+    con = appmod.db()
+    con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) "
+                "VALUES(?,?,?,?,?,?)", (uid, 90_002, "A", "2026-04-01", 180.0, "x"))
+    con.commit()
+    con.close()
+    s = {"daily": {"2026-05-10": 250.0}, "net": 250.0, "green_days": 1, "red_days": 0,
+         "best_day": ("2026-05-10", 250.0), "worst_day": ("2026-05-10", 250.0)}
+    s = appmod.apply_persisted_pnl(s, uid, "2026-04-01", "2026-05-31")
+    assert s["daily"]["2026-04-01"] == 180.0   # gap filled
+    assert s["daily"]["2026-05-10"] == 250.0   # live kept
+    assert s["net"] == 430.0
+
+
 def test_apply_persisted_pnl_noop_when_no_snapshots():
     uid = _new_user()
     s = appmod.journal_analytics([])
