@@ -95,6 +95,34 @@ def test_trade_stats_math():
     assert s["pf_disp"] == "4.00"            # (100+60) / 40
 
 
+def test_account_history_falls_back_to_ledger_when_broker_read_throws(monkeypatch):
+    # The journal/dashboard $0 bug: a broker hiccup made account_trade_history raise,
+    # the caller swallowed it to [], and the journal went blank even though the
+    # permanent ledger held the trade. Now a broker failure must STILL return the
+    # ledger so realized P&L never disappears.
+    uid = _user()
+    aid = 990077
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO", "_account_id": aid, "symbol": "MNQU6", "side": "long", "qty": 2,
+        "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+        "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T15:00:01Z"}])
+
+    # Simulate a connected account whose live read explodes.
+    monkeypatch.setattr(appmod, "get_broker_accounts",
+                        lambda user_id, connected_only=False: [
+                            {"id": aid, "env": "demo", "account_id": "48440214",
+                             "account_name": "DEMO", "access_token_enc": "x"}])
+    def boom(_a):
+        raise RuntimeError("token renew failed / broker down")
+    monkeypatch.setattr(appmod, "ensure_fresh_token", boom)
+
+    trips, _open = appmod.account_trade_history(uid, only_account_id=aid)
+    assert len(trips) == 1                         # ledger preserved, not blanked
+    assert trips[0]["pnl"] == -536.0
+    s = appmod.journal_analytics(trips)
+    assert s["net"] == -536.0 and s["gross_loss"] == 536.0   # analytics populated
+
+
 def test_persist_track_trades_dedup(monkeypatch):
     uid = _user()
     monkeypatch.setattr(appmod, "_public_track_user", lambda: {"id": uid})

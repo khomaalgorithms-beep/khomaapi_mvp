@@ -3122,51 +3122,70 @@ def build_round_trips(fills, name_for):
 def account_trade_history(user_id: int, only_account_id=None):
     """Closed round-trips + open positions across the user's connected accounts.
     Pass only_account_id (broker_accounts.id) to scope to a single account."""
-    accounts = get_broker_accounts(user_id, connected_only=True)
-    if only_account_id not in (None, "", "all"):
-        accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
+    try:
+        accounts = get_broker_accounts(user_id, connected_only=True)
+        if only_account_id not in (None, "", "all"):
+            accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
+    except Exception as e:
+        # Even if the account lookup fails, fall through to the permanent ledger.
+        print(f"account_trade_history: account lookup failed (uid {user_id}): {e}")
+        accounts = []
     token_cache: Dict[tuple, list] = {}
     contract_names: Dict[Any, str] = {}
     all_trips, all_open = [], []
 
     for a in accounts:
-        token = ensure_fresh_token(a)
-        env = a.get("env") or "live"
-        acct_id = a.get("account_id")
-        if not token or not acct_id:
-            continue
+        # A broker hiccup on ONE account (expired token, slow API, odd fill) must
+        # never blank the whole dashboard/journal — we still return the permanent
+        # ledger below. So each account's LIVE read is isolated.
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                continue
 
-        key = (token, env)
-        if key not in token_cache:
-            token_cache[key] = (tvo.get_fills(env, token), tvo.get_orders(env, token))
-        fills_all, orders_all = token_cache[key]
-        orders_map = _orders_account_map(orders_all)
-        single_account = len(accounts) == 1
+            key = (token, env)
+            if key not in token_cache:
+                token_cache[key] = (tvo.get_fills(env, token), tvo.get_orders(env, token))
+            fills_all, orders_all = token_cache[key]
+            orders_map = _orders_account_map(orders_all)
+            single_account = len(accounts) == 1
 
-        def name_for(cid):
-            if cid in contract_names:
+            def name_for(cid):
+                if cid in contract_names:
+                    return contract_names[cid]
+                c = tvo.get_contract(env, token, cid) or {}
+                nm = c.get("name") if isinstance(c, dict) else None
+                contract_names[cid] = nm or f"#{cid}"
                 return contract_names[cid]
-            c = tvo.get_contract(env, token, cid) or {}
-            nm = c.get("name") if isinstance(c, dict) else None
-            contract_names[cid] = nm or f"#{cid}"
-            return contract_names[cid]
 
-        acct_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
-        trips, openp = build_round_trips(acct_fills, name_for)
-        for t in trips:
-            t["account"] = a["account_name"]
-            t["_account_id"] = a["id"]
-        for o in openp:
-            o["account"] = a["account_name"]
-        all_trips += trips
-        all_open += openp
+            acct_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
+            trips, openp = build_round_trips(acct_fills, name_for)
+            for t in trips:
+                t["account"] = a["account_name"]
+                t["_account_id"] = a["id"]
+            for o in openp:
+                o["account"] = a["account_name"]
+            all_trips += trips
+            all_open += openp
+        except Exception as e:
+            print(f"account_trade_history: live read failed for account {a.get('id')}: {e}")
+            continue
 
     # Tradovate's get_fills only returns a short recent window, so realized P&L
     # would vanish from old days. Persist every trip we see into a permanent
-    # ledger and return the ledger ∪ live fills, so the dashboard/journal always
-    # show the full realized P&L (deduped by trip_key).
-    _ledger_persist_trips(user_id, all_trips)
-    all_trips = _ledger_merge(user_id, all_trips, only_account_id)
+    # ledger and ALWAYS return the ledger ∪ live fills, so the dashboard/journal
+    # show the full realized P&L (deduped by intrinsic identity). Both steps are
+    # best-effort: a persistence error must not discard the ledger we can read.
+    try:
+        _ledger_persist_trips(user_id, all_trips)
+    except Exception as e:
+        print(f"account_trade_history: ledger persist failed (uid {user_id}): {e}")
+    try:
+        all_trips = _ledger_merge(user_id, all_trips, only_account_id)
+    except Exception as e:
+        print(f"account_trade_history: ledger merge failed (uid {user_id}): {e}")
     all_trips.sort(key=lambda x: str(x.get("closed_at", "")), reverse=True)
     return all_trips, all_open
 
@@ -5781,8 +5800,13 @@ def journal_page(request: Request):
 
     try:
         all_trips, _open = account_trade_history(user["id"], only_account_id=only)
-    except Exception:
-        all_trips = []
+    except Exception as e:
+        # Last-resort: still show the permanent ledger so the journal is never blank.
+        print(f"journal_page: account_trade_history failed, falling back to ledger: {e}")
+        try:
+            all_trips = _ledger_merge(user["id"], [], only)
+        except Exception:
+            all_trips = []
 
     # Date-range filter: presets (today/7d/30d/month/ytd/all) or custom from/to.
     rng = (request.query_params.get("range") or "all").lower()
