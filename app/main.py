@@ -2576,6 +2576,22 @@ async def digest_loop():
         await asyncio.sleep(600)
 
 
+async def trade_ledger_loop():
+    """Capture EVERY connected client's closed round-trips into the permanent ledger
+    on a tight cadence, so realized P&L is recorded while broker tokens are valid and
+    fills are fresh — and stays visible on every client's dashboard/journal after the
+    fills age out. Leader-only; resilient per user."""
+    print("TRADE-LEDGER scheduler started (2-min cadence)")
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            if await loop.run_in_executor(None, try_become_leader):
+                await loop.run_in_executor(None, persist_all_account_trades)
+        except Exception as e:
+            print("TRADE-LEDGER ERROR:", e)
+        await asyncio.sleep(120)
+
+
 @app.on_event("startup")
 async def _start_watchdog():
     # Disable with KHOMA_DISABLE_WATCHDOG=1 (e.g. in tests / CI).
@@ -2583,6 +2599,7 @@ async def _start_watchdog():
         return
     asyncio.create_task(risk_watchdog_loop())
     asyncio.create_task(digest_loop())
+    asyncio.create_task(trade_ledger_loop())
 
 
 def _order_ok(resp) -> bool:
@@ -7344,6 +7361,38 @@ def persist_track_trades():
             _ledger_persist_trips(user["id"], trips)
     except Exception as e:
         print("persist_track_trades error:", e)
+
+
+def persist_all_account_trades():
+    """Server-side: capture EVERY connected user's closed round-trips into the
+    permanent trade ledger, on a schedule, while their broker tokens are valid and
+    fills are still in Tradovate's short window. This is what lets EVERY client (not
+    just the public-track account) see today's realized P&L on their dashboard/journal
+    even after the fills age out — independent of whether they have the page open.
+
+    Drives account_trade_history(user_id), which already persists every live trip to
+    trade_log (intrinsic-deduped) and is broker-error resilient, so one bad account
+    never stops the sweep. Bounded concurrency keeps it safe at 1,000+ accounts."""
+    try:
+        con = db()
+        rows = con.execute(
+            "SELECT DISTINCT user_id FROM broker_accounts WHERE status='connected'").fetchall()
+        con.close()
+        uids = [r["user_id"] for r in rows]
+    except Exception as e:
+        print(f"persist_all_account_trades: user lookup failed: {e}")
+        return
+    if not uids:
+        return
+
+    def _one(uid):
+        try:
+            account_trade_history(uid)   # persists this user's live trips as a side effect
+        except Exception as e:
+            print(f"persist_all_account_trades: uid {uid} failed: {e}")
+
+    with ThreadPoolExecutor(max_workers=min(WATCH_WORKERS, len(uids))) as pool:
+        list(pool.map(_one, uids))
 
 
 def _track_live_trades(account_ids):

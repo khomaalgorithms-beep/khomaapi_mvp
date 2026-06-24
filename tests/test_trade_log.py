@@ -149,3 +149,36 @@ def test_persist_track_trades_dedup(monkeypatch):
     appmod.persist_track_trades()
     rows = appmod._track_live_trades([777])
     assert len(rows) == 3
+
+
+def test_persist_all_account_trades_covers_every_connected_user(monkeypatch):
+    # The client-$0 fix: a server-side sweep must capture EVERY connected user's trips
+    # into the ledger (not just the public-track account), so each client sees their own
+    # realized P&L even with no dashboard open. account_trade_history persists as a side
+    # effect; here we assert the sweep drives it for every distinct connected user_id.
+    u1, u2 = _user(), _user()
+    a1, a2 = 51001, 51002
+    con = appmod.db()
+    for uid, aid in ((u1, a1), (u2, a2)):
+        con.execute("INSERT INTO broker_accounts(user_id,broker,env,account_id,account_name,status,created_at,updated_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)", (uid, "tradovate", "demo", str(aid), f"ACC{aid}", "connected", "x", "x"))
+    con.commit(); con.close()
+
+    real = appmod.account_trade_history
+    def fake(uid, only_account_id=None):
+        # Each user has one closed trip; persist it the way the real function does.
+        aid = a1 if uid == u1 else a2
+        trip = {"account": f"ACC{aid}", "_account_id": aid, "symbol": "MNQ", "side": "long",
+                "qty": 2, "entry_price": 100, "exit_price": 95, "pnl": -20.0,
+                "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T15:00:00Z"}
+        appmod._ledger_persist_trips(uid, [trip])
+        return [trip], []
+    monkeypatch.setattr(appmod, "account_trade_history", fake)
+
+    appmod.persist_all_account_trades()
+    appmod.persist_all_account_trades()           # idempotent
+
+    assert len(appmod._ledger_merge(u1, [], only_account_id=a1)) == 1
+    assert len(appmod._ledger_merge(u2, [], only_account_id=a2)) == 1
+    # Strict per-user scoping: u1's sweep never wrote into u2's ledger.
+    assert appmod._ledger_merge(u1, [], only_account_id=a2) == []
