@@ -47,12 +47,31 @@ def test_ledger_persist_and_merge_unions_history():
     assert len(appmod._ledger_merge(uid, [], only_account_id=999)) == 0
 
 
+def test_name_drift_does_not_duplicate_or_double_count():
+    # The real bug: trip_key includes the account NAME, which drifts to empty as a
+    # trip round-trips through the ledger. Persisting the "same" trade once with a
+    # name and once without must NOT create a 2nd row or double the P&L.
+    uid = _user()
+    aid = 990044
+    base = {"_account_id": aid, "symbol": "MNQU6", "side": "long", "qty": 2,
+            "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+            "opened_at": "2026-06-23T14:30:00Z", "closed_at": "2026-06-23T15:00:01Z"}
+    appmod._ledger_persist_trips(uid, [{**base, "account": "DEMO856420"}])  # with name
+    appmod._ledger_persist_trips(uid, [{**base, "account": ""}])            # name drifted
+    appmod._ledger_persist_trips(uid, [{**base, "account": None}])          # name None
+    # Exactly one row; calendar + trade list + merge all show a single -536.
+    assert len(appmod._track_live_trades([aid])) == 1
+    assert appmod.public_daily_map([aid])[appmod._et_day(base["closed_at"])] == -536.0
+    assert len(appmod._ledger_merge(uid, [], only_account_id=aid)) == 1
+    assert appmod._trade_stats(appmod._track_live_trades([aid]))["net"] == -536.0
+
+
 def test_public_daily_map_built_from_trade_ledger():
     # Regression: the verified calendar showed $0 on a real trade day because it read
     # the daily_equity snapshots (which were $0). It must be built from the trade
     # ledger so the calendar ALWAYS matches the trade history. Keyed by ET date.
     uid = _user()
-    aid = 44
+    aid = 990045
     appmod._ledger_persist_trips(uid, [{
         "account": "DEMO", "_account_id": aid, "symbol": "MNQ", "side": "long", "qty": 2,
         "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,

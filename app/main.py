@@ -3171,14 +3171,36 @@ def account_trade_history(user_id: int, only_account_id=None):
     return all_trips, all_open
 
 
+def _trip_ident(t):
+    """Stable INTRINSIC identity of a closed round-trip, used to dedup the permanent
+    ledger. Deliberately excludes the account NAME (trip_key includes it for journal
+    mapping, but the name drifts to NULL as a trip round-trips through the ledger,
+    which would split one real trade into duplicates and double-count its P&L)."""
+    return "|".join(str(x) for x in (
+        t.get("_account_id", ""), t.get("symbol", ""), t.get("side", ""),
+        t.get("qty", ""), t.get("entry_price", ""), t.get("exit_price", ""),
+        t.get("closed_at", ""),
+    ))
+
+
 def _ledger_persist_trips(user_id, trips):
-    """Save newly-seen closed round-trips into the permanent ledger (idempotent)."""
+    """Save newly-seen closed round-trips into the permanent ledger (idempotent).
+    Deduped by intrinsic identity (account_id+symbol+side+qty+prices+close) so the
+    same trade is never logged twice even if its trip_key shifts."""
     rows = [t for t in (trips or []) if t.get("closed_at")]
     if not rows:
         return
     now = datetime.now(timezone.utc).isoformat()
     con = db()
     for t in rows:
+        exists = con.execute(
+            "SELECT 1 FROM trade_log WHERE user_id=? AND account_id=? AND symbol=? "
+            "AND side=? AND qty=? AND entry_price=? AND exit_price=? AND closed_at=? LIMIT 1",
+            (user_id, t.get("_account_id"), t.get("symbol"), t.get("side"), t.get("qty"),
+             t.get("entry_price"), t.get("exit_price"), t.get("closed_at")),
+        ).fetchone()
+        if exists:
+            continue
         con.execute(
             "INSERT INTO trade_log(user_id,account_id,account_name,trip_key,side,symbol,qty,"
             "entry_price,exit_price,pnl,opened_at,closed_at,created_at) "
@@ -3192,8 +3214,10 @@ def _ledger_persist_trips(user_id, trips):
 
 
 def _ledger_merge(user_id, live_trips, only_account_id=None):
-    """Return live trips UNION the permanent ledger (deduped by trip_key). Live
-    values win; the ledger backfills days Tradovate no longer returns."""
+    """Return live trips UNION the permanent ledger, deduped by INTRINSIC identity
+    (never the cosmetic account name). Live values win; the ledger backfills days
+    Tradovate no longer returns. Collapsing by identity also folds away any legacy
+    duplicate rows so realized P&L is never double-counted."""
     q = ("SELECT trip_key, account_id, account_name, side, symbol, qty, entry_price, "
          "exit_price, pnl, opened_at, closed_at FROM trade_log WHERE user_id=?")
     params = [user_id]
@@ -3206,17 +3230,18 @@ def _ledger_merge(user_id, live_trips, only_account_id=None):
     con = db()
     rows = con.execute(q, tuple(params)).fetchall()
     con.close()
-    by_key = {}
+    by_ident = {}
     for r in rows:
-        by_key[r["trip_key"]] = {
+        t = {
             "account": r["account_name"] or "", "_account_id": r["account_id"],
             "side": r["side"], "symbol": r["symbol"], "qty": r["qty"],
             "entry_price": r["entry_price"], "exit_price": r["exit_price"],
             "pnl": r["pnl"], "opened_at": r["opened_at"], "closed_at": r["closed_at"],
         }
+        by_ident[_trip_ident(t)] = t
     for t in (live_trips or []):     # live (fresh) wins
-        by_key[trip_key(t)] = t
-    return list(by_key.values())
+        by_ident[_trip_ident(t)] = t
+    return list(by_ident.values())
 
 
 def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
@@ -7209,12 +7234,18 @@ def public_daily_map(account_ids):
     ph = ",".join("?" for _ in account_ids)
     con = db()
     rows = con.execute(
-        f"SELECT pnl, closed_at FROM trade_log WHERE account_id IN ({ph})",
+        f"SELECT account_id, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
+        f"FROM trade_log WHERE account_id IN ({ph})",
         tuple(account_ids),
     ).fetchall()
     con.close()
-    out = {}
+    out, seen = {}, set()
     for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
         day = _et_day(r["closed_at"])
         if not day:
             continue
@@ -7247,26 +7278,16 @@ def persist_track_trades():
             return
         for aid in _public_connected_ids(user):   # log from any connected account
             try:
+                # account_trade_history already persists live trips via the intrinsic-
+                # deduped ledger; this scopes + re-persists idempotently as a backstop.
                 trips, _o = account_trade_history(user["id"], only_account_id=aid)
             except Exception:
                 continue
             if not trips:
                 continue
-            con = db()
-            now = datetime.now(timezone.utc).isoformat()
             for t in trips:
-                if not t.get("closed_at"):
-                    continue
-                con.execute(
-                    "INSERT INTO trade_log(user_id,account_id,trip_key,side,symbol,qty,entry_price,"
-                    "exit_price,pnl,opened_at,closed_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(user_id,trip_key) DO NOTHING",
-                    (user["id"], aid, trip_key(t), t.get("side"), t.get("symbol"), t.get("qty"),
-                     t.get("entry_price"), t.get("exit_price"), t.get("pnl"),
-                     t.get("opened_at"), t.get("closed_at"), now),
-                )
-            con.commit()
-            con.close()
+                t["_account_id"] = aid
+            _ledger_persist_trips(user["id"], trips)
     except Exception as e:
         print("persist_track_trades error:", e)
 
@@ -7277,10 +7298,18 @@ def _track_live_trades(account_ids):
     ph = ",".join("?" for _ in account_ids)
     con = db()
     rows = con.execute(
-        f"SELECT side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
+        f"SELECT account_id,side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
         f"WHERE account_id IN ({ph}) ORDER BY closed_at", tuple(account_ids)).fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    out, seen = [], set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
+        out.append(dict(r))
+    return out
 
 
 def _trade_stats(trades):
