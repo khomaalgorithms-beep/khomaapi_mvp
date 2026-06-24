@@ -139,6 +139,27 @@ def test_persisted_fills_gaps_not_covered_by_live():
     assert s["net"] == 430.0
 
 
+def test_ledger_wins_over_stale_equity_snapshot_in_journal():
+    # One-source-of-truth: a real trade in the permanent ledger must drive the journal
+    # calendar even when a stale/wrong daily_equity snapshot exists for that day and no
+    # live trips were passed (e.g. the fill aged out of Tradovate's window).
+    uid = _new_user()
+    aid = 123_450
+    con = appmod.db()
+    con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) "
+                "VALUES(?,?,?,?,?,?)", (uid, aid, "A", "2026-06-23", 0.0, "x"))  # stale $0 snapshot
+    con.commit(); con.close()
+    appmod._ledger_persist_trips(uid, [{
+        "account": "A", "_account_id": aid, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+        "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T15:00:01Z"}])
+    s = appmod.journal_analytics([])                       # no live trips passed
+    s = appmod.apply_persisted_pnl(s, uid, "2026-06-01", "2026-06-30")
+    day = appmod._et_day("2026-06-23T15:00:01Z")
+    assert s["daily"][day] == -536.0                       # ledger beats the stale $0
+    assert s["net"] == -536.0
+
+
 def test_apply_persisted_pnl_noop_when_no_snapshots():
     uid = _new_user()
     s = appmod.journal_analytics([])

@@ -2248,6 +2248,33 @@ def daily_pnl_map(user_id: int, start_date: str = None, end_date: str = None, on
     return {r["trade_date"]: (r["pnl"] or 0) for r in rows}
 
 
+def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None, only_account_id=None) -> dict:
+    """{ 'YYYY-MM-DD'(ET): summed realized P&L } from the permanent trade_log ledger
+    for ONE user — the authoritative realized-P&L source (same data the public
+    results page uses), so the journal calendar matches the trade history instead of
+    relying on the unreliable daily_equity equity snapshots. ET dates, inclusive."""
+    q = "SELECT pnl, closed_at FROM trade_log WHERE user_id=?"
+    params = [user_id]
+    if only_account_id not in (None, "", "all"):
+        try:
+            q += " AND account_id=?"
+            params.append(int(only_account_id))
+        except (TypeError, ValueError):
+            pass
+    con = db()
+    rows = con.execute(q, tuple(params)).fetchall()
+    con.close()
+    out = {}
+    for r in rows:
+        day = _et_day(r["closed_at"])
+        if not day:
+            continue
+        if (start_date and day < start_date) or (end_date and day > end_date):
+            continue
+        out[day] = round(out.get(day, 0.0) + float(r["pnl"] or 0), 2)
+    return out
+
+
 def period_pnl_stats(user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
     """Net + per-day stats over a date range, from persisted daily PnL."""
     m = daily_pnl_map(user_id, start_date, end_date, only_account_id)
@@ -2294,14 +2321,17 @@ def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, o
     equity curve with PERSISTED daily PnL (penny-exact, full history). Trip-level
     stats (win rate, profit factor, per-trade) are left as-is. If no snapshots
     exist yet (e.g. right after first deploy), the trip-based values are kept."""
-    persisted = daily_pnl_map(user_id, start_date, end_date, only_account_id)
-    if not persisted:
+    snapshots = daily_pnl_map(user_id, start_date, end_date, only_account_id)   # legacy equity snapshots
+    ledger = ledger_daily_map(user_id, start_date, end_date, only_account_id)   # authoritative trade_log
+    if not snapshots and not ledger:
         return s
-    # LIVE trip data wins for any day it covers (it's the accurate broker record);
-    # persisted only fills OLDER days Tradovate no longer returns fills for. This
-    # prevents a persisted $0 from wiping out a client's real P&L.
+    # Precedence (each day's value taken from the highest-priority source, never
+    # summed): LIVE trips (freshest broker record) > permanent ledger (authoritative
+    # realized P&L, same source as /results) > equity snapshots (legacy gap-fill for
+    # pre-ledger history only). So a real trade day never shows a stale snapshot, and
+    # the journal calendar matches the trade history.
     trip_daily = s.get("daily", {})
-    daily = {**persisted, **trip_daily}
+    daily = {**snapshots, **ledger, **trip_daily}
     vals = list(daily.values())
     s["daily"] = daily
     s["net"] = round(sum(vals), 2)
