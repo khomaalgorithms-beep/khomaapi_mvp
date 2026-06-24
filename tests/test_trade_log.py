@@ -47,6 +47,29 @@ def test_ledger_persist_and_merge_unions_history():
     assert len(appmod._ledger_merge(uid, [], only_account_id=999)) == 0
 
 
+def test_public_daily_map_built_from_trade_ledger():
+    # Regression: the verified calendar showed $0 on a real trade day because it read
+    # the daily_equity snapshots (which were $0). It must be built from the trade
+    # ledger so the calendar ALWAYS matches the trade history. Keyed by ET date.
+    uid = _user()
+    aid = 44
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO", "_account_id": aid, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+        "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T14:30:00Z"}])
+    m = appmod.public_daily_map([aid])
+    day = appmod._et_day("2026-06-23T14:30:00Z")      # ET trade-close date
+    assert m.get(day) == -536.0                        # ledger drives the calendar
+    assert appmod.public_daily_map([999]) == {}        # scoped to the chosen account
+
+
+def test_et_day_converts_to_eastern():
+    # 02:30 UTC is still the previous evening in ET.
+    assert appmod._et_day("2026-06-24T02:30:00Z") == "2026-06-23"
+    assert appmod._et_day("2026-06-23T14:30:00Z") == "2026-06-23"
+    assert appmod._et_day("") == "" and appmod._et_day("garbage")[:4] == "garb"
+
+
 def test_trade_stats_math():
     s = appmod._trade_stats([{"pnl": 100}, {"pnl": -40}, {"pnl": 60}])
     assert s["net"] == 120 and s["trades"] == 3 and s["wins"] == 2 and s["losses"] == 1

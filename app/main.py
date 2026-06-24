@@ -7185,18 +7185,41 @@ def _public_track_account_ids(user):
     return sorted(ids)
 
 
+def _et_day(iso_str):
+    """ET calendar date 'YYYY-MM-DD' for an ISO timestamp (UTC if naive); falls back
+    to the first 10 chars so a bad value never crashes the public feed."""
+    if not iso_str:
+        return ""
+    try:
+        d = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d")
+    except Exception:
+        return str(iso_str)[:10]
+
+
 def public_daily_map(account_ids):
-    """{ 'YYYY-MM-DD': summed day_pnl } across the chosen accounts (persisted)."""
+    """{ 'YYYY-MM-DD': summed realized P&L } across the chosen accounts, built from the
+    permanent trade ledger (closed round-trips) keyed by ET close date. The ledger is
+    the authoritative source — so the public calendar ALWAYS matches the trade history.
+    (The old daily_equity snapshots returned $0 on real trade days and are not used.)"""
     if not account_ids:
         return {}
     ph = ",".join("?" for _ in account_ids)
     con = db()
     rows = con.execute(
-        f"SELECT trade_date, SUM(day_pnl) AS p FROM daily_equity WHERE account_id IN ({ph}) GROUP BY trade_date",
+        f"SELECT pnl, closed_at FROM trade_log WHERE account_id IN ({ph})",
         tuple(account_ids),
     ).fetchall()
     con.close()
-    return {r["trade_date"]: (r["p"] or 0) for r in rows}
+    out = {}
+    for r in rows:
+        day = _et_day(r["closed_at"])
+        if not day:
+            continue
+        out[day] = round(out.get(day, 0.0) + float(r["pnl"] or 0), 2)
+    return out
 
 
 def public_live_snapshot(account_ids):
@@ -7371,7 +7394,7 @@ def _track_payload():
             "days": stats["days"], "green": stats["green"], "red": stats["red"],
             "daily": daily,   # {YYYY-MM-DD: pnl} — live, for the calendar
             # Live trade-by-trade log + trade-based stats for the "Verified" section.
-            "trades": [{"side": t.get("side"), "date": str(t.get("closed_at") or "")[:10],
+            "trades": [{"side": t.get("side"), "date": _et_day(t.get("closed_at")),
                         "entry": t.get("entry_price"), "exit": t.get("exit_price"),
                         "qty": t.get("qty"), "pnl": t.get("pnl")} for t in trades],
             "trade_net_disp": _money(ts["net"]), "trade_count": ts["trades"],
