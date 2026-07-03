@@ -153,6 +153,35 @@ PUBLIC_TRACK_EMAIL = os.getenv("PUBLIC_TRACK_EMAIL", "khomadima89@gmail.com").st
 PUBLIC_TRACK_NAME = os.getenv("PUBLIC_TRACK_NAME", "KhomaAPI — Verified Results").strip()
 PUBLIC_TRACK_ACCOUNT_IDS = [s.strip() for s in os.getenv("PUBLIC_TRACK_ACCOUNT_IDS", "").split(",") if s.strip()]
 
+# Real resting exchange-side OCO brackets: when an entry alert carries sl/tp levels,
+# place the stop + take-profit as WORKING orders at Tradovate (placeOSO) so exits fill
+# at price-or-better and survive a server/VPS/internet outage. Instant kill-switch:
+# set BRACKET_ORDERS=0 to revert to plain market entries without a redeploy.
+BRACKET_ORDERS = os.getenv("BRACKET_ORDERS", "1") == "1"
+# Canary rollout: if set (comma-separated emails), real OCO brackets run for ONLY these
+# users; EVERY other client keeps plain market entries, byte-for-byte unchanged. Lets us
+# demo-test on one account with zero client risk, then clear the var to enable for all.
+BRACKET_ORDERS_ONLY_USERS = {e.strip().lower() for e in
+                             os.getenv("BRACKET_ORDERS_ONLY_USERS", "").split(",") if e.strip()}
+
+
+def _brackets_on_for(email: str) -> bool:
+    """Are real OCO brackets enabled for this user? Global flag AND (canary empty OR
+    the user is in the canary allow-list)."""
+    if not BRACKET_ORDERS:
+        return False
+    if BRACKET_ORDERS_ONLY_USERS:
+        return str(email or "").lower() in BRACKET_ORDERS_ONLY_USERS
+    return True
+
+# Tick size per futures root, for rounding sl/tp to a valid exchange price so a bracket
+# is never rejected for an off-tick price (which would risk a naked entry).
+_TICK_SIZE = {
+    "ES": 0.25, "MES": 0.25, "NQ": 0.25, "MNQ": 0.25, "YM": 1.0, "MYM": 1.0,
+    "RTY": 0.1, "M2K": 0.1, "CL": 0.01, "MCL": 0.01, "GC": 0.1, "MGC": 0.1,
+    "SI": 0.005, "6E": 0.00005, "6B": 0.0001, "6J": 0.0000005,
+}
+
 
 def google_login_button() -> str:
     """Render the Google sign-in button ONLY when Google OAuth is configured,
@@ -2726,7 +2755,7 @@ def flatten_on_account(account: dict, symbol: str) -> list:
     if not token or not acct_id:
         return [{"account": account.get("account_name"), "ok": False, "error": "Reconnect required"}]
 
-    root = symbol_root(str(symbol).upper())
+    root = symbol_root(str(symbol).upper()) if symbol else ""   # no symbol -> flatten ALL
     results = []
     for p in (tvo.get_positions(env, token) or []):
         if str(p.get("accountId")) != str(acct_id):
@@ -2771,6 +2800,363 @@ def reverse_on_account(account: dict, symbol: str, qty: int) -> dict:
 
     return {"account": account.get("account_name"), "ok": False, "skipped": True,
             "error": "No open position to reverse."}
+
+
+# ============================================================
+# EXCHANGE-SIDE OCO BRACKETS (real resting stop + take-profit)
+# ============================================================
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tick_for(symbol) -> float:
+    return _TICK_SIZE.get(symbol_root(str(symbol).upper()), 0.25)
+
+
+def _round_tick(price, tick: float):
+    """Snap a price to the nearest valid exchange tick (or None)."""
+    p = _num(price)
+    if p is None:
+        return None
+    if not tick or tick <= 0:
+        return round(p, 6)
+    return round(round(p / tick) * tick, 6)
+
+
+def _cancel_ok(resp) -> bool:
+    """A cancel actually succeeded (not a swallowed transport failure or a 200-with-
+    failure-body broker reject). None -> failed; dict with a failure field -> failed."""
+    if not isinstance(resp, dict):
+        return False
+    return not (resp.get("failureReason") or resp.get("failureText") or resp.get("error"))
+
+
+def _contract_name(env, token, contract_id) -> str:
+    """Safe contract-name lookup — never raises even if the broker returns a non-dict
+    (a bare string / array), which would blow up a naive `(get_contract(...) or {}).get`."""
+    try:
+        c = tvo.get_contract(env, token, contract_id)
+        if isinstance(c, dict):
+            return str(c.get("name") or "").upper()
+    except Exception:
+        pass
+    return ""
+
+
+def _net_position_for(account, resolved_symbol) -> int:
+    """Signed net position for a contract root on one account (0 if flat / unknown)."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    net = 0
+    for p in (tvo.get_positions(env, token) or []):
+        if str(p.get("accountId")) != str(acct_id):
+            continue
+        n = int(p.get("netPos") or 0)
+        if n == 0:
+            continue
+        cname = _contract_name(env, token, p.get("contractId"))
+        if root and cname and symbol_root(cname) != root:
+            continue
+        net += n
+    return net
+
+
+def _resting_stop_count(account, resolved_symbol) -> int:
+    """How many WORKING stop orders currently rest for this contract on the account."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+        cname = _contract_name(env, token, o.get("contractId"))
+        if not root or (cname and symbol_root(cname) == root):
+            n += 1
+    return n
+
+
+# Retry window while the placeOSO bracket legs register at Tradovate before we decide a
+# stop is genuinely missing (env-tunable so a slow broker doesn't cause a false flatten).
+_STOP_CONFIRM_TRIES = int(os.getenv("BRACKET_CONFIRM_TRIES", "5"))
+_STOP_CONFIRM_DELAY = float(os.getenv("BRACKET_CONFIRM_DELAY", "0.5"))
+
+
+def _ensure_protected_or_flatten(account, resolved_symbol, expected_stops: int):
+    """CRITICAL prop-safety guard. Tradovate's placeOSO is NON-ATOMIC: the market entry
+    can fill while a stop bracket leg is rejected (e.g. price ticks through a tight stop
+    at the instant of the fill), leaving a funded position with no resting stop while the
+    order response still looks 'ok'. After placing the bracket(s), confirm that the
+    expected number of protective stops actually rest for the contract. If an open
+    position remains under-protected, FLATTEN it (cancel working orders + close) so the
+    account is never left naked or partially-naked. Returns a dict to merge into the leg
+    results when it had to intervene, else None."""
+    if expected_stops <= 0:
+        return None
+    for i in range(max(1, _STOP_CONFIRM_TRIES)):
+        if _net_position_for(account, resolved_symbol) == 0:
+            return None                                   # already flat -> nothing to protect
+        if _resting_stop_count(account, resolved_symbol) >= expected_stops:
+            return None                                   # fully protected
+        if i < _STOP_CONFIRM_TRIES - 1:
+            time.sleep(_STOP_CONFIRM_DELAY)
+    if _net_position_for(account, resolved_symbol) == 0:
+        return None
+    # Open position with too few resting stops -> never hold it unprotected. Cancel any
+    # resting legs, then flatten race-safely (server-side liquidation).
+    try:
+        cancel_working_orders_for(account, resolved_symbol)
+    except Exception:
+        pass
+    try:
+        _liquidate_positions_for(account, resolved_symbol)
+    except Exception:
+        pass
+    return {"ok": False, "unprotected_flattened": True,
+            "error": "Protective stop did not rest at the exchange (placeOSO partial reject) — "
+                     "position flattened for safety"}
+
+
+def _bracket_side_ok(side: str, stop, limit) -> bool:
+    """Reject a wrong-side protective bracket so we NEVER place a stop that would
+    trigger the instant it rests. buy: stop below the target; sell: stop above it."""
+    s = str(side).lower()
+    st, lm = _num(stop), _num(limit)
+    if st is not None and lm is not None:
+        if s == "buy" and not (st < lm):
+            return False
+        if s == "sell" and not (st > lm):
+            return False
+    return True
+
+
+def entry_legs_from_alert(side: str, qty: int, extras: dict):
+    """Bracket legs (qty, stop, limit) from a TradingView entry alert:
+      scale-out (qtyScale+qtyRunner+tp1+tp2) -> TWO brackets (scale=tp1, runner=tp2);
+      simple (sl+tp)                          -> ONE bracket;
+      sl only                                 -> a stop-only protective order;
+      no sl                                   -> a single plain market leg (unchanged)."""
+    sl = _num(extras.get("sl"))
+    tp = _num(extras.get("tp"))
+    tp1 = _num(extras.get("tp1"))
+    tp2 = _num(extras.get("tp2"))
+    qscale = extras.get("qtyScale")
+    qrunner = extras.get("qtyRunner")
+    try:
+        qscale = int(qscale) if qscale is not None else None
+        qrunner = int(qrunner) if qrunner is not None else None
+    except (TypeError, ValueError):
+        qscale = qrunner = None
+
+    if sl is not None and tp1 is not None and tp2 is not None and qscale and qrunner:
+        return [(qscale, sl, tp1), (qrunner, sl, tp2)]      # scale-out: two OCO brackets
+    tgt = tp if tp is not None else tp1
+    if sl is not None:
+        return [(int(qty), sl, tgt)]                        # one bracket (or stop-only if tgt None)
+    return [(int(qty), None, None)]                         # plain market entry
+
+
+def execute_bracket_to_accounts(accounts: list, symbol: str, side: str, legs: list) -> dict:
+    """Place resting OCO bracket(s) on every account in parallel (same instant, same
+    price). `legs` = [(qty, stop, limit), ...]. Risk-gated per account; off-tick prices
+    are snapped; a wrong-side bracket is refused rather than placed unprotected."""
+    accounts = list(accounts or [])
+    if not accounts:
+        return {"results": [], "placed": 0, "total": 0, "accounts": 0}
+
+    for a in accounts:                       # refresh tokens up front (serialized)
+        try:
+            ensure_fresh_token(a)
+        except Exception:
+            pass
+
+    resolved = symbol                        # resolve the contract once
+    for a in accounts:
+        tok = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+        if tok:
+            try:
+                resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+                break
+            except Exception:
+                pass
+    tick = _tick_for(resolved)
+
+    def run(a):
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                return [{"account": a.get("account_name"), "ok": False, "error": "Reconnect required"}]
+            # Gate the WHOLE entry ONCE against the TOTAL intended qty. Per-leg gating
+            # read a stale cached net position, so a 2-leg scale-out could let the
+            # account exceed max_position (both legs saw net=0 and both passed).
+            total_qty = sum(max(1, int(q)) for (q, _s, _l) in legs)
+            allowed, reason, breach = risk_gate(a, side, total_qty, resolved)
+            if not allowed:
+                return [{"account": a.get("account_name"), "ok": False,
+                         "error": "Risk: " + reason, "risk_blocked": True, "breach": breach}]
+            out = []
+            expected_stops = 0
+            for (lqty, stop, limit) in legs:
+                lqty = max(1, int(lqty))
+                st = _round_tick(stop, tick)
+                lm = _round_tick(limit, tick)
+                if not _bracket_side_ok(side, st, lm):
+                    # Bad data -> refuse (never leave a naked prop position on a wrong-side stop).
+                    out.append({"account": a.get("account_name"), "ok": False,
+                                "error": f"Bracket refused: wrong-side stop/target (stop={st}, tp={lm})"})
+                    continue
+                resp = tvo.place_bracket_order(env, token, a.get("account_name"), acct_id,
+                                               side, resolved, lqty, st, lm)
+                ok = _order_ok(resp)
+                if ok and st is not None:
+                    expected_stops += 1        # we expect a real resting stop for this leg
+                out.append({"account": a.get("account_name"), "ok": ok,
+                            "response": resp, "stop": st, "limit": lm, "qty": lqty})
+            # CRITICAL: placeOSO is non-atomic — verify the protective stops actually rest;
+            # if a filled position is left under-protected, flatten it for safety.
+            remedy = _ensure_protected_or_flatten(a, resolved, expected_stops)
+            if remedy:
+                for r in out:
+                    r.update(remedy)
+            return out
+        except Exception as e:
+            return [{"account": a.get("account_name"), "ok": False, "error": str(e)}]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(accounts), 16)) as pool:
+        for r in pool.map(run, accounts):
+            results += r
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results),
+            "accounts": len(accounts), "contract": resolved}
+
+
+def cancel_working_orders_for(account: dict, symbol: str) -> int:
+    """Cancel every WORKING order (resting stop/target) for a symbol on one account, so
+    a bracket can't orphan into a naked position after the position is flattened. Only
+    counts a cancel that ACTUALLY succeeded (a swallowed transport failure or a broker
+    reject must not be reported as cancelled)."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    root = symbol_root(str(symbol).upper()) if symbol else ""   # no symbol -> cancel ALL
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id):
+        cname = _contract_name(env, token, o.get("contractId"))
+        if root and cname and symbol_root(cname) != root:
+            continue
+        if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
+            n += 1
+    return n
+
+
+def _liquidate_positions_for(account, symbol) -> int:
+    """Race-safely flatten every open position for a symbol via /order/liquidatePosition
+    (server-side: cancels the position's resting orders AND closes it atomically; no-op
+    when flat). Returns how many positions were liquidated."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(symbol).upper()) if symbol else ""
+    liq = 0
+    for p in (tvo.get_positions(env, token) or []):
+        if str(p.get("accountId")) != str(acct_id):
+            continue
+        if int(p.get("netPos") or 0) == 0:
+            continue
+        cname = _contract_name(env, token, p.get("contractId"))
+        if root and cname and symbol_root(cname) != root:
+            continue
+        tvo.liquidate_position(env, token, acct_id, p.get("contractId"))
+        liq += 1
+    return liq
+
+
+def exit_from_accounts(accounts: list, symbol: str) -> dict:
+    """Idempotent exit for a bracketed strategy. Per account, in THREE independent phases
+    so one failure never skips the flatten:
+      1. cancel resting working orders (best-effort, verified);
+      2. ALWAYS flatten open positions race-safely via /order/liquidatePosition;
+      3. re-cancel any survivors so an orphan leg can never re-open a naked position.
+    A no-op (ok:True, flat) when already flat."""
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        r = {"account": a.get("account_name")}
+        token = ensure_fresh_token(a)
+        if not token or not a.get("account_id"):
+            results.append({**r, "ok": False, "error": "Reconnect required"})
+            continue
+        cancelled = 0
+        try:                                            # phase 1 — cancel (own scope)
+            cancelled = cancel_working_orders_for(a, symbol)
+        except Exception as e:
+            r["cancel_error"] = str(e)
+        try:                                            # phase 2 — flatten ALWAYS runs
+            r["liquidated"] = _liquidate_positions_for(a, symbol)
+        except Exception as e:
+            r["flatten_error"] = str(e)
+        try:                                            # phase 3 — sweep orphan survivors
+            cancelled += cancel_working_orders_for(a, symbol)
+        except Exception:
+            pass
+        r["cancelled"] = cancelled
+        r["flat"] = True
+        r["ok"] = "flatten_error" not in r
+        results.append(r)
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
+def move_stops_to_accounts(accounts: list, symbol: str, new_stop) -> dict:
+    """Move the working STOP order(s) for a symbol to a new price (move_stop -> breakeven).
+    Never opens or adds to a position. Best-effort: if no stop is found the original stop
+    simply stays in place (still protective), which is safe."""
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                results.append({"account": a.get("account_name"), "ok": False, "error": "Reconnect required"})
+                continue
+            orders = tvo.get_orders(env, token)
+            versions = tvo.get_order_versions(env, token)
+            root = symbol_root(str(symbol).upper()) if symbol else ""
+            ns = _round_tick(new_stop, _tick_for(symbol))
+            moved = 0
+            for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+                cname = _contract_name(env, token, o.get("contractId"))
+                if root and cname and symbol_root(cname) != root:
+                    continue
+                tvo.modify_stop_price(env, token, o.get("id"), ns)
+                moved += 1
+            results.append({"account": a.get("account_name"), "ok": True, "moved": moved, "stop": ns})
+        except Exception as e:
+            results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
 
 
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
@@ -6888,8 +7274,10 @@ class WebhookTrade(BaseModel):
 
     client_id: str
     auth: str
-    symbol: str
-    side: str
+    # symbol/side are optional so exit / move_stop alerts (event + auth only) parse;
+    # entries still require them (enforced in risk_check → "Missing symbol").
+    symbol: Optional[str] = None
+    side: Optional[str] = None
     qty: Optional[Any] = 1
     request_id: Optional[str] = None
     # Optional: route this alert to ONE specific connected account (independent
@@ -6995,6 +7383,18 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
     return RedirectResponse(url=dest, status_code=302)
 
 
+def _route_signal_accounts(user, target_name):
+    """Which accounts a webhook targets: one named INDEPENDENT account, else the Copy
+    Trading group, else every connected account. Returns (accounts, route_label)."""
+    if target_name:
+        acct = find_connected_account(user["id"], target_name)
+        return ([acct] if acct else []), "ROUTED"
+    accounts = get_copy_accounts(user["id"])
+    if accounts:
+        return accounts, "COPIED"
+    return get_broker_accounts(user["id"], connected_only=True), "BROADCAST"
+
+
 @app.post("/webhook/trade")
 def webhook_trade(payload: WebhookTrade):
     start_time = time.perf_counter()
@@ -7020,37 +7420,55 @@ def webhook_trade(payload: WebhookTrade):
 
     try:
         target_name = (payload.account or "").strip()
+        extras = payload.model_extra or {}
+        event = str(extras.get("event") or "").lower().strip()
+        brackets_on = _brackets_on_for(user["email"])   # global flag + canary allow-list
 
-        # Dedup is scoped per target so the same strategy alert can hit different
-        # accounts without one blocking the other.
+        # --- Lifecycle events that MANAGE an existing position; they never open one.
+        # This also fixes the old bug where move_stop (side:"buy") was misread as a new
+        # BUY entry, and where exit was dropped for missing fields.
+        if brackets_on and event in ("exit", "move_stop"):
+            if payload.auth != user["webhook_secret"]:
+                raise Exception("Invalid webhook secret.")
+            accounts, route = _route_signal_accounts(user, target_name)
+            sym = (str(payload.symbol).upper() if payload.symbol else None)
+            if event == "exit":
+                response = exit_from_accounts(accounts, sym)          # cancel orders + flatten (idempotent)
+                action = "EXIT"
+                message = f"Exit: cancel working orders + flatten on {response['accounts']} account(s)."
+            else:  # move_stop -> modify the resting stop (e.g. to breakeven)
+                new_stop = extras.get("stop")
+                response = move_stops_to_accounts(accounts, sym, new_stop)
+                moved = sum(int(r.get("moved") or 0) for r in response.get("results", []))
+                action = "MOVE_STOP"
+                message = f"Move stop → {new_stop}: modified {moved} working stop(s) on {response['accounts']} account(s)."
+            latency = round((time.perf_counter() - start_time) * 1000, 3)
+            log_trade(user["id"], request_id, sym or "*", event, 0, "live", "EXECUTED", latency, message, response)
+            return {"ok": True, "action": action, "status": "EXECUTED", "message": message,
+                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
+
+        # --- ENTRY (or legacy buy/sell/flatten/reverse signal). Dedup is scoped per
+        # target so the same alert can hit different accounts without one blocking another.
         dedup_id = f"{target_name}|{request_id}" if target_name else request_id
         symbol, side, qty = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, dedup_id)
 
-        # Routing (independent and copy systems run side-by-side, never crossing):
-        #   - account specified  -> INDEPENDENT: trade ONLY that one account
-        #   - no account         -> MASTER signal: mirror to the Copy Trading group
-        # An account-routed alert never touches the copy group, and a master
-        # signal never touches independent accounts.
-        if target_name:
-            acct = find_connected_account(user["id"], target_name)
-            if not acct:
-                raise Exception(f"Account '{target_name}' is not connected.")
-            accounts = [acct]
-            route = "ROUTED"
-        else:
-            # Master signal: prefer the Copy Trading group. If the user hasn't
-            # placed any accounts in that group yet, fall back to every connected
-            # account so a freshly-connected account still trades cleanly.
-            accounts = get_copy_accounts(user["id"])
-            route = "COPIED"
-            if not accounts:
-                accounts = get_broker_accounts(user["id"], connected_only=True)
-                route = "BROADCAST"
+        # Routing (independent and copy systems run side-by-side, never crossing).
+        accounts, route = _route_signal_accounts(user, target_name)
+        if target_name and not accounts:
+            raise Exception(f"Account '{target_name}' is not connected.")
 
         if accounts:
-            response = execute_to_accounts(accounts, symbol, side, qty)
+            # Real resting OCO bracket(s) when the entry carries a stop (buy/sell only);
+            # scale-out alerts (qtyScale+qtyRunner+tp1+tp2) place TWO independent brackets.
+            legs = entry_legs_from_alert(side, qty, extras) if (brackets_on and side in ("buy", "sell")) else None
+            has_bracket = bool(legs) and any(st is not None for (_q, st, _l) in legs)
+            if has_bracket:
+                response = execute_bracket_to_accounts(accounts, symbol, side, legs)
+                action = route + "_BRACKET"
+            else:
+                response = execute_to_accounts(accounts, symbol, side, qty)
+                action = route
             mode = "live"
-            action = route
             status = "EXECUTED" if (response["placed"] > 0 or response["total"] == 0) else "REJECTED"
             if target_name:
                 scope = f"account {target_name}"
@@ -7058,7 +7476,8 @@ def webhook_trade(payload: WebhookTrade):
                 scope = f"{response['accounts']} connected account(s)"
             else:
                 scope = f"{response['accounts']} copy account(s)"
-            message = f"{route.title()} {response['placed']}/{response['total']} order(s) to {scope}."
+            kind = "bracket" if has_bracket else "order"
+            message = f"{route.title()} {response['placed']}/{response['total']} {kind}(s) to {scope}."
             # If nothing was placed, surface the broker's reason (e.g. token
             # expired -> reconnect) so the failure isn't silent.
             if response["placed"] == 0 and response["total"] > 0:

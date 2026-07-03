@@ -209,11 +209,136 @@ def get_orders(env: str, token: str) -> list:
     return data if isinstance(data, list) else []
 
 
+def get_order_versions(env: str, token: str) -> list:
+    """orderVersion/list — carries the orderType (Stop/Limit), price and stopPrice for
+    each order (the Order entity itself does not), so we can tell a resting stop from a
+    resting target when modifying/cancelling exits."""
+    data = _get(env, token, "/orderVersion/list")
+    return data if isinstance(data, list) else []
+
+
 def get_cash_snapshot(env: str, token: str, account_id):
     try:
         return _post(env, token, "/cashBalance/getCashBalanceSnapshot", {"accountId": int(account_id)})
     except Exception:
         return None
+
+
+_WORKING_STATUSES = ("working", "pending", "suspended", "queued", "received", "accepted")
+
+
+def place_bracket_order(env: str, token: str, account_spec, account_id, action: str,
+                        symbol: str, qty: int, stop_price=None, limit_price=None):
+    """Place a MARKET entry with a resting OCO bracket at the exchange (placeOSO): the
+    stop and take-profit sit as working orders the instant the entry fills, so they fill
+    at price-or-better and survive a server/VPS/internet outage. The bracket legs are the
+    OPPOSITE action of the entry. If NEITHER a stop nor a limit is supplied, this degrades
+    to a plain market order (unchanged behaviour for strategies that send no levels).
+
+    Returns the parsed Tradovate response dict, or {"error": ...} on transport failure.
+    """
+    contract = resolve_contract(env, token, symbol)
+    entry_action = "Buy" if str(action).lower() == "buy" else "Sell"
+    exit_action = "Sell" if entry_action == "Buy" else "Buy"
+    body = {
+        "accountSpec": str(account_spec),
+        "accountId": int(account_id),
+        "action": entry_action,
+        "symbol": str(contract).upper(),
+        "orderQty": int(qty),
+        "orderType": "Market",
+        "isAutomated": True,
+        "timeInForce": "Day",
+    }
+    brackets = []
+    if stop_price is not None:
+        brackets.append({"action": exit_action, "orderType": "Stop", "stopPrice": float(stop_price)})
+    if limit_price is not None:
+        brackets.append({"action": exit_action, "orderType": "Limit", "price": float(limit_price)})
+    if not brackets:                       # no exits -> plain market entry
+        resp = _post(env, token, "/order/placeorder", body)
+        return resp if resp is not None else {"error": "request failed"}
+    body["bracket1"] = brackets[0]
+    if len(brackets) > 1:
+        body["bracket2"] = brackets[1]
+    resp = _post(env, token, "/order/placeOSO", body)
+    return resp if resp is not None else {"error": "request failed"}
+
+
+def modify_stop_price(env: str, token: str, order_id, new_stop, qty=None):
+    """Move an existing working STOP order to a new price (used by move_stop → breakeven).
+    Never opens/adds a position — it only edits a resting order."""
+    body = {"orderId": int(order_id), "orderType": "Stop",
+            "stopPrice": float(new_stop), "isAutomated": True}
+    if qty is not None:
+        body["orderQty"] = int(qty)
+    try:
+        return _post(env, token, "/order/modifyorder", body)
+    except Exception:
+        return None
+
+
+def liquidate_position(env: str, token: str, account_id, contract_id):
+    """Flatten a whole position for a contract server-side, RACE-SAFELY, in one call:
+    Tradovate's /order/liquidatePosition cancels the position's resting orders AND
+    closes the position atomically, and is a clean no-op (200) when already flat. This
+    avoids the read-then-offset race of a manual market close (which can open a fresh
+    reverse position if the position closes between the position read and the order)."""
+    body = {"accountId": int(account_id), "contractId": int(contract_id), "admin": False}
+    try:
+        return _post(env, token, "/order/liquidatePosition", body)
+    except Exception:
+        return None
+
+
+def place_stop_order(env: str, token: str, account_spec, account_id, action: str,
+                     symbol: str, qty: int, stop_price):
+    """Place a standalone working STOP order — used to RE-PROTECT a position when a
+    placeOSO bracket's stop leg was rejected (non-atomic OSO) so the account is never
+    left naked. `action` is the EXIT action (opposite the entry). Returns parsed resp."""
+    contract = resolve_contract(env, token, symbol)
+    body = {
+        "accountSpec": str(account_spec),
+        "accountId": int(account_id),
+        "action": "Buy" if str(action).lower() == "buy" else "Sell",
+        "symbol": str(contract).upper(),
+        "orderQty": int(qty),
+        "orderType": "Stop",
+        "stopPrice": float(stop_price),
+        "isAutomated": True,
+        "timeInForce": "Day",
+    }
+    resp = _post(env, token, "/order/placeorder", body)
+    return resp if resp is not None else {"error": "request failed"}
+
+
+def working_orders_for(orders: list, versions: list, account_id, contract_id=None,
+                       order_type: str = None) -> list:
+    """Join order/list with orderVersion/list to return WORKING orders for an account
+    (optionally one contract and/or one orderType like 'Stop'), each annotated with
+    {id, orderType, stopPrice, price, contractId}. Used by move_stop and exit."""
+    ver_by_order = {}
+    for v in versions or []:
+        oid = v.get("orderId")
+        if oid is not None:
+            ver_by_order[oid] = v          # latest wins (list is chronological)
+    out = []
+    for o in orders or []:
+        if str(o.get("accountId")) != str(account_id):
+            continue
+        status = str(o.get("ordStatus") or o.get("status") or "").lower()
+        if status not in _WORKING_STATUSES:
+            continue
+        cid = o.get("contractId")
+        if contract_id is not None and str(cid) != str(contract_id):
+            continue
+        v = ver_by_order.get(o.get("id"), {})
+        otype = str(v.get("orderType") or o.get("orderType") or "")
+        if order_type is not None and otype.lower() != order_type.lower():
+            continue
+        out.append({"id": o.get("id"), "orderType": otype, "contractId": cid,
+                    "stopPrice": v.get("stopPrice"), "price": v.get("price")})
+    return out
 
 
 def cancel_order(env: str, token: str, order_id):
