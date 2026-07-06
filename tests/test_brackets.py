@@ -159,6 +159,28 @@ def test_handler_no_levels_routes_to_plain(monkeypatch):
     assert cap.get("plain") is True and "bracket" not in cap
 
 
+def test_handler_noncanary_user_with_levels_stays_plain(monkeypatch):
+    # BACKWARD-COMPAT / rollout guarantee: a user NOT on the bracket allow-list keeps
+    # plain market orders even when their alert carries sl/tp -> every existing client is
+    # byte-for-byte unchanged until brackets are enabled for everyone.
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "BRACKET_ORDERS", True)
+    monkeypatch.setattr(appmod, "BRACKET_ORDERS_ONLY_USERS", {"only-admin@x.com"})   # NOT this user
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_to_accounts",
+                        lambda *a, **k: cap.update(plain=True) or {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    monkeypatch.setattr(appmod, "execute_bracket_to_accounts",
+                        lambda *a, **k: cap.update(bracket=True) or {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "symbol": "MNQ1!", "side": "buy",
+                                             "event": "entry", "qtyTotal": 2, "qtyScale": 1, "qtyRunner": 1,
+                                             "sl": 29960, "tp1": 30012, "tp2": 30080})
+    assert r.status_code == 200
+    assert cap.get("plain") is True and "bracket" not in cap    # brackets OFF for a non-canary user
+
+
 def test_handler_move_stop_modifies_not_entry(monkeypatch):
     uid, email, secret = _mk_user()
     cap = {}
