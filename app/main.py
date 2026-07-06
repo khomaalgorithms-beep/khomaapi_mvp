@@ -3007,6 +3007,17 @@ def execute_bracket_to_accounts(accounts: list, symbol: str, side: str, legs: li
             if not allowed:
                 return [{"account": a.get("account_name"), "ok": False,
                          "error": "Risk: " + reason, "risk_blocked": True, "breach": breach}]
+            # Fresh-entry reset: a bracket entry opens ONE new position. If a prior one
+            # is still open (its bracket hasn't filled yet, or a re-entry raced the exit
+            # alert), flatten it + cancel its stale orders FIRST so the new bracket can
+            # never stack on a leftover. No-op when already flat (the common case: one
+            # get_positions check).
+            try:
+                if _net_position_for(a, resolved) != 0:
+                    cancel_working_orders_for(a, resolved)
+                    flatten_on_account(a, resolved)
+            except Exception as e:
+                print(f"execute_bracket_to_accounts: pre-entry reset failed (acct {a.get('id')}): {e}")
             out = []
             expected_stops = 0
             for (lqty, stop, limit) in legs:

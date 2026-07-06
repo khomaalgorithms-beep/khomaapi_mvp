@@ -295,6 +295,42 @@ def test_bracket_aggregate_risk_gate_uses_total_qty(monkeypatch):
     assert calls == [2]                                           # ONE gate, total qty
 
 
+def test_bracket_entry_flattens_leftover_before_placing(monkeypatch):
+    # Fresh-entry reset: if a position is still open (a diverged/un-filled bracket), the
+    # new entry flattens it + cancels stale orders BEFORE placing, so it can't stack.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "dec", lambda x: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "risk_gate", lambda a, side, qty, sym: (True, "", False))
+    monkeypatch.setattr(appmod, "_net_position_for", lambda a, s: 2)     # leftover long 2
+    did = {}
+    monkeypatch.setattr(appmod, "cancel_working_orders_for", lambda a, s: did.setdefault("cancel", True))
+    monkeypatch.setattr(appmod, "flatten_on_account", lambda a, s: (did.setdefault("flatten", True), [])[1])
+    monkeypatch.setattr(tvo, "place_bracket_order", lambda *a, **k: {"orderId": 1})
+    monkeypatch.setattr(appmod, "_ensure_protected_or_flatten", lambda a, s, n: None)
+    accts = [{"account_name": "A", "account_id": 44, "env": "demo", "access_token_enc": "x"}]
+    legs = [(1, 29960.0, 30012.0), (1, 29960.0, 30080.0)]
+    r = appmod.execute_bracket_to_accounts(accts, "MNQ1!", "buy", legs)
+    assert did.get("flatten") is True and did.get("cancel") is True     # leftover cleared first
+    assert r["placed"] == 2                                             # then new bracket placed
+
+
+def test_bracket_entry_no_reset_when_flat(monkeypatch):
+    # Already flat -> the reset is a no-op (no flatten), just places the bracket.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "dec", lambda x: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "risk_gate", lambda a, side, qty, sym: (True, "", False))
+    monkeypatch.setattr(appmod, "_net_position_for", lambda a, s: 0)     # already flat
+    did = {}
+    monkeypatch.setattr(appmod, "flatten_on_account", lambda a, s: (did.setdefault("flatten", True), [])[1])
+    monkeypatch.setattr(tvo, "place_bracket_order", lambda *a, **k: {"orderId": 1})
+    monkeypatch.setattr(appmod, "_ensure_protected_or_flatten", lambda a, s, n: None)
+    accts = [{"account_name": "A", "account_id": 44, "env": "demo", "access_token_enc": "x"}]
+    r = appmod.execute_bracket_to_accounts(accts, "MNQ1!", "buy", [(1, 29960.0, 30012.0)])
+    assert "flatten" not in did and r["placed"] == 1
+
+
 def test_exit_flatten_runs_even_if_cancel_raises(monkeypatch):
     # A cancel-phase exception must NEVER skip the flatten (it's the prop kill-switch).
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
