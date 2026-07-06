@@ -481,9 +481,9 @@ def init_db():
         automation_status TEXT DEFAULT 'Paused',
         live_mode TEXT DEFAULT 'simulation',
         max_contracts INTEGER DEFAULT 2,
-        max_orders INTEGER DEFAULT 10,
+        max_orders INTEGER DEFAULT 200,
         duplicate_seconds INTEGER DEFAULT 8,
-        max_rejections_per_day INTEGER DEFAULT 3,
+        max_rejections_per_day INTEGER DEFAULT 50,
         allowed_symbols TEXT DEFAULT '*',
         created_at TEXT
     )
@@ -4327,7 +4327,7 @@ def emergency_risk_check(user_id: int):
     ).fetchone()["n"]
     con.close()
 
-    max_rejections = int(user["max_rejections_per_day"] or 3) if user else 3
+    max_rejections = int(user["max_rejections_per_day"] or 50) if user else 50
 
     if int(rejected or 0) >= max_rejections:
         raise Exception(f"SYSTEM LOCK: Too many rejected trades today ({rejected}/{max_rejections}).")
