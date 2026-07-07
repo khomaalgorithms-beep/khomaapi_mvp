@@ -89,9 +89,25 @@ def debug_static():
 DB_PATH = Path(os.getenv("KHOMA_DB_PATH", str(BASE_DIR / "khomaapi_v31.db")))
 KEY_PATH = BASE_DIR / ".khoma_secret_v31"
 
-if not KEY_PATH.exists():
-    KEY_PATH.write_text(Fernet.generate_key().decode(), encoding="utf-8")
-FERNET = Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode())
+# CRITICAL: the encryption key MUST be stable across deploys/restarts, or every
+# stored broker token becomes undecryptable and every client is forced to
+# reconnect. On Railway the container filesystem is ephemeral, so a file-based key
+# silently rotates on each restart. Pin it to the KHOMA_ENC_KEY env var (persistent
+# config) as the source of truth; fall back to the on-disk key only for local dev.
+def _load_fernet():
+    env_key = (os.getenv("KHOMA_ENC_KEY") or "").strip()
+    if env_key:
+        try:
+            return Fernet(env_key.encode()), "env"
+        except Exception as e:
+            print(f"KHOMA_ENC_KEY is set but invalid ({e}); falling back to key file")
+    if not KEY_PATH.exists():
+        KEY_PATH.write_text(Fernet.generate_key().decode(), encoding="utf-8")
+    return Fernet(KEY_PATH.read_text(encoding="utf-8").strip().encode()), "file"
+
+
+FERNET, _FERNET_SOURCE = _load_fernet()
+print(f"FERNET key source: {_FERNET_SOURCE}")
 
 # Maps a short-lived OAuth `state` value -> user_id, so the Tradovate
 # callback can be tied back to the user who started the connect flow.
@@ -136,6 +152,35 @@ WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "").strip()
 PUBLIC_TRACK_EMAIL = os.getenv("PUBLIC_TRACK_EMAIL", "khomadima89@gmail.com").strip().lower()
 PUBLIC_TRACK_NAME = os.getenv("PUBLIC_TRACK_NAME", "KhomaAPI — Verified Results").strip()
 PUBLIC_TRACK_ACCOUNT_IDS = [s.strip() for s in os.getenv("PUBLIC_TRACK_ACCOUNT_IDS", "").split(",") if s.strip()]
+
+# Real resting exchange-side OCO brackets: when an entry alert carries sl/tp levels,
+# place the stop + take-profit as WORKING orders at Tradovate (placeOSO) so exits fill
+# at price-or-better and survive a server/VPS/internet outage. Instant kill-switch:
+# set BRACKET_ORDERS=0 to revert to plain market entries without a redeploy.
+BRACKET_ORDERS = os.getenv("BRACKET_ORDERS", "1") == "1"
+# Canary rollout: if set (comma-separated emails), real OCO brackets run for ONLY these
+# users; EVERY other client keeps plain market entries, byte-for-byte unchanged. Lets us
+# demo-test on one account with zero client risk, then clear the var to enable for all.
+BRACKET_ORDERS_ONLY_USERS = {e.strip().lower() for e in
+                             os.getenv("BRACKET_ORDERS_ONLY_USERS", "").split(",") if e.strip()}
+
+
+def _brackets_on_for(email: str) -> bool:
+    """Are real OCO brackets enabled for this user? Global flag AND (canary empty OR
+    the user is in the canary allow-list)."""
+    if not BRACKET_ORDERS:
+        return False
+    if BRACKET_ORDERS_ONLY_USERS:
+        return str(email or "").lower() in BRACKET_ORDERS_ONLY_USERS
+    return True
+
+# Tick size per futures root, for rounding sl/tp to a valid exchange price so a bracket
+# is never rejected for an off-tick price (which would risk a naked entry).
+_TICK_SIZE = {
+    "ES": 0.25, "MES": 0.25, "NQ": 0.25, "MNQ": 0.25, "YM": 1.0, "MYM": 1.0,
+    "RTY": 0.1, "M2K": 0.1, "CL": 0.01, "MCL": 0.01, "GC": 0.1, "MGC": 0.1,
+    "SI": 0.005, "6E": 0.00005, "6B": 0.0001, "6J": 0.0000005,
+}
 
 
 def google_login_button() -> str:
@@ -214,7 +259,16 @@ def enc(value: str) -> str:
 
 
 def dec(value: Optional[str]) -> str:
-    return FERNET.decrypt(value.encode()).decode() if value else ""
+    # A token encrypted with a different/rotated key raises Fernet's InvalidToken,
+    # whose message is BLANK — which previously surfaced as an empty 'REJECTED' with
+    # no reason. Treat any decrypt failure as "no usable token" so the caller cleanly
+    # asks the user to reconnect instead of throwing an unexplained error.
+    if not value:
+        return ""
+    try:
+        return FERNET.decrypt(value.encode()).decode()
+    except Exception:
+        return ""
 
 
 def hash_password(password: str) -> str:
@@ -427,9 +481,9 @@ def init_db():
         automation_status TEXT DEFAULT 'Paused',
         live_mode TEXT DEFAULT 'simulation',
         max_contracts INTEGER DEFAULT 2,
-        max_orders INTEGER DEFAULT 10,
+        max_orders INTEGER DEFAULT 200,
         duplicate_seconds INTEGER DEFAULT 8,
-        max_rejections_per_day INTEGER DEFAULT 3,
+        max_rejections_per_day INTEGER DEFAULT 50,
         allowed_symbols TEXT DEFAULT '*',
         created_at TEXT
     )
@@ -2248,6 +2302,39 @@ def daily_pnl_map(user_id: int, start_date: str = None, end_date: str = None, on
     return {r["trade_date"]: (r["pnl"] or 0) for r in rows}
 
 
+def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None, only_account_id=None) -> dict:
+    """{ 'YYYY-MM-DD'(ET): summed realized P&L } from the permanent trade_log ledger
+    for ONE user — the authoritative realized-P&L source (same data the public
+    results page uses), so the journal calendar matches the trade history instead of
+    relying on the unreliable daily_equity equity snapshots. ET dates, inclusive."""
+    q = ("SELECT account_id, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
+         "FROM trade_log WHERE user_id=?")
+    params = [user_id]
+    if only_account_id not in (None, "", "all"):
+        try:
+            q += " AND account_id=?"
+            params.append(int(only_account_id))
+        except (TypeError, ValueError):
+            pass
+    con = db()
+    rows = con.execute(q, tuple(params)).fetchall()
+    con.close()
+    out, seen = {}, set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
+        day = _et_day(r["closed_at"])
+        if not day:
+            continue
+        if (start_date and day < start_date) or (end_date and day > end_date):
+            continue
+        out[day] = round(out.get(day, 0.0) + float(r["pnl"] or 0), 2)
+    return out
+
+
 def period_pnl_stats(user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
     """Net + per-day stats over a date range, from persisted daily PnL."""
     m = daily_pnl_map(user_id, start_date, end_date, only_account_id)
@@ -2290,18 +2377,23 @@ def account_total_profit(account_id) -> float:
 
 
 def apply_persisted_pnl(s: dict, user_id: int, start_date: str, end_date: str, only_account_id=None) -> dict:
-    """Override a journal_analytics() result's daily PnL, net, day stats, and
-    equity curve with PERSISTED daily PnL (penny-exact, full history). Trip-level
-    stats (win rate, profit factor, per-trade) are left as-is. If no snapshots
-    exist yet (e.g. right after first deploy), the trip-based values are kept."""
-    persisted = daily_pnl_map(user_id, start_date, end_date, only_account_id)
-    if not persisted:
+    """Override a journal_analytics() result's daily PnL, net, day stats, and equity
+    curve with the permanent trade ledger — REALIZED closed round-trips only, the
+    exact same source as the trade list and /results. Trip-level stats (win rate,
+    profit factor, per-trade) are left as-is.
+
+    Deliberately does NOT use the daily_equity snapshot table: those snapshots record
+    netLiq day P&L (realized + UNREALIZED open positions), which would put a phantom
+    value on the calendar for a day that has an open position but no closed trade
+    (e.g. an open short shows '+$307' while the trade list shows nothing). Ledger-only
+    keeps the calendar perfectly consistent with the trades."""
+    ledger = ledger_daily_map(user_id, start_date, end_date, only_account_id)   # authoritative trade_log
+    if not ledger:
         return s
-    # LIVE trip data wins for any day it covers (it's the accurate broker record);
-    # persisted only fills OLDER days Tradovate no longer returns fills for. This
-    # prevents a persisted $0 from wiping out a client's real P&L.
+    # LIVE trips (freshest broker record) win for any day they cover; the ledger
+    # backfills days whose fills have aged out of Tradovate's window. Never summed.
     trip_daily = s.get("daily", {})
-    daily = {**persisted, **trip_daily}
+    daily = {**ledger, **trip_daily}
     vals = list(daily.values())
     s["daily"] = daily
     s["net"] = round(sum(vals), 2)
@@ -2546,6 +2638,22 @@ async def digest_loop():
         await asyncio.sleep(600)
 
 
+async def trade_ledger_loop():
+    """Capture EVERY connected client's closed round-trips into the permanent ledger
+    on a tight cadence, so realized P&L is recorded while broker tokens are valid and
+    fills are fresh — and stays visible on every client's dashboard/journal after the
+    fills age out. Leader-only; resilient per user."""
+    print("TRADE-LEDGER scheduler started (2-min cadence)")
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            if await loop.run_in_executor(None, try_become_leader):
+                await loop.run_in_executor(None, persist_all_account_trades)
+        except Exception as e:
+            print("TRADE-LEDGER ERROR:", e)
+        await asyncio.sleep(120)
+
+
 @app.on_event("startup")
 async def _start_watchdog():
     # Disable with KHOMA_DISABLE_WATCHDOG=1 (e.g. in tests / CI).
@@ -2553,6 +2661,7 @@ async def _start_watchdog():
         return
     asyncio.create_task(risk_watchdog_loop())
     asyncio.create_task(digest_loop())
+    asyncio.create_task(trade_ledger_loop())
 
 
 def _order_ok(resp) -> bool:
@@ -2646,7 +2755,7 @@ def flatten_on_account(account: dict, symbol: str) -> list:
     if not token or not acct_id:
         return [{"account": account.get("account_name"), "ok": False, "error": "Reconnect required"}]
 
-    root = symbol_root(str(symbol).upper())
+    root = symbol_root(str(symbol).upper()) if symbol else ""   # no symbol -> flatten ALL
     results = []
     for p in (tvo.get_positions(env, token) or []):
         if str(p.get("accountId")) != str(acct_id):
@@ -2691,6 +2800,390 @@ def reverse_on_account(account: dict, symbol: str, qty: int) -> dict:
 
     return {"account": account.get("account_name"), "ok": False, "skipped": True,
             "error": "No open position to reverse."}
+
+
+# ============================================================
+# EXCHANGE-SIDE OCO BRACKETS (real resting stop + take-profit)
+# ============================================================
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tick_for(symbol) -> float:
+    return _TICK_SIZE.get(symbol_root(str(symbol).upper()), 0.25)
+
+
+def _round_tick(price, tick: float):
+    """Snap a price to the nearest valid exchange tick (or None)."""
+    p = _num(price)
+    if p is None:
+        return None
+    if not tick or tick <= 0:
+        return round(p, 6)
+    return round(round(p / tick) * tick, 6)
+
+
+def _cancel_ok(resp) -> bool:
+    """A cancel actually succeeded (not a swallowed transport failure or a 200-with-
+    failure-body broker reject). None -> failed; dict with a failure field -> failed."""
+    if not isinstance(resp, dict):
+        return False
+    return not (resp.get("failureReason") or resp.get("failureText") or resp.get("error"))
+
+
+_CONTRACT_NAME_CACHE: dict = {}   # contract_id -> name (immutable per id; safe to cache forever)
+
+
+def _contract_name(env, token, contract_id) -> str:
+    """Safe contract-name lookup — never raises even if the broker returns a non-dict
+    (a bare string / array), which would blow up a naive `(get_contract(...) or {}).get`.
+    Caches by contract_id and retries once: a BLANK name is a symbol-scoping HAZARD — the
+    guards below fail closed on an empty name, so a transient 429/timeout must not blank it
+    (that was the bug where a rate-limited lookup misfired an exit/move_stop onto the wrong
+    contract)."""
+    if contract_id is None:
+        return ""
+    cached = _CONTRACT_NAME_CACHE.get(contract_id)
+    if cached:
+        return cached
+    for _ in range(2):                     # one retry — don't let a transient blip blank the name
+        try:
+            c = tvo.get_contract(env, token, contract_id)
+            if isinstance(c, dict):
+                name = str(c.get("name") or "").upper()
+                if name:
+                    _CONTRACT_NAME_CACHE[contract_id] = name
+                    return name
+        except Exception:
+            pass
+    return ""
+
+
+def _net_position_for(account, resolved_symbol) -> int:
+    """Signed net position for a contract root on one account (0 if flat / unknown)."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    net = 0
+    for p in (tvo.get_positions(env, token) or []):
+        if str(p.get("accountId")) != str(acct_id):
+            continue
+        n = int(p.get("netPos") or 0)
+        if n == 0:
+            continue
+        cname = _contract_name(env, token, p.get("contractId"))
+        if root and cname and symbol_root(cname) != root:
+            continue
+        net += n
+    return net
+
+
+def _resting_stop_count(account, resolved_symbol) -> int:
+    """How many WORKING stop orders currently rest for this contract on the account."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+        cname = _contract_name(env, token, o.get("contractId"))
+        if not root or (cname and symbol_root(cname) == root):
+            n += 1
+    return n
+
+
+# Retry window while the placeOSO bracket legs register at Tradovate before we decide a
+# stop is genuinely missing (env-tunable so a slow broker doesn't cause a false flatten).
+_STOP_CONFIRM_TRIES = int(os.getenv("BRACKET_CONFIRM_TRIES", "5"))
+_STOP_CONFIRM_DELAY = float(os.getenv("BRACKET_CONFIRM_DELAY", "0.5"))
+
+
+def _ensure_protected_or_flatten(account, resolved_symbol, expected_stops: int):
+    """CRITICAL prop-safety guard. Tradovate's placeOSO is NON-ATOMIC: the market entry
+    can fill while a stop bracket leg is rejected (e.g. price ticks through a tight stop
+    at the instant of the fill), leaving a funded position with no resting stop while the
+    order response still looks 'ok'. After placing the bracket(s), confirm that the
+    expected number of protective stops actually rest for the contract. If an open
+    position remains under-protected, FLATTEN it (cancel working orders + close) so the
+    account is never left naked or partially-naked. Returns a dict to merge into the leg
+    results when it had to intervene, else None."""
+    if expected_stops <= 0:
+        return None
+    for i in range(max(1, _STOP_CONFIRM_TRIES)):
+        if _net_position_for(account, resolved_symbol) == 0:
+            return None                                   # already flat -> nothing to protect
+        if _resting_stop_count(account, resolved_symbol) >= expected_stops:
+            return None                                   # fully protected
+        if i < _STOP_CONFIRM_TRIES - 1:
+            time.sleep(_STOP_CONFIRM_DELAY)
+    if _net_position_for(account, resolved_symbol) == 0:
+        return None
+    # Open position with too few resting stops -> never hold it unprotected. Cancel any
+    # resting legs, then flatten race-safely (server-side liquidation).
+    try:
+        cancel_working_orders_for(account, resolved_symbol)
+    except Exception:
+        pass
+    try:
+        _liquidate_positions_for(account, resolved_symbol)
+    except Exception:
+        pass
+    return {"ok": False, "unprotected_flattened": True,
+            "error": "Protective stop did not rest at the exchange (placeOSO partial reject) — "
+                     "position flattened for safety"}
+
+
+def _bracket_side_ok(side: str, stop, limit) -> bool:
+    """Reject a wrong-side protective bracket so we NEVER place a stop that would
+    trigger the instant it rests. buy: stop below the target; sell: stop above it."""
+    s = str(side).lower()
+    st, lm = _num(stop), _num(limit)
+    if st is not None and lm is not None:
+        if s == "buy" and not (st < lm):
+            return False
+        if s == "sell" and not (st > lm):
+            return False
+    return True
+
+
+def entry_legs_from_alert(side: str, qty: int, extras: dict):
+    """Bracket legs (qty, stop, limit) from a TradingView entry alert:
+      scale-out (qtyScale+qtyRunner+tp1+tp2) -> TWO brackets (scale=tp1, runner=tp2);
+      simple (sl+tp)                          -> ONE bracket;
+      sl only                                 -> a stop-only protective order;
+      no sl                                   -> a single plain market leg (unchanged)."""
+    sl = _num(extras.get("sl"))
+    tp = _num(extras.get("tp"))
+    tp1 = _num(extras.get("tp1"))
+    tp2 = _num(extras.get("tp2"))
+    qscale = extras.get("qtyScale")
+    qrunner = extras.get("qtyRunner")
+    try:
+        qscale = int(qscale) if qscale is not None else None
+        qrunner = int(qrunner) if qrunner is not None else None
+    except (TypeError, ValueError):
+        qscale = qrunner = None
+
+    if sl is not None and tp1 is not None and tp2 is not None and qscale and qrunner:
+        return [(qscale, sl, tp1), (qrunner, sl, tp2)]      # scale-out: two OCO brackets
+    tgt = tp if tp is not None else tp1
+    if sl is not None:
+        return [(int(qty), sl, tgt)]                        # one bracket (or stop-only if tgt None)
+    return [(int(qty), None, None)]                         # plain market entry
+
+
+def execute_bracket_to_accounts(accounts: list, symbol: str, side: str, legs: list) -> dict:
+    """Place resting OCO bracket(s) on every account in parallel (same instant, same
+    price). `legs` = [(qty, stop, limit), ...]. Risk-gated per account; off-tick prices
+    are snapped; a wrong-side bracket is refused rather than placed unprotected."""
+    accounts = list(accounts or [])
+    if not accounts:
+        return {"results": [], "placed": 0, "total": 0, "accounts": 0}
+
+    for a in accounts:                       # refresh tokens up front (serialized)
+        try:
+            ensure_fresh_token(a)
+        except Exception:
+            pass
+
+    resolved = symbol                        # resolve the contract once
+    for a in accounts:
+        tok = dec(a["access_token_enc"]) if a.get("access_token_enc") else ""
+        if tok:
+            try:
+                resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+                break
+            except Exception:
+                pass
+    tick = _tick_for(resolved)
+
+    def run(a):
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                return [{"account": a.get("account_name"), "ok": False, "error": "Reconnect required"}]
+            # Gate the WHOLE entry ONCE against the TOTAL intended qty. Per-leg gating
+            # read a stale cached net position, so a 2-leg scale-out could let the
+            # account exceed max_position (both legs saw net=0 and both passed).
+            total_qty = sum(max(1, int(q)) for (q, _s, _l) in legs)
+            allowed, reason, breach = risk_gate(a, side, total_qty, resolved)
+            if not allowed:
+                return [{"account": a.get("account_name"), "ok": False,
+                         "error": "Risk: " + reason, "risk_blocked": True, "breach": breach}]
+            # Fresh-entry reset: a bracket entry opens ONE new position. If a prior one
+            # is still open (its bracket hasn't filled yet, or a re-entry raced the exit
+            # alert), flatten it + cancel its stale orders FIRST so the new bracket can
+            # never stack on a leftover. No-op when already flat (the common case: one
+            # get_positions check).
+            try:
+                if _net_position_for(a, resolved) != 0:
+                    cancel_working_orders_for(a, resolved)
+                    flatten_on_account(a, resolved)
+            except Exception as e:
+                print(f"execute_bracket_to_accounts: pre-entry reset failed (acct {a.get('id')}): {e}")
+            out = []
+            expected_stops = 0
+            for (lqty, stop, limit) in legs:
+                lqty = max(1, int(lqty))
+                st = _round_tick(stop, tick)
+                lm = _round_tick(limit, tick)
+                if not _bracket_side_ok(side, st, lm):
+                    # Bad data -> refuse (never leave a naked prop position on a wrong-side stop).
+                    out.append({"account": a.get("account_name"), "ok": False,
+                                "error": f"Bracket refused: wrong-side stop/target (stop={st}, tp={lm})"})
+                    continue
+                resp = tvo.place_bracket_order(env, token, a.get("account_name"), acct_id,
+                                               side, resolved, lqty, st, lm)
+                ok = _order_ok(resp)
+                if ok and st is not None:
+                    expected_stops += 1        # we expect a real resting stop for this leg
+                out.append({"account": a.get("account_name"), "ok": ok,
+                            "response": resp, "stop": st, "limit": lm, "qty": lqty})
+            # CRITICAL: placeOSO is non-atomic — verify the protective stops actually rest;
+            # if a filled position is left under-protected, flatten it for safety.
+            remedy = _ensure_protected_or_flatten(a, resolved, expected_stops)
+            if remedy:
+                for r in out:
+                    r.update(remedy)
+            return out
+        except Exception as e:
+            return [{"account": a.get("account_name"), "ok": False, "error": str(e)}]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(accounts), 16)) as pool:
+        for r in pool.map(run, accounts):
+            results += r
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results),
+            "accounts": len(accounts), "contract": resolved}
+
+
+def cancel_working_orders_for(account: dict, symbol: str) -> int:
+    """Cancel every WORKING order (resting stop/target) for a symbol on one account, so
+    a bracket can't orphan into a naked position after the position is flattened. Only
+    counts a cancel that ACTUALLY succeeded (a swallowed transport failure or a broker
+    reject must not be reported as cancelled)."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    root = symbol_root(str(symbol).upper()) if symbol else ""   # no symbol -> cancel ALL
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id):
+        cname = _contract_name(env, token, o.get("contractId"))
+        if root and (not cname or symbol_root(cname) != root):   # fail closed: never cancel an unidentifiable order
+            continue
+        if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
+            n += 1
+    return n
+
+
+def _liquidate_positions_for(account, symbol) -> int:
+    """Race-safely flatten every open position for a symbol via /order/liquidatePosition
+    (server-side: cancels the position's resting orders AND closes it atomically; no-op
+    when flat). Returns how many positions were liquidated."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(symbol).upper()) if symbol else ""
+    liq = 0
+    for p in (tvo.get_positions(env, token) or []):
+        if str(p.get("accountId")) != str(acct_id):
+            continue
+        if int(p.get("netPos") or 0) == 0:
+            continue
+        cname = _contract_name(env, token, p.get("contractId"))
+        if root and (not cname or symbol_root(cname) != root):   # fail closed: never liquidate an unidentifiable position
+            continue
+        tvo.liquidate_position(env, token, acct_id, p.get("contractId"))
+        liq += 1
+    return liq
+
+
+def exit_from_accounts(accounts: list, symbol: str) -> dict:
+    """Idempotent exit for a bracketed strategy. Per account, in THREE independent phases
+    so one failure never skips the flatten:
+      1. cancel resting working orders (best-effort, verified);
+      2. ALWAYS flatten open positions race-safely via /order/liquidatePosition;
+      3. re-cancel any survivors so an orphan leg can never re-open a naked position.
+    A no-op (ok:True, flat) when already flat."""
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        r = {"account": a.get("account_name")}
+        token = ensure_fresh_token(a)
+        if not token or not a.get("account_id"):
+            results.append({**r, "ok": False, "error": "Reconnect required"})
+            continue
+        cancelled = 0
+        try:                                            # phase 1 — cancel (own scope)
+            cancelled = cancel_working_orders_for(a, symbol)
+        except Exception as e:
+            r["cancel_error"] = str(e)
+        try:                                            # phase 2 — flatten ALWAYS runs
+            r["liquidated"] = _liquidate_positions_for(a, symbol)
+        except Exception as e:
+            r["flatten_error"] = str(e)
+        try:                                            # phase 3 — sweep orphan survivors
+            cancelled += cancel_working_orders_for(a, symbol)
+        except Exception:
+            pass
+        r["cancelled"] = cancelled
+        r["flat"] = True
+        r["ok"] = "flatten_error" not in r
+        results.append(r)
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
+def move_stops_to_accounts(accounts: list, symbol: str, new_stop) -> dict:
+    """Move the working STOP order(s) for a symbol to a new price (move_stop -> breakeven).
+    Never opens or adds to a position. Best-effort: if no stop is found the original stop
+    simply stays in place (still protective), which is safe."""
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                results.append({"account": a.get("account_name"), "ok": False, "error": "Reconnect required"})
+                continue
+            orders = tvo.get_orders(env, token)
+            versions = tvo.get_order_versions(env, token)
+            root = symbol_root(str(symbol).upper()) if symbol else ""
+            ns = _round_tick(new_stop, _tick_for(symbol))
+            moved = 0
+            for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+                cname = _contract_name(env, token, o.get("contractId"))
+                if root and (not cname or symbol_root(cname) != root):   # fail closed: never move an unidentifiable stop
+                    continue
+                tvo.modify_stop_price(env, token, o.get("id"), ns)
+                moved += 1
+            results.append({"account": a.get("account_name"), "ok": True, "moved": moved, "stop": ns})
+        except Exception as e:
+            results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
 
 
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
@@ -3122,63 +3615,116 @@ def build_round_trips(fills, name_for):
 def account_trade_history(user_id: int, only_account_id=None):
     """Closed round-trips + open positions across the user's connected accounts.
     Pass only_account_id (broker_accounts.id) to scope to a single account."""
-    accounts = get_broker_accounts(user_id, connected_only=True)
-    if only_account_id not in (None, "", "all"):
-        accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
+    try:
+        accounts = get_broker_accounts(user_id, connected_only=True)
+        if only_account_id not in (None, "", "all"):
+            accounts = [a for a in accounts if str(a["id"]) == str(only_account_id)]
+    except Exception as e:
+        # Even if the account lookup fails, fall through to the permanent ledger.
+        print(f"account_trade_history: account lookup failed (uid {user_id}): {e}")
+        accounts = []
     token_cache: Dict[tuple, list] = {}
     contract_names: Dict[Any, str] = {}
     all_trips, all_open = [], []
 
     for a in accounts:
-        token = ensure_fresh_token(a)
-        env = a.get("env") or "live"
-        acct_id = a.get("account_id")
-        if not token or not acct_id:
-            continue
+        # A broker hiccup on ONE account (expired token, slow API, odd fill) must
+        # never blank the whole dashboard/journal — we still return the permanent
+        # ledger below. So each account's LIVE read is isolated.
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            if not token or not acct_id:
+                continue
 
-        key = (token, env)
-        if key not in token_cache:
-            token_cache[key] = (tvo.get_fills(env, token), tvo.get_orders(env, token))
-        fills_all, orders_all = token_cache[key]
-        orders_map = _orders_account_map(orders_all)
-        single_account = len(accounts) == 1
+            key = (token, env)
+            if key not in token_cache:
+                token_cache[key] = (tvo.get_fills(env, token), tvo.get_orders(env, token))
+            fills_all, orders_all = token_cache[key]
+            orders_map = _orders_account_map(orders_all)
+            single_account = len(accounts) == 1
 
-        def name_for(cid):
-            if cid in contract_names:
+            def name_for(cid):
+                if cid in contract_names:
+                    return contract_names[cid]
+                c = tvo.get_contract(env, token, cid) or {}
+                nm = c.get("name") if isinstance(c, dict) else None
+                contract_names[cid] = nm or f"#{cid}"
                 return contract_names[cid]
-            c = tvo.get_contract(env, token, cid) or {}
-            nm = c.get("name") if isinstance(c, dict) else None
-            contract_names[cid] = nm or f"#{cid}"
-            return contract_names[cid]
 
-        acct_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
-        trips, openp = build_round_trips(acct_fills, name_for)
-        for t in trips:
-            t["account"] = a["account_name"]
-            t["_account_id"] = a["id"]
-        for o in openp:
-            o["account"] = a["account_name"]
-        all_trips += trips
-        all_open += openp
+            acct_fills = _fills_for_account(fills_all, orders_map, acct_id, single_account)
+            trips, openp = build_round_trips(acct_fills, name_for)
+            for t in trips:
+                t["account"] = a["account_name"]
+                t["_account_id"] = a["id"]
+            for o in openp:
+                o["account"] = a["account_name"]
+            all_trips += trips
+            all_open += openp
+        except Exception as e:
+            print(f"account_trade_history: live read failed for account {a.get('id')}: {e}")
+            continue
 
     # Tradovate's get_fills only returns a short recent window, so realized P&L
     # would vanish from old days. Persist every trip we see into a permanent
-    # ledger and return the ledger ∪ live fills, so the dashboard/journal always
-    # show the full realized P&L (deduped by trip_key).
-    _ledger_persist_trips(user_id, all_trips)
-    all_trips = _ledger_merge(user_id, all_trips, only_account_id)
+    # ledger and ALWAYS return the ledger ∪ live fills, so the dashboard/journal
+    # show the full realized P&L (deduped by intrinsic identity). Both steps are
+    # best-effort: a persistence error must not discard the ledger we can read.
+    try:
+        _ledger_persist_trips(user_id, all_trips)
+    except Exception as e:
+        print(f"account_trade_history: ledger persist failed (uid {user_id}): {e}")
+    try:
+        all_trips = _ledger_merge(user_id, all_trips, only_account_id)
+    except Exception as e:
+        print(f"account_trade_history: ledger merge failed (uid {user_id}): {e}")
     all_trips.sort(key=lambda x: str(x.get("closed_at", "")), reverse=True)
     return all_trips, all_open
 
 
+def _trip_ident(t):
+    """Stable INTRINSIC identity of a closed round-trip, used to dedup the permanent
+    ledger UNION live fills. Keyed on the account NAME, which is STABLE across
+    reconnects (broker_accounts.id rotates 44->55->56..., but the Tradovate account
+    name does not) — so a trade still inside the live fills window when a user
+    reconnects is not counted twice. Distinct accounts keep distinct identities, so
+    copy-trade fills across accounts are never collapsed. Falls back to the row id
+    only for legacy rows that predate the account_name column (always out of the live
+    window, so they never produce a live duplicate)."""
+    acct = t.get("account") or t.get("_account_id", "")
+
+    def _n(v):   # normalize numbers so int 100 and float 100.0 share one identity
+        try:
+            return format(float(v), ".4f")
+        except (TypeError, ValueError):
+            return str(v)
+
+    return "|".join((
+        str(acct), str(t.get("symbol", "")), str(t.get("side", "")),
+        _n(t.get("qty", "")), _n(t.get("entry_price", "")), _n(t.get("exit_price", "")),
+        str(t.get("closed_at", "")),
+    ))
+
+
 def _ledger_persist_trips(user_id, trips):
-    """Save newly-seen closed round-trips into the permanent ledger (idempotent)."""
+    """Save newly-seen closed round-trips into the permanent ledger (idempotent).
+    Deduped by intrinsic identity (account_id+symbol+side+qty+prices+close) so the
+    same trade is never logged twice even if its trip_key shifts."""
     rows = [t for t in (trips or []) if t.get("closed_at")]
     if not rows:
         return
     now = datetime.now(timezone.utc).isoformat()
     con = db()
     for t in rows:
+        exists = con.execute(
+            "SELECT 1 FROM trade_log WHERE user_id=? AND account_id=? AND symbol=? "
+            "AND side=? AND qty=? AND entry_price=? AND exit_price=? AND closed_at=? LIMIT 1",
+            (user_id, t.get("_account_id"), t.get("symbol"), t.get("side"), t.get("qty"),
+             t.get("entry_price"), t.get("exit_price"), t.get("closed_at")),
+        ).fetchone()
+        if exists:
+            continue
         con.execute(
             "INSERT INTO trade_log(user_id,account_id,account_name,trip_key,side,symbol,qty,"
             "entry_price,exit_price,pnl,opened_at,closed_at,created_at) "
@@ -3192,8 +3738,10 @@ def _ledger_persist_trips(user_id, trips):
 
 
 def _ledger_merge(user_id, live_trips, only_account_id=None):
-    """Return live trips UNION the permanent ledger (deduped by trip_key). Live
-    values win; the ledger backfills days Tradovate no longer returns."""
+    """Return live trips UNION the permanent ledger, deduped by INTRINSIC identity
+    (never the cosmetic account name). Live values win; the ledger backfills days
+    Tradovate no longer returns. Collapsing by identity also folds away any legacy
+    duplicate rows so realized P&L is never double-counted."""
     q = ("SELECT trip_key, account_id, account_name, side, symbol, qty, entry_price, "
          "exit_price, pnl, opened_at, closed_at FROM trade_log WHERE user_id=?")
     params = [user_id]
@@ -3206,17 +3754,18 @@ def _ledger_merge(user_id, live_trips, only_account_id=None):
     con = db()
     rows = con.execute(q, tuple(params)).fetchall()
     con.close()
-    by_key = {}
+    by_ident = {}
     for r in rows:
-        by_key[r["trip_key"]] = {
+        t = {
             "account": r["account_name"] or "", "_account_id": r["account_id"],
             "side": r["side"], "symbol": r["symbol"], "qty": r["qty"],
             "entry_price": r["entry_price"], "exit_price": r["exit_price"],
             "pnl": r["pnl"], "opened_at": r["opened_at"], "closed_at": r["closed_at"],
         }
+        by_ident[_trip_ident(t)] = t
     for t in (live_trips or []):     # live (fresh) wins
-        by_key[trip_key(t)] = t
-    return list(by_key.values())
+        by_ident[_trip_ident(t)] = t
+    return list(by_ident.values())
 
 
 def tradovate_login_raw(env: str, username: str, password: str, user_id: int) -> Tuple[str, Dict[str, Any]]:
@@ -3576,7 +4125,7 @@ def daily_journal(user_id: int, trips: Optional[list] = None):
     days: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
-        day = (r["ts"] or "")[:10]
+        day = _et_day(r["ts"])           # ET, to agree with the journal calendar
         if not day:
             continue
         days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})
@@ -3586,14 +4135,15 @@ def daily_journal(user_id: int, trips: Optional[list] = None):
         if r["status"] in ("EXECUTED", "SIMULATED", "FLATTEN_SENT", "SKIPPED"):
             days[day]["executed"] += 1
 
-    # Realized PnL per day from actual broker fills (closed round-trips).
+    # Realized PnL per day from actual broker fills (closed round-trips), keyed by ET
+    # close date so the dashboard mini-journal matches the journal calendar exactly.
     if trips is None:
         try:
             trips, _open = account_trade_history(user_id)
         except Exception:
             trips = []
     for t in trips:
-        day = str(t.get("closed_at") or "")[:10]
+        day = _et_day(t.get("closed_at"))
         if not day:
             continue
         days.setdefault(day, {"trades": 0, "executed": 0, "rejected": 0, "pnl": 0.0})
@@ -3804,7 +4354,7 @@ def emergency_risk_check(user_id: int):
     ).fetchone()["n"]
     con.close()
 
-    max_rejections = int(user["max_rejections_per_day"] or 3) if user else 3
+    max_rejections = int(user["max_rejections_per_day"] or 50) if user else 50
 
     if int(rejected or 0) >= max_rejections:
         raise Exception(f"SYSTEM LOCK: Too many rejected trades today ({rejected}/{max_rejections}).")
@@ -5756,8 +6306,13 @@ def journal_page(request: Request):
 
     try:
         all_trips, _open = account_trade_history(user["id"], only_account_id=only)
-    except Exception:
-        all_trips = []
+    except Exception as e:
+        # Last-resort: still show the permanent ledger so the journal is never blank.
+        print(f"journal_page: account_trade_history failed, falling back to ledger: {e}")
+        try:
+            all_trips = _ledger_merge(user["id"], [], only)
+        except Exception:
+            all_trips = []
 
     # Date-range filter: presets (today/7d/30d/month/ytd/all) or custom from/to.
     rng = (request.query_params.get("range") or "all").lower()
@@ -6746,8 +7301,10 @@ class WebhookTrade(BaseModel):
 
     client_id: str
     auth: str
-    symbol: str
-    side: str
+    # symbol/side are optional so exit / move_stop alerts (event + auth only) parse;
+    # entries still require them (enforced in risk_check → "Missing symbol").
+    symbol: Optional[str] = None
+    side: Optional[str] = None
     qty: Optional[Any] = 1
     request_id: Optional[str] = None
     # Optional: route this alert to ONE specific connected account (independent
@@ -6853,6 +7410,18 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
     return RedirectResponse(url=dest, status_code=302)
 
 
+def _route_signal_accounts(user, target_name):
+    """Which accounts a webhook targets: one named INDEPENDENT account, else the Copy
+    Trading group, else every connected account. Returns (accounts, route_label)."""
+    if target_name:
+        acct = find_connected_account(user["id"], target_name)
+        return ([acct] if acct else []), "ROUTED"
+    accounts = get_copy_accounts(user["id"])
+    if accounts:
+        return accounts, "COPIED"
+    return get_broker_accounts(user["id"], connected_only=True), "BROADCAST"
+
+
 @app.post("/webhook/trade")
 def webhook_trade(payload: WebhookTrade):
     start_time = time.perf_counter()
@@ -6878,37 +7447,62 @@ def webhook_trade(payload: WebhookTrade):
 
     try:
         target_name = (payload.account or "").strip()
+        extras = payload.model_extra or {}
+        event = str(extras.get("event") or "").lower().strip()
+        brackets_on = _brackets_on_for(user["email"])   # global flag + canary allow-list
 
-        # Dedup is scoped per target so the same strategy alert can hit different
-        # accounts without one blocking the other.
+        # --- Lifecycle events that MANAGE an existing position; they never open one.
+        # This also fixes the old bug where move_stop (side:"buy") was misread as a new
+        # BUY entry, and where exit was dropped for missing fields.
+        if brackets_on and event in ("exit", "move_stop"):
+            if payload.auth != user["webhook_secret"]:
+                raise Exception("Invalid webhook secret.")
+            accounts, route = _route_signal_accounts(user, target_name)
+            sym = (str(payload.symbol).upper() if payload.symbol else None)
+            # A symbol-less move_stop would yank EVERY resting stop on the account to one price
+            # — never intended. Fail closed. (A symbol-less exit is still a valid flatten-all.)
+            if event == "move_stop" and not sym:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Rejected: move_stop requires a symbol (refusing an account-wide stop move)."
+                log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
+            if event == "exit":
+                response = exit_from_accounts(accounts, sym)          # cancel orders + flatten (idempotent)
+                action = "EXIT"
+                message = f"Exit: cancel working orders + flatten on {response['accounts']} account(s)."
+            else:  # move_stop -> modify the resting stop (e.g. to breakeven)
+                new_stop = extras.get("stop")
+                response = move_stops_to_accounts(accounts, sym, new_stop)
+                moved = sum(int(r.get("moved") or 0) for r in response.get("results", []))
+                action = "MOVE_STOP"
+                message = f"Move stop → {new_stop}: modified {moved} working stop(s) on {response['accounts']} account(s)."
+            latency = round((time.perf_counter() - start_time) * 1000, 3)
+            log_trade(user["id"], request_id, sym or "*", event, 0, "live", "EXECUTED", latency, message, response)
+            return {"ok": True, "action": action, "status": "EXECUTED", "message": message,
+                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
+
+        # --- ENTRY (or legacy buy/sell/flatten/reverse signal). Dedup is scoped per
+        # target so the same alert can hit different accounts without one blocking another.
         dedup_id = f"{target_name}|{request_id}" if target_name else request_id
         symbol, side, qty = risk_check(user, payload.auth, payload.symbol, payload.side, payload.qty, dedup_id)
 
-        # Routing (independent and copy systems run side-by-side, never crossing):
-        #   - account specified  -> INDEPENDENT: trade ONLY that one account
-        #   - no account         -> MASTER signal: mirror to the Copy Trading group
-        # An account-routed alert never touches the copy group, and a master
-        # signal never touches independent accounts.
-        if target_name:
-            acct = find_connected_account(user["id"], target_name)
-            if not acct:
-                raise Exception(f"Account '{target_name}' is not connected.")
-            accounts = [acct]
-            route = "ROUTED"
-        else:
-            # Master signal: prefer the Copy Trading group. If the user hasn't
-            # placed any accounts in that group yet, fall back to every connected
-            # account so a freshly-connected account still trades cleanly.
-            accounts = get_copy_accounts(user["id"])
-            route = "COPIED"
-            if not accounts:
-                accounts = get_broker_accounts(user["id"], connected_only=True)
-                route = "BROADCAST"
+        # Routing (independent and copy systems run side-by-side, never crossing).
+        accounts, route = _route_signal_accounts(user, target_name)
+        if target_name and not accounts:
+            raise Exception(f"Account '{target_name}' is not connected.")
 
         if accounts:
-            response = execute_to_accounts(accounts, symbol, side, qty)
+            # Real resting OCO bracket(s) when the entry carries a stop (buy/sell only);
+            # scale-out alerts (qtyScale+qtyRunner+tp1+tp2) place TWO independent brackets.
+            legs = entry_legs_from_alert(side, qty, extras) if (brackets_on and side in ("buy", "sell")) else None
+            has_bracket = bool(legs) and any(st is not None for (_q, st, _l) in legs)
+            if has_bracket:
+                response = execute_bracket_to_accounts(accounts, symbol, side, legs)
+                action = route + "_BRACKET"
+            else:
+                response = execute_to_accounts(accounts, symbol, side, qty)
+                action = route
             mode = "live"
-            action = route
             status = "EXECUTED" if (response["placed"] > 0 or response["total"] == 0) else "REJECTED"
             if target_name:
                 scope = f"account {target_name}"
@@ -6916,7 +7510,8 @@ def webhook_trade(payload: WebhookTrade):
                 scope = f"{response['accounts']} connected account(s)"
             else:
                 scope = f"{response['accounts']} copy account(s)"
-            message = f"{route.title()} {response['placed']}/{response['total']} order(s) to {scope}."
+            kind = "bracket" if has_bracket else "order"
+            message = f"{route.title()} {response['placed']}/{response['total']} {kind}(s) to {scope}."
             # If nothing was placed, surface the broker's reason (e.g. token
             # expired -> reconnect) so the failure isn't silent.
             if response["placed"] == 0 and response["total"] > 0:
@@ -7185,18 +7780,47 @@ def _public_track_account_ids(user):
     return sorted(ids)
 
 
+def _et_day(iso_str):
+    """ET calendar date 'YYYY-MM-DD' for an ISO timestamp (UTC if naive); falls back
+    to the first 10 chars so a bad value never crashes the public feed."""
+    if not iso_str:
+        return ""
+    try:
+        d = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d")
+    except Exception:
+        return str(iso_str)[:10]
+
+
 def public_daily_map(account_ids):
-    """{ 'YYYY-MM-DD': summed day_pnl } across the chosen accounts (persisted)."""
+    """{ 'YYYY-MM-DD': summed realized P&L } across the chosen accounts, built from the
+    permanent trade ledger (closed round-trips) keyed by ET close date. The ledger is
+    the authoritative source — so the public calendar ALWAYS matches the trade history.
+    (The old daily_equity snapshots returned $0 on real trade days and are not used.)"""
     if not account_ids:
         return {}
     ph = ",".join("?" for _ in account_ids)
     con = db()
     rows = con.execute(
-        f"SELECT trade_date, SUM(day_pnl) AS p FROM daily_equity WHERE account_id IN ({ph}) GROUP BY trade_date",
+        f"SELECT account_id, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
+        f"FROM trade_log WHERE account_id IN ({ph})",
         tuple(account_ids),
     ).fetchall()
     con.close()
-    return {r["trade_date"]: (r["p"] or 0) for r in rows}
+    out, seen = {}, set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
+        day = _et_day(r["closed_at"])
+        if not day:
+            continue
+        out[day] = round(out.get(day, 0.0) + float(r["pnl"] or 0), 2)
+    return out
 
 
 def public_live_snapshot(account_ids):
@@ -7224,28 +7848,50 @@ def persist_track_trades():
             return
         for aid in _public_connected_ids(user):   # log from any connected account
             try:
+                # account_trade_history already persists live trips via the intrinsic-
+                # deduped ledger; this scopes + re-persists idempotently as a backstop.
                 trips, _o = account_trade_history(user["id"], only_account_id=aid)
             except Exception:
                 continue
             if not trips:
                 continue
-            con = db()
-            now = datetime.now(timezone.utc).isoformat()
             for t in trips:
-                if not t.get("closed_at"):
-                    continue
-                con.execute(
-                    "INSERT INTO trade_log(user_id,account_id,trip_key,side,symbol,qty,entry_price,"
-                    "exit_price,pnl,opened_at,closed_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(user_id,trip_key) DO NOTHING",
-                    (user["id"], aid, trip_key(t), t.get("side"), t.get("symbol"), t.get("qty"),
-                     t.get("entry_price"), t.get("exit_price"), t.get("pnl"),
-                     t.get("opened_at"), t.get("closed_at"), now),
-                )
-            con.commit()
-            con.close()
+                t["_account_id"] = aid
+            _ledger_persist_trips(user["id"], trips)
     except Exception as e:
         print("persist_track_trades error:", e)
+
+
+def persist_all_account_trades():
+    """Server-side: capture EVERY connected user's closed round-trips into the
+    permanent trade ledger, on a schedule, while their broker tokens are valid and
+    fills are still in Tradovate's short window. This is what lets EVERY client (not
+    just the public-track account) see today's realized P&L on their dashboard/journal
+    even after the fills age out — independent of whether they have the page open.
+
+    Drives account_trade_history(user_id), which already persists every live trip to
+    trade_log (intrinsic-deduped) and is broker-error resilient, so one bad account
+    never stops the sweep. Bounded concurrency keeps it safe at 1,000+ accounts."""
+    try:
+        con = db()
+        rows = con.execute(
+            "SELECT DISTINCT user_id FROM broker_accounts WHERE status='connected'").fetchall()
+        con.close()
+        uids = [r["user_id"] for r in rows]
+    except Exception as e:
+        print(f"persist_all_account_trades: user lookup failed: {e}")
+        return
+    if not uids:
+        return
+
+    def _one(uid):
+        try:
+            account_trade_history(uid)   # persists this user's live trips as a side effect
+        except Exception as e:
+            print(f"persist_all_account_trades: uid {uid} failed: {e}")
+
+    with ThreadPoolExecutor(max_workers=min(WATCH_WORKERS, len(uids))) as pool:
+        list(pool.map(_one, uids))
 
 
 def _track_live_trades(account_ids):
@@ -7254,10 +7900,38 @@ def _track_live_trades(account_ids):
     ph = ",".join("?" for _ in account_ids)
     con = db()
     rows = con.execute(
-        f"SELECT side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
+        f"SELECT account_id,side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
         f"WHERE account_id IN ({ph}) ORDER BY closed_at", tuple(account_ids)).fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    out, seen = [], set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:            # fold away any legacy duplicate rows
+            continue
+        seen.add(ident)
+        out.append(dict(r))
+    return out
+
+
+def _track_user_trades(user_id):
+    """All closed round-trips for the public-track USER (every account they've ever
+    owned), keyed by user_id — so the verified record survives reconnects that change
+    the volatile broker_accounts.id (account 44 -> 55 -> ...). Intrinsic-deduped."""
+    con = db()
+    rows = con.execute(
+        "SELECT account_id,side,symbol,qty,entry_price,exit_price,pnl,closed_at FROM trade_log "
+        "WHERE user_id=? ORDER BY closed_at", (user_id,)).fetchall()
+    con.close()
+    out, seen = [], set()
+    for r in rows:
+        ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
+                 r["entry_price"], r["exit_price"], str(r["closed_at"]))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(dict(r))
+    return out
 
 
 def _trade_stats(trades):
@@ -7349,11 +8023,14 @@ def _track_payload():
     if not user:
         data = {"ok": False}
     else:
-        ids = _public_track_account_ids(user)
-        daily = public_daily_map(ids)
+        # Scope the verified record to the track USER (their email), not a volatile
+        # broker_accounts.id — so it survives every reconnect (account 44 -> 55 -> ...)
+        # and always reflects exactly this one KhomaAPI account's real trades.
+        uid = user["id"]
+        daily = ledger_daily_map(uid)
         stats = _track_stats(daily)
-        live = public_live_snapshot(ids)
-        trades = _track_live_trades(ids)          # permanent per-trade log
+        live = public_live_snapshot(_public_connected_ids(user))   # today's intraday, connected accts
+        trades = _track_user_trades(uid)          # permanent per-trade log, all of the user's accounts
         ts = _trade_stats(trades)
         et = datetime.now(timezone.utc).astimezone(ZoneInfo(_ET))
         pf = stats["pf"]
@@ -7371,7 +8048,7 @@ def _track_payload():
             "days": stats["days"], "green": stats["green"], "red": stats["red"],
             "daily": daily,   # {YYYY-MM-DD: pnl} — live, for the calendar
             # Live trade-by-trade log + trade-based stats for the "Verified" section.
-            "trades": [{"side": t.get("side"), "date": str(t.get("closed_at") or "")[:10],
+            "trades": [{"side": t.get("side"), "date": _et_day(t.get("closed_at")),
                         "entry": t.get("entry_price"), "exit": t.get("exit_price"),
                         "qty": t.get("qty"), "pnl": t.get("pnl")} for t in trades],
             "trade_net_disp": _money(ts["net"]), "trade_count": ts["trades"],
@@ -7417,10 +8094,10 @@ def verified_page(request: Request):
         body = "<div class='empty-note'>Results are being set up. Check back shortly.</div>"
         return HTMLResponse(_verified_shell(name, body), headers={"Cache-Control": "no-store"})
 
-    ids = _public_track_account_ids(user)
-    daily = public_daily_map(ids)
+    # Scope to the track USER (email), not a volatile broker_accounts.id — survives reconnects.
+    daily = ledger_daily_map(user["id"])
     stats = _track_stats(daily)
-    live = public_live_snapshot(ids)
+    live = public_live_snapshot(_public_connected_ids(user))
 
     # Calendar month: ?month=YYYY-MM, else latest data month, else current ET.
     mq = request.query_params.get("month", "")

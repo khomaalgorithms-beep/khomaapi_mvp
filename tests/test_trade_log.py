@@ -47,10 +47,115 @@ def test_ledger_persist_and_merge_unions_history():
     assert len(appmod._ledger_merge(uid, [], only_account_id=999)) == 0
 
 
+def test_name_drift_does_not_duplicate_or_double_count():
+    # The real bug: trip_key includes the account NAME, which drifts to empty as a
+    # trip round-trips through the ledger. Persisting the "same" trade once with a
+    # name and once without must NOT create a 2nd row or double the P&L.
+    uid = _user()
+    aid = 990044
+    base = {"_account_id": aid, "symbol": "MNQU6", "side": "long", "qty": 2,
+            "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+            "opened_at": "2026-06-23T14:30:00Z", "closed_at": "2026-06-23T15:00:01Z"}
+    appmod._ledger_persist_trips(uid, [{**base, "account": "DEMO856420"}])  # with name
+    appmod._ledger_persist_trips(uid, [{**base, "account": ""}])            # name drifted
+    appmod._ledger_persist_trips(uid, [{**base, "account": None}])          # name None
+    # Exactly one row; calendar + trade list + merge all show a single -536.
+    assert len(appmod._track_live_trades([aid])) == 1
+    assert appmod.public_daily_map([aid])[appmod._et_day(base["closed_at"])] == -536.0
+    assert len(appmod._ledger_merge(uid, [], only_account_id=aid)) == 1
+    assert appmod._trade_stats(appmod._track_live_trades([aid]))["net"] == -536.0
+
+
+def test_public_daily_map_built_from_trade_ledger():
+    # Regression: the verified calendar showed $0 on a real trade day because it read
+    # the daily_equity snapshots (which were $0). It must be built from the trade
+    # ledger so the calendar ALWAYS matches the trade history. Keyed by ET date.
+    uid = _user()
+    aid = 990045
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO", "_account_id": aid, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+        "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T14:30:00Z"}])
+    m = appmod.public_daily_map([aid])
+    day = appmod._et_day("2026-06-23T14:30:00Z")      # ET trade-close date
+    assert m.get(day) == -536.0                        # ledger drives the calendar
+    assert appmod.public_daily_map([999]) == {}        # scoped to the chosen account
+
+
+def test_et_day_converts_to_eastern():
+    # 02:30 UTC is still the previous evening in ET.
+    assert appmod._et_day("2026-06-24T02:30:00Z") == "2026-06-23"
+    assert appmod._et_day("2026-06-23T14:30:00Z") == "2026-06-23"
+    assert appmod._et_day("") == "" and appmod._et_day("garbage")[:4] == "garb"
+
+
+def test_ledger_merge_dedups_across_reconnect_account_id_change():
+    # Reconnect rotates broker_accounts.id (44 -> 55) but the Tradovate account NAME
+    # is stable. A trade still in the live fills window after a reconnect must NOT be
+    # double-counted just because its row id changed.
+    uid = _user()
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO856420", "_account_id": 44, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 100, "exit_price": 90, "pnl": -40.0,
+        "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}])
+    live = [{   # same physical trade, re-read live after reconnect: NEW id, SAME name
+        "account": "DEMO856420", "_account_id": 55, "symbol": "MNQ", "side": "long", "qty": 2,
+        "entry_price": 100, "exit_price": 90, "pnl": -40.0,
+        "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}]
+    merged = appmod._ledger_merge(uid, live)
+    assert len(merged) == 1                              # not double-counted
+    assert round(sum(t["pnl"] for t in merged), 2) == -40.0
+
+
+def test_ledger_merge_keeps_distinct_accounts_separate():
+    # Copy trading: the SAME signal on TWO different accounts (different names) must
+    # stay as two separate trades — never collapsed by the dedup.
+    uid = _user()
+    live = [
+        {"account": "ACCT-A", "_account_id": 70, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+         "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"},
+        {"account": "ACCT-B", "_account_id": 71, "symbol": "MNQ", "side": "long", "qty": 1,
+         "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+         "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"},
+    ]
+    merged = appmod._ledger_merge(uid, live)
+    assert len(merged) == 2                              # distinct accounts not collapsed
+    assert round(sum(t["pnl"] for t in merged), 2) == 20.0
+
+
 def test_trade_stats_math():
     s = appmod._trade_stats([{"pnl": 100}, {"pnl": -40}, {"pnl": 60}])
     assert s["net"] == 120 and s["trades"] == 3 and s["wins"] == 2 and s["losses"] == 1
     assert s["pf_disp"] == "4.00"            # (100+60) / 40
+
+
+def test_account_history_falls_back_to_ledger_when_broker_read_throws(monkeypatch):
+    # The journal/dashboard $0 bug: a broker hiccup made account_trade_history raise,
+    # the caller swallowed it to [], and the journal went blank even though the
+    # permanent ledger held the trade. Now a broker failure must STILL return the
+    # ledger so realized P&L never disappears.
+    uid = _user()
+    aid = 990077
+    appmod._ledger_persist_trips(uid, [{
+        "account": "DEMO", "_account_id": aid, "symbol": "MNQU6", "side": "long", "qty": 2,
+        "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
+        "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T15:00:01Z"}])
+
+    # Simulate a connected account whose live read explodes.
+    monkeypatch.setattr(appmod, "get_broker_accounts",
+                        lambda user_id, connected_only=False: [
+                            {"id": aid, "env": "demo", "account_id": "48440214",
+                             "account_name": "DEMO", "access_token_enc": "x"}])
+    def boom(_a):
+        raise RuntimeError("token renew failed / broker down")
+    monkeypatch.setattr(appmod, "ensure_fresh_token", boom)
+
+    trips, _open = appmod.account_trade_history(uid, only_account_id=aid)
+    assert len(trips) == 1                         # ledger preserved, not blanked
+    assert trips[0]["pnl"] == -536.0
+    s = appmod.journal_analytics(trips)
+    assert s["net"] == -536.0 and s["gross_loss"] == 536.0   # analytics populated
 
 
 def test_persist_track_trades_dedup(monkeypatch):
@@ -79,3 +184,36 @@ def test_persist_track_trades_dedup(monkeypatch):
     appmod.persist_track_trades()
     rows = appmod._track_live_trades([777])
     assert len(rows) == 3
+
+
+def test_persist_all_account_trades_covers_every_connected_user(monkeypatch):
+    # The client-$0 fix: a server-side sweep must capture EVERY connected user's trips
+    # into the ledger (not just the public-track account), so each client sees their own
+    # realized P&L even with no dashboard open. account_trade_history persists as a side
+    # effect; here we assert the sweep drives it for every distinct connected user_id.
+    u1, u2 = _user(), _user()
+    a1, a2 = 51001, 51002
+    con = appmod.db()
+    for uid, aid in ((u1, a1), (u2, a2)):
+        con.execute("INSERT INTO broker_accounts(user_id,broker,env,account_id,account_name,status,created_at,updated_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)", (uid, "tradovate", "demo", str(aid), f"ACC{aid}", "connected", "x", "x"))
+    con.commit(); con.close()
+
+    real = appmod.account_trade_history
+    def fake(uid, only_account_id=None):
+        # Each user has one closed trip; persist it the way the real function does.
+        aid = a1 if uid == u1 else a2
+        trip = {"account": f"ACC{aid}", "_account_id": aid, "symbol": "MNQ", "side": "long",
+                "qty": 2, "entry_price": 100, "exit_price": 95, "pnl": -20.0,
+                "opened_at": "2026-06-23T14:00:00Z", "closed_at": "2026-06-23T15:00:00Z"}
+        appmod._ledger_persist_trips(uid, [trip])
+        return [trip], []
+    monkeypatch.setattr(appmod, "account_trade_history", fake)
+
+    appmod.persist_all_account_trades()
+    appmod.persist_all_account_trades()           # idempotent
+
+    assert len(appmod._ledger_merge(u1, [], only_account_id=a1)) == 1
+    assert len(appmod._ledger_merge(u2, [], only_account_id=a2)) == 1
+    # Strict per-user scoping: u1's sweep never wrote into u2's ledger.
+    assert appmod._ledger_merge(u1, [], only_account_id=a2) == []
