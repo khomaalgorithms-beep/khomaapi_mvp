@@ -2835,15 +2835,31 @@ def _cancel_ok(resp) -> bool:
     return not (resp.get("failureReason") or resp.get("failureText") or resp.get("error"))
 
 
+_CONTRACT_NAME_CACHE: dict = {}   # contract_id -> name (immutable per id; safe to cache forever)
+
+
 def _contract_name(env, token, contract_id) -> str:
     """Safe contract-name lookup — never raises even if the broker returns a non-dict
-    (a bare string / array), which would blow up a naive `(get_contract(...) or {}).get`."""
-    try:
-        c = tvo.get_contract(env, token, contract_id)
-        if isinstance(c, dict):
-            return str(c.get("name") or "").upper()
-    except Exception:
-        pass
+    (a bare string / array), which would blow up a naive `(get_contract(...) or {}).get`.
+    Caches by contract_id and retries once: a BLANK name is a symbol-scoping HAZARD — the
+    guards below fail closed on an empty name, so a transient 429/timeout must not blank it
+    (that was the bug where a rate-limited lookup misfired an exit/move_stop onto the wrong
+    contract)."""
+    if contract_id is None:
+        return ""
+    cached = _CONTRACT_NAME_CACHE.get(contract_id)
+    if cached:
+        return cached
+    for _ in range(2):                     # one retry — don't let a transient blip blank the name
+        try:
+            c = tvo.get_contract(env, token, contract_id)
+            if isinstance(c, dict):
+                name = str(c.get("name") or "").upper()
+                if name:
+                    _CONTRACT_NAME_CACHE[contract_id] = name
+                    return name
+        except Exception:
+            pass
     return ""
 
 
@@ -3071,7 +3087,7 @@ def cancel_working_orders_for(account: dict, symbol: str) -> int:
     n = 0
     for o in tvo.working_orders_for(orders, versions, acct_id):
         cname = _contract_name(env, token, o.get("contractId"))
-        if root and cname and symbol_root(cname) != root:
+        if root and (not cname or symbol_root(cname) != root):   # fail closed: never cancel an unidentifiable order
             continue
         if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
             n += 1
@@ -3095,7 +3111,7 @@ def _liquidate_positions_for(account, symbol) -> int:
         if int(p.get("netPos") or 0) == 0:
             continue
         cname = _contract_name(env, token, p.get("contractId"))
-        if root and cname and symbol_root(cname) != root:
+        if root and (not cname or symbol_root(cname) != root):   # fail closed: never liquidate an unidentifiable position
             continue
         tvo.liquidate_position(env, token, acct_id, p.get("contractId"))
         liq += 1
@@ -3159,7 +3175,7 @@ def move_stops_to_accounts(accounts: list, symbol: str, new_stop) -> dict:
             moved = 0
             for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
                 cname = _contract_name(env, token, o.get("contractId"))
-                if root and cname and symbol_root(cname) != root:
+                if root and (not cname or symbol_root(cname) != root):   # fail closed: never move an unidentifiable stop
                     continue
                 tvo.modify_stop_price(env, token, o.get("id"), ns)
                 moved += 1
@@ -7443,6 +7459,13 @@ def webhook_trade(payload: WebhookTrade):
                 raise Exception("Invalid webhook secret.")
             accounts, route = _route_signal_accounts(user, target_name)
             sym = (str(payload.symbol).upper() if payload.symbol else None)
+            # A symbol-less move_stop would yank EVERY resting stop on the account to one price
+            # — never intended. Fail closed. (A symbol-less exit is still a valid flatten-all.)
+            if event == "move_stop" and not sym:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Rejected: move_stop requires a symbol (refusing an account-wide stop move)."
+                log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
             if event == "exit":
                 response = exit_from_accounts(accounts, sym)          # cancel orders + flatten (idempotent)
                 action = "EXIT"

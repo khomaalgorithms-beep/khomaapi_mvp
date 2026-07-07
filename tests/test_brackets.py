@@ -366,3 +366,76 @@ def test_exit_idempotent_when_flat(monkeypatch):
     out = appmod.exit_from_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!")
     r = out["results"][0]
     assert r["ok"] is True and r["flat"] is True and r["cancelled"] == 0 and r["liquidated"] == 0
+
+
+# ---- SAFETY: symbol-scoping must fail CLOSED (deploy-readiness blockers) ---------------
+
+def test_contract_name_caches_and_retries(monkeypatch):
+    # A transient blank (429/None) must NOT stick — retry, then cache the resolved name.
+    appmod._CONTRACT_NAME_CACHE.clear()
+    calls = {"n": 0}
+    def flaky(e, t, c):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else {"name": "mnqu6"}     # 1st blips, 2nd resolves
+    monkeypatch.setattr(tvo, "get_contract", flaky)
+    assert appmod._contract_name("demo", "tok", 77) == "MNQU6"    # retried past the blip
+    n_after = calls["n"]
+    assert appmod._contract_name("demo", "tok", 77) == "MNQU6"    # cached -> no further broker calls
+    assert calls["n"] == n_after
+
+
+def test_liquidate_fail_closed_on_blank_contract(monkeypatch):
+    # BLOCKER 2: a blank contract name (lookup failed) must NOT flatten a position we can't
+    # identify as the requested symbol — else an exit misfires onto the wrong contract.
+    appmod._CONTRACT_NAME_CACHE.clear()
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "get_positions", lambda e, t: [{"accountId": 44, "netPos": 2, "contractId": 999}])
+    monkeypatch.setattr(tvo, "get_contract", lambda e, t, c: None)        # name never resolves -> blank
+    liqs = []
+    monkeypatch.setattr(tvo, "liquidate_position", lambda e, t, a, c: liqs.append(c))
+    acct = {"account_name": "A", "account_id": 44, "env": "demo"}
+    assert appmod._liquidate_positions_for(acct, "MNQ1!") == 0 and liqs == []   # fail closed
+    assert appmod._liquidate_positions_for(acct, None) == 1 and liqs == [999]   # symbol-less flatten-all still works
+
+
+def test_cancel_fail_closed_on_blank_contract(monkeypatch):
+    appmod._CONTRACT_NAME_CACHE.clear()
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
+    monkeypatch.setattr(tvo, "working_orders_for", lambda o, v, a, order_type=None: [{"id": 11, "contractId": 999}])
+    monkeypatch.setattr(tvo, "get_contract", lambda e, t, c: None)
+    cancels = []
+    monkeypatch.setattr(tvo, "cancel_order", lambda e, t, i: cancels.append(i) or {"commandId": 1})
+    acct = {"account_name": "A", "account_id": 44, "env": "demo"}
+    assert appmod.cancel_working_orders_for(acct, "MNQ1!") == 0 and cancels == []   # fail closed
+    assert appmod.cancel_working_orders_for(acct, None) == 1 and cancels == [11]    # flatten-all path still cancels
+
+
+def test_move_stops_fail_closed_on_blank_contract(monkeypatch):
+    appmod._CONTRACT_NAME_CACHE.clear()
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
+    monkeypatch.setattr(tvo, "working_orders_for", lambda o, v, a, order_type=None: [{"id": 22, "contractId": 999}])
+    monkeypatch.setattr(tvo, "get_contract", lambda e, t, c: None)
+    moves = []
+    monkeypatch.setattr(tvo, "modify_stop_price", lambda e, t, i, p: moves.append((i, p)))
+    acct = {"account_name": "A", "account_id": 44, "env": "demo"}
+    resp = appmod.move_stops_to_accounts([acct], "MNQ1!", 30000)
+    assert moves == []                                       # fail closed: never move an unidentifiable stop
+    assert resp["results"][0]["moved"] == 0
+
+
+def test_handler_move_stop_requires_symbol(monkeypatch):
+    # BLOCKER 1: a symbol-less move_stop would yank EVERY resting stop to one price -> reject it.
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "move_stops_to_accounts",
+                        lambda *a, **k: cap.update(moved=True) or {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "move_stop", "stop": 30000})
+    assert r.status_code == 200
+    assert r.json().get("status") == "REJECTED" and "moved" not in cap   # refused, never fanned out account-wide
