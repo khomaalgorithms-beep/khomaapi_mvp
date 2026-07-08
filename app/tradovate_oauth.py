@@ -312,6 +312,37 @@ def place_stop_order(env: str, token: str, account_spec, account_id, action: str
     return resp if resp is not None else {"error": "request failed"}
 
 
+def place_oco_exit(env: str, token: str, account_spec, account_id, exit_action: str,
+                   symbol: str, qty: int, stop_price, limit_price):
+    """Place a standalone OCO exit pair (protective STOP + take-profit LIMIT) for an EXISTING
+    position — NO entry order, so it never opens/adds to a position. One leg filling cancels
+    the other AT THE EXCHANGE, so a breakeven-stop fill takes the runner's take-profit down in
+    the same instant (no orphaned limit). `exit_action` is the CLOSING side (opposite the
+    position): a short runner closes with BUY orders, a long runner with SELL orders."""
+    contract = resolve_contract(env, token, symbol)
+    act = "Buy" if str(exit_action).lower() == "buy" else "Sell"
+    body = {
+        "accountSpec": str(account_spec),
+        "accountId": int(account_id),
+        "action": act,
+        "symbol": str(contract).upper(),
+        "orderQty": int(qty),
+        "orderType": "Stop",
+        "stopPrice": float(stop_price),
+        "isAutomated": True,
+        "timeInForce": "Day",
+        "other": {
+            "action": act,
+            "orderType": "Limit",
+            "price": float(limit_price),
+            "isAutomated": True,
+            "timeInForce": "Day",
+        },
+    }
+    resp = _post(env, token, "/order/placeOCO", body)
+    return resp if resp is not None else {"error": "request failed"}
+
+
 def working_orders_for(orders: list, versions: list, account_id, contract_id=None,
                        order_type: str = None) -> list:
     """Join order/list with orderVersion/list to return WORKING orders for an account
