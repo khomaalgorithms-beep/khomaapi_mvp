@@ -461,22 +461,48 @@ def test_handler_replace_stop_moves_not_entry(monkeypatch):
     assert cap.get("stop") == 29504.75 and cap.get("pos_side") == "sell" and "entered" not in cap   # moved a stop, opened NOTHING
 
 
-def test_replace_stops_cancels_then_places_opposite_side(monkeypatch):
-    # Short position (entry side "sell") -> protective stop is a BUY stop for the runner qty.
+def test_replace_stops_reocos_breakeven_stop_with_tp(monkeypatch):
+    # Short runner: cancel OLD stop + OLD TP, re-arm breakeven stop + TP as ONE OCO on the
+    # BUY side (opposite the position) so a stop fill takes the TP down in the same instant.
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
     monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
     monkeypatch.setattr(appmod, "_net_position_for", lambda a, s: -2)      # runner: short 2 still open
     monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
     monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
-    monkeypatch.setattr(tvo, "working_orders_for", lambda o, v, a, order_type=None: [{"id": 9, "contractId": 5}])
+    monkeypatch.setattr(tvo, "working_orders_for",
+        lambda o, v, a, order_type=None: [{"id": 7, "contractId": 5, "orderType": "Stop", "stopPrice": 29600},
+                                          {"id": 8, "contractId": 5, "orderType": "Limit", "price": 29000}])
     monkeypatch.setattr(appmod, "_contract_name", lambda e, t, c: "MNQU6")
     cancels = []
     monkeypatch.setattr(tvo, "cancel_order", lambda e, t, i: cancels.append(i) or {"commandId": 1})
+    oco = {}
+    monkeypatch.setattr(tvo, "place_oco_exit",
+        lambda env, tok, spec, aid, action, sym, qty, sp, lp: oco.update(action=action, qty=qty, stop=sp, tp=lp) or {"orderId": 1, "ocoId": 9})
+    stops = []
+    monkeypatch.setattr(tvo, "place_stop_order", lambda *a, **k: stops.append(1) or {"orderId": 2})
+    out = appmod.replace_stops_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", "sell", 29504.75)
+    assert sorted(cancels) == [7, 8]                       # cancelled BOTH the old stop and old TP
+    assert oco["action"] == "buy" and oco["qty"] == 2      # short -> BUY exit OCO for the runner qty
+    assert oco["stop"] == 29504.75 and oco["tp"] == 29000  # breakeven stop + the captured runner TP
+    assert stops == []                                     # OCO accepted -> no bare-stop fallback
+    assert out["results"][0]["kind"] == "oco" and out["placed"] == 1
+
+
+def test_replace_stops_falls_back_to_bare_stop_when_oco_rejected(monkeypatch):
+    # If placeOCO is rejected, the runner must STILL get a protective stop (never left naked).
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "_net_position_for", lambda a, s: -2)
+    monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
+    monkeypatch.setattr(tvo, "working_orders_for",
+        lambda o, v, a, order_type=None: [{"id": 8, "contractId": 5, "orderType": "Limit", "price": 29000}])
+    monkeypatch.setattr(appmod, "_contract_name", lambda e, t, c: "MNQU6")
+    monkeypatch.setattr(tvo, "cancel_order", lambda e, t, i: {"commandId": 1})
+    monkeypatch.setattr(tvo, "place_oco_exit", lambda *a, **k: {"failureReason": "RejectedByExchange"})
     placed = {}
     monkeypatch.setattr(tvo, "place_stop_order",
-                        lambda env, tok, spec, aid, action, sym, qty, px: placed.update(action=action, qty=qty, px=px) or {"orderId": 1})
+        lambda env, tok, spec, aid, action, sym, qty, px: placed.update(action=action, qty=qty, px=px) or {"orderId": 2})
     out = appmod.replace_stops_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", "sell", 29504.75)
-    assert cancels == [9]                                  # cancelled the OLD working stop
-    assert placed["action"] == "buy"                       # short -> BUY stop (opposite of position side)
-    assert placed["qty"] == 2 and placed["px"] == 29504.75  # runner qty + payload stop price
-    assert out["placed"] == 1 and out["results"][0]["cancelled"] == 1
+    assert placed["action"] == "buy" and placed["qty"] == 2 and placed["px"] == 29504.75  # bare protective stop placed
+    assert out["results"][0]["kind"] == "stop-fallback" and out["results"][0]["ok"] is True

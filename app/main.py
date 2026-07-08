@@ -3216,21 +3216,45 @@ def replace_stops_to_accounts(accounts: list, symbol: str, position_side: str, n
             if open_qty <= 0:
                 results.append({"account": name, "ok": False, "error": "No open position to protect"})
                 continue
-            # 1) cancel the existing working protective STOP(s) for THIS symbol only (fail closed)
+            # 1) Cancel the OLD protective STOP *and* capture + cancel the OLD take-profit LIMIT
+            #    for THIS symbol only (fail-closed scoping). Capturing the TP lets us re-link the
+            #    breakeven stop OCO to it, so a stop fill takes the TP down in the same instant
+            #    instead of orphaning the runner's second-target limit.
             orders = tvo.get_orders(env, token)
             versions = tvo.get_order_versions(env, token)
             cancelled = 0
-            for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+            tp_price = None
+            for o in tvo.working_orders_for(orders, versions, acct_id):
                 cname = _contract_name(env, token, o.get("contractId"))
                 if root and (not cname or symbol_root(cname) != root):
                     continue
+                otype = str(o.get("orderType") or "").lower()
+                if otype not in ("stop", "limit"):
+                    continue
+                if otype == "limit" and tp_price is None:
+                    tp_price = o.get("price")
                 if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
                     cancelled += 1
-            # 2) place a fresh protective stop for the runner qty at the new (breakeven) price
+            # 2) Re-arm the runner: breakeven STOP + take-profit LIMIT as ONE OCO (stop fill
+            #    cancels the TP, TP fill cancels the stop). If there is no runner TP, or the OCO
+            #    is rejected, FALL BACK to a bare protective stop so the runner is NEVER unprotected.
             ns = _round_tick(new_stop, _tick_for(resolved))
-            resp = tvo.place_stop_order(env, token, name, acct_id, close_action, resolved, int(open_qty), ns)
-            results.append({"account": name, "ok": _order_ok(resp), "cancelled": cancelled,
-                            "qty": int(open_qty), "stop": ns, "action": close_action, "response": resp})
+            kind = "stop"
+            if tp_price is not None:
+                resp = tvo.place_oco_exit(env, token, name, acct_id, close_action, resolved,
+                                          int(open_qty), ns, _round_tick(tp_price, _tick_for(resolved)))
+                oco_failed = (not isinstance(resp, dict)) or resp.get("failureReason") \
+                    or resp.get("failureText") or resp.get("error")
+                if oco_failed:
+                    resp = tvo.place_stop_order(env, token, name, acct_id, close_action, resolved, int(open_qty), ns)
+                    kind = "stop-fallback"
+                else:
+                    kind = "oco"
+            else:
+                resp = tvo.place_stop_order(env, token, name, acct_id, close_action, resolved, int(open_qty), ns)
+            ok = True if kind == "oco" else _order_ok(resp)
+            results.append({"account": name, "ok": ok, "cancelled": cancelled, "qty": int(open_qty),
+                            "stop": ns, "tp": tp_price, "kind": kind, "action": close_action, "response": resp})
         except Exception as e:
             results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
     placed = sum(1 for r in results if r.get("ok"))
