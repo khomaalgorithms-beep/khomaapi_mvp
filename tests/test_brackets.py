@@ -439,3 +439,44 @@ def test_handler_move_stop_requires_symbol(monkeypatch):
     r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "move_stop", "stop": 30000})
     assert r.status_code == 200
     assert r.json().get("status") == "REJECTED" and "moved" not in cap   # refused, never fanned out account-wide
+
+
+def test_handler_replace_stop_moves_not_entry(monkeypatch):
+    # replace_stop must branch on event FIRST and NEVER open a position from side:"sell".
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "replace_stops_to_accounts",
+                        lambda accts, sym, pos_side, stop: (cap.update(sym=sym, pos_side=pos_side, stop=stop),
+                        {"placed": 1, "total": 1, "accounts": 1, "results": [{"ok": True}]})[1])
+    monkeypatch.setattr(appmod, "execute_to_accounts", lambda *a, **k: cap.update(entered=True) or {})
+    monkeypatch.setattr(appmod, "execute_bracket_to_accounts", lambda *a, **k: cap.update(entered=True) or {})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "replace_stop",
+        "symbol": "MNQ1!", "side": "sell", "cancel_previous_stop": True, "stop": 29504.75, "applies_to": "remaining_runner"})
+    assert r.status_code == 200
+    b = r.json()
+    assert b.get("status") == "EXECUTED" and b.get("action") == "REPLACE_STOP"
+    assert cap.get("stop") == 29504.75 and cap.get("pos_side") == "sell" and "entered" not in cap   # moved a stop, opened NOTHING
+
+
+def test_replace_stops_cancels_then_places_opposite_side(monkeypatch):
+    # Short position (entry side "sell") -> protective stop is a BUY stop for the runner qty.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "_net_position_for", lambda a, s: -2)      # runner: short 2 still open
+    monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
+    monkeypatch.setattr(tvo, "working_orders_for", lambda o, v, a, order_type=None: [{"id": 9, "contractId": 5}])
+    monkeypatch.setattr(appmod, "_contract_name", lambda e, t, c: "MNQU6")
+    cancels = []
+    monkeypatch.setattr(tvo, "cancel_order", lambda e, t, i: cancels.append(i) or {"commandId": 1})
+    placed = {}
+    monkeypatch.setattr(tvo, "place_stop_order",
+                        lambda env, tok, spec, aid, action, sym, qty, px: placed.update(action=action, qty=qty, px=px) or {"orderId": 1})
+    out = appmod.replace_stops_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", "sell", 29504.75)
+    assert cancels == [9]                                  # cancelled the OLD working stop
+    assert placed["action"] == "buy"                       # short -> BUY stop (opposite of position side)
+    assert placed["qty"] == 2 and placed["px"] == 29504.75  # runner qty + payload stop price
+    assert out["placed"] == 1 and out["results"][0]["cancelled"] == 1

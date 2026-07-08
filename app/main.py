@@ -3186,6 +3186,57 @@ def move_stops_to_accounts(accounts: list, symbol: str, new_stop) -> dict:
     return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
 
 
+def replace_stops_to_accounts(accounts: list, symbol: str, position_side: str, new_stop) -> dict:
+    """ADD-ONLY handler for the `replace_stop` event: CANCEL the working protective stop for
+    `symbol` and PLACE a fresh stop for whatever qty is still open (the runner) at `new_stop`.
+    NEVER opens, adds to, or reverses a position. `position_side` is the ENTRY/position side
+    ('buy'/'sell'); the protective stop CLOSES the position, so its action is the OPPOSITE
+    (short position -> BUY stop, long position -> SELL stop). Reuses the existing cancel /
+    position / stop helpers and changes nothing that already works."""
+    close_action = "buy" if str(position_side).lower() == "sell" else "sell"
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            name = a.get("account_name")
+            if not token or not acct_id:
+                results.append({"account": name, "ok": False, "error": "Reconnect required"})
+                continue
+            resolved = symbol
+            try:
+                resolved = tvo.resolve_contract(env, token, symbol)
+            except Exception:
+                pass
+            root = symbol_root(str(resolved or symbol).upper())
+            # remaining_runner = whatever is still open after the first take-profit scaled out
+            open_qty = abs(_net_position_for(a, resolved))
+            if open_qty <= 0:
+                results.append({"account": name, "ok": False, "error": "No open position to protect"})
+                continue
+            # 1) cancel the existing working protective STOP(s) for THIS symbol only (fail closed)
+            orders = tvo.get_orders(env, token)
+            versions = tvo.get_order_versions(env, token)
+            cancelled = 0
+            for o in tvo.working_orders_for(orders, versions, acct_id, order_type="Stop"):
+                cname = _contract_name(env, token, o.get("contractId"))
+                if root and (not cname or symbol_root(cname) != root):
+                    continue
+                if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
+                    cancelled += 1
+            # 2) place a fresh protective stop for the runner qty at the new (breakeven) price
+            ns = _round_tick(new_stop, _tick_for(resolved))
+            resp = tvo.place_stop_order(env, token, name, acct_id, close_action, resolved, int(open_qty), ns)
+            results.append({"account": name, "ok": _order_ok(resp), "cancelled": cancelled,
+                            "qty": int(open_qty), "stop": ns, "action": close_action, "response": resp})
+        except Exception as e:
+            results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
     """Copy-trade engine: place the SAME order on every account simultaneously.
 
@@ -7450,6 +7501,30 @@ def webhook_trade(payload: WebhookTrade):
         extras = payload.model_extra or {}
         event = str(extras.get("event") or "").lower().strip()
         brackets_on = _brackets_on_for(user["email"])   # global flag + canary allow-list
+
+        # --- replace_stop: move the runner's protective stop to breakeven via CANCEL + re-place.
+        # Routed on `event` FIRST (independent of the bracket flag) so it can NEVER fall through
+        # to an order-placement path — fixes the bug where side:"sell" opened another short.
+        # Only cancels the old stop and creates a new one; never opens/adds/reverses a position.
+        if event == "replace_stop":
+            if payload.auth != user["webhook_secret"]:
+                raise Exception("Invalid webhook secret.")
+            sym = (str(payload.symbol).upper() if payload.symbol else None)
+            if not sym:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Rejected: replace_stop requires a symbol."
+                log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
+            accounts, route = _route_signal_accounts(user, target_name)
+            pos_side = str(payload.side or "").lower()   # POSITION side; the new stop is the OPPOSITE
+            new_stop = extras.get("stop")
+            response = replace_stops_to_accounts(accounts, sym, pos_side, new_stop)
+            replaced = sum(1 for r in response.get("results", []) if r.get("ok"))
+            latency = round((time.perf_counter() - start_time) * 1000, 3)
+            message = f"Replace stop -> {new_stop}: re-armed {replaced} runner stop(s) on {response['accounts']} account(s)."
+            log_trade(user["id"], request_id, sym, event, 0, "live", "EXECUTED", latency, message, response)
+            return {"ok": True, "action": "REPLACE_STOP", "status": "EXECUTED", "message": message,
+                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
 
         # --- Lifecycle events that MANAGE an existing position; they never open one.
         # This also fixes the old bug where move_stop (side:"buy") was misread as a new
