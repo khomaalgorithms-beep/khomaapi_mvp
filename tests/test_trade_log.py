@@ -26,10 +26,21 @@ def _user():
     return uid
 
 
+def _connect(uid, name, aid=None):
+    """Register a CONNECTED broker account so realized P&L for `name` is in scope — the
+    journal/ledger now show only accounts still connected to KhomaAPI (disconnected ones
+    drop out). Name is what the scoping keys on (stable across reconnects)."""
+    con = appmod.db()
+    con.execute("INSERT INTO broker_accounts(user_id,broker,env,account_id,account_name,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)", (uid, "tradovate", "demo", str(aid if aid is not None else name), name, "connected", "x", "x"))
+    con.commit(); con.close()
+
+
 def test_ledger_persist_and_merge_unions_history():
     # The fix: realized P&L survives Tradovate's short fill window because every
     # trip is persisted and account_trade_history returns ledger ∪ live fills.
     uid = _user()
+    _connect(uid, "A")
     old = {"account": "A", "_account_id": 44, "symbol": "MNQ", "side": "long", "qty": 2,
            "entry_price": 100, "exit_price": 90, "pnl": -40.0,
            "opened_at": "2026-06-01T10:00:00Z", "closed_at": "2026-06-01T10:30:00Z"}
@@ -52,6 +63,7 @@ def test_name_drift_does_not_duplicate_or_double_count():
     # trip round-trips through the ledger. Persisting the "same" trade once with a
     # name and once without must NOT create a 2nd row or double the P&L.
     uid = _user()
+    _connect(uid, "DEMO856420")
     aid = 990044
     base = {"_account_id": aid, "symbol": "MNQU6", "side": "long", "qty": 2,
             "entry_price": 29986.25, "exit_price": 29852.25, "pnl": -536.0,
@@ -94,6 +106,7 @@ def test_ledger_merge_dedups_across_reconnect_account_id_change():
     # is stable. A trade still in the live fills window after a reconnect must NOT be
     # double-counted just because its row id changed.
     uid = _user()
+    _connect(uid, "DEMO856420")
     appmod._ledger_persist_trips(uid, [{
         "account": "DEMO856420", "_account_id": 44, "symbol": "MNQ", "side": "long", "qty": 2,
         "entry_price": 100, "exit_price": 90, "pnl": -40.0,
@@ -111,6 +124,8 @@ def test_ledger_merge_keeps_distinct_accounts_separate():
     # Copy trading: the SAME signal on TWO different accounts (different names) must
     # stay as two separate trades — never collapsed by the dedup.
     uid = _user()
+    _connect(uid, "ACCT-A")
+    _connect(uid, "ACCT-B")
     live = [
         {"account": "ACCT-A", "_account_id": 70, "symbol": "MNQ", "side": "long", "qty": 1,
          "entry_price": 100, "exit_price": 110, "pnl": 10.0,
@@ -217,3 +232,39 @@ def test_persist_all_account_trades_covers_every_connected_user(monkeypatch):
     assert len(appmod._ledger_merge(u2, [], only_account_id=a2)) == 1
     # Strict per-user scoping: u1's sweep never wrote into u2's ledger.
     assert appmod._ledger_merge(u1, [], only_account_id=a2) == []
+
+
+def test_journal_shows_only_connected_accounts():
+    # The journal must show ONLY accounts currently connected to KhomaAPI. Disconnect an
+    # account (its broker_accounts row is DELETED) and its numbers vanish immediately.
+    uid = _user()
+    _connect(uid, "ACC-A")
+    _connect(uid, "ACC-B")
+    tA = {"account": "ACC-A", "_account_id": 61, "symbol": "MNQ", "side": "long", "qty": 1,
+          "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+          "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}
+    tB = {"account": "ACC-B", "_account_id": 62, "symbol": "MNQ", "side": "long", "qty": 1,
+          "entry_price": 100, "exit_price": 90, "pnl": -10.0,
+          "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:05:00Z"}
+    appmod._ledger_persist_trips(uid, [tA, tB])
+    assert len(appmod._ledger_merge(uid, [])) == 2                       # both connected -> both show
+    # Disconnect B (delete its broker row, as /broker/disconnect does).
+    con = appmod.db(); con.execute("DELETE FROM broker_accounts WHERE user_id=? AND account_name=?", (uid, "ACC-B")); con.commit(); con.close()
+    merged = appmod._ledger_merge(uid, [])
+    assert len(merged) == 1 and merged[0]["account"] == "ACC-A"          # B's numbers gone
+    assert round(sum(t["pnl"] for t in merged), 2) == 10.0
+    assert round(sum(appmod.ledger_daily_map(uid).values()), 2) == 10.0  # calendar scoped too
+
+
+def test_journal_scoping_fails_safe_on_lookup_error(monkeypatch):
+    # A DB hiccup while reading the connected set must NOT blank the journal — fail safe = show all.
+    uid = _user()
+    appmod._ledger_persist_trips(uid, [{
+        "account": "X", "_account_id": 63, "symbol": "MNQ", "side": "long", "qty": 1,
+        "entry_price": 100, "exit_price": 110, "pnl": 10.0,
+        "opened_at": "2026-06-24T14:00:00Z", "closed_at": "2026-06-24T15:00:00Z"}])
+    assert appmod._ledger_merge(uid, []) == []                           # not connected -> hidden
+    def boom(user_id, connected_only=False):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(appmod, "get_broker_accounts", boom)
+    assert len(appmod._ledger_merge(uid, [])) == 1                       # error -> show all, never blank

@@ -2302,12 +2302,29 @@ def daily_pnl_map(user_id: int, start_date: str = None, end_date: str = None, on
     return {r["trade_date"]: (r["pnl"] or 0) for r in rows}
 
 
+def _connected_account_names(user_id: int):
+    """Set of the user's CURRENTLY-connected Tradovate account names (upper-cased). Used to
+    scope realized P&L to accounts still linked to KhomaAPI: a disconnected account (its
+    broker_accounts row is DELETED) drops out immediately, while a token lapse keeps
+    status='connected' so numbers do NOT vanish, and a reconnect keeps the same NAME (the
+    id rotates) so history survives. Returns None on any DB error so the ledger reads fail
+    SAFE (show everything) instead of blanking; an EMPTY set is legitimate (no connected
+    accounts -> no realized numbers)."""
+    try:
+        return {str(a.get("account_name") or "").strip().upper()
+                for a in get_broker_accounts(user_id, connected_only=True)
+                if a.get("account_name")}
+    except Exception:
+        return None
+
+
 def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None, only_account_id=None) -> dict:
     """{ 'YYYY-MM-DD'(ET): summed realized P&L } from the permanent trade_log ledger
     for ONE user — the authoritative realized-P&L source (same data the public
     results page uses), so the journal calendar matches the trade history instead of
-    relying on the unreliable daily_equity equity snapshots. ET dates, inclusive."""
-    q = ("SELECT account_id, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
+    relying on the unreliable daily_equity equity snapshots. ET dates, inclusive.
+    Scoped to CURRENTLY-CONNECTED accounts (disconnected accounts drop out)."""
+    q = ("SELECT account_id, account_name, symbol, side, qty, entry_price, exit_price, pnl, closed_at "
          "FROM trade_log WHERE user_id=?")
     params = [user_id]
     if only_account_id not in (None, "", "all"):
@@ -2319,8 +2336,12 @@ def ledger_daily_map(user_id: int, start_date: str = None, end_date: str = None,
     con = db()
     rows = con.execute(q, tuple(params)).fetchall()
     con.close()
+    names = _connected_account_names(user_id)   # scope to CONNECTED accounts; None (DB error) -> show all
     out, seen = {}, set()
     for r in rows:
+        nm = str(r["account_name"] or "").strip().upper()
+        if names is not None and nm and nm not in names:
+            continue                 # a NAMED trade from a DISCONNECTED account -> hide it
         ident = (r["account_id"], r["symbol"], r["side"], r["qty"],
                  r["entry_price"], r["exit_price"], str(r["closed_at"]))
         if ident in seen:            # fold away any legacy duplicate rows
@@ -3829,8 +3850,12 @@ def _ledger_merge(user_id, live_trips, only_account_id=None):
     con = db()
     rows = con.execute(q, tuple(params)).fetchall()
     con.close()
+    names = _connected_account_names(user_id)   # scope to CONNECTED accounts; None (DB error) -> show all
     by_ident = {}
     for r in rows:
+        nm = str(r["account_name"] or "").strip().upper()
+        if names is not None and nm and nm not in names:
+            continue                 # a NAMED trade from a DISCONNECTED account -> hide it
         t = {
             "account": r["account_name"] or "", "_account_id": r["account_id"],
             "side": r["side"], "symbol": r["symbol"], "qty": r["qty"],
@@ -3838,7 +3863,10 @@ def _ledger_merge(user_id, live_trips, only_account_id=None):
             "pnl": r["pnl"], "opened_at": r["opened_at"], "closed_at": r["closed_at"],
         }
         by_ident[_trip_ident(t)] = t
-    for t in (live_trips or []):     # live (fresh) wins
+    for t in (live_trips or []):     # live (fresh) wins; live reads are already connected-only
+        nm = str(t.get("account") or "").strip().upper()
+        if names is not None and nm and nm not in names:
+            continue
         by_ident[_trip_ident(t)] = t
     return list(by_ident.values())
 

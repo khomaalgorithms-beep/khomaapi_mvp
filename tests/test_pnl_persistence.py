@@ -28,6 +28,15 @@ def _new_user():
     return uid
 
 
+def _connect(uid, name, aid=None):
+    """Register a CONNECTED broker account so realized P&L for `name` is in scope (the
+    journal shows only accounts still connected to KhomaAPI)."""
+    con = appmod.db()
+    con.execute("INSERT INTO broker_accounts(user_id,broker,env,account_id,account_name,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)", (uid, "tradovate", "demo", str(aid if aid is not None else name), name, "connected", "x", "x"))
+    con.commit(); con.close()
+
+
 def _today_et():
     return appmod.datetime.now(appmod.timezone.utc).astimezone(
         appmod.ZoneInfo(appmod._ET)).strftime("%Y-%m-%d")
@@ -93,6 +102,7 @@ def test_apply_persisted_pnl_overrides_journal():
     # The journal calendar/net are driven by the REALIZED trade ledger (trade_log),
     # NOT the daily_equity snapshots (which include unrealized open-position P&L).
     uid = _new_user()
+    _connect(uid, "A")
     appmod._ledger_persist_trips(uid, [
         {"account": "A", "_account_id": 80_001, "symbol": "MNQ", "side": "long", "qty": 1,
          "entry_price": 100, "exit_price": 200, "pnl": 100.0,
@@ -133,6 +143,7 @@ def test_persisted_fills_gaps_not_covered_by_live():
     # The ledger backfills OLDER days the current live fills no longer cover (the
     # fills aged out of Tradovate's window), while live trips win for days they cover.
     uid = _new_user()
+    _connect(uid, "A")
     appmod._ledger_persist_trips(uid, [
         {"account": "A", "_account_id": 90_002, "symbol": "MNQ", "side": "long", "qty": 1,
          "entry_price": 100, "exit_price": 280, "pnl": 180.0,
@@ -152,6 +163,7 @@ def test_ledger_wins_over_stale_equity_snapshot_in_journal():
     # calendar even when a stale/wrong daily_equity snapshot exists for that day and no
     # live trips were passed (e.g. the fill aged out of Tradovate's window).
     uid = _new_user()
+    _connect(uid, "A")
     aid = 123_450
     con = appmod.db()
     con.execute("INSERT INTO daily_equity(user_id,account_id,account_name,trade_date,day_pnl,updated_at) "
