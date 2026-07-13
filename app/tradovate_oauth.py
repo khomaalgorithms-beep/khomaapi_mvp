@@ -343,6 +343,34 @@ def place_oco_exit(env: str, token: str, account_spec, account_id, exit_action: 
     return resp if resp is not None else {"error": "request failed"}
 
 
+def place_stoplimit_bracket(env: str, token: str, account_spec, account_id, action: str,
+                            symbol: str, qty: int, entry_stop, entry_limit, stop_price, limit_price):
+    """Place a RESTING stop-limit ENTRY with an attached OCO bracket (protective stop-market SL
+    + take-profit limit) via placeOSO. The entry rests until price triggers it; the SL/TP only
+    become working orders once the entry FILLS (OSO) — no naked window. Entry = StopLimit (a
+    stop trigger with a limit cap = a small slippage allowance so it can't chase); SL = Stop
+    (stop-MARKET, always exits even through the level); TP = Limit. `action` is the ENTRY side."""
+    contract = resolve_contract(env, token, symbol)
+    entry_action = "Buy" if str(action).lower() == "buy" else "Sell"
+    exit_action = "Sell" if entry_action == "Buy" else "Buy"
+    body = {
+        "accountSpec": str(account_spec),
+        "accountId": int(account_id),
+        "action": entry_action,
+        "symbol": str(contract).upper(),
+        "orderQty": int(qty),
+        "orderType": "StopLimit",
+        "stopPrice": float(entry_stop),
+        "price": float(entry_limit),
+        "isAutomated": True,
+        "timeInForce": "Day",
+        "bracket1": {"action": exit_action, "orderType": "Stop", "stopPrice": float(stop_price)},
+        "bracket2": {"action": exit_action, "orderType": "Limit", "price": float(limit_price)},
+    }
+    resp = _post(env, token, "/order/placeOSO", body)
+    return resp if resp is not None else {"error": "request failed"}
+
+
 def working_orders_for(orders: list, versions: list, account_id, contract_id=None,
                        order_type: str = None) -> list:
     """Join order/list with orderVersion/list to return WORKING orders for an account
