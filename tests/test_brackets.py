@@ -506,3 +506,91 @@ def test_replace_stops_falls_back_to_bare_stop_when_oco_rejected(monkeypatch):
     out = appmod.replace_stops_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", "sell", 29504.75)
     assert placed["action"] == "buy" and placed["qty"] == 2 and placed["px"] == 29504.75  # bare protective stop placed
     assert out["results"][0]["kind"] == "stop-fallback" and out["results"][0]["ok"] is True
+
+
+# ---- resting stop-limit ORB entries (place_orb / cancel_pending_entries) ----
+
+def test_place_stoplimit_bracket_body(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(tvo, "_post", lambda e, t, p, b: (cap.update(path=p, body=b), {"orderId": 1})[1])
+    tvo.place_stoplimit_bracket("demo", "tok", "ACC", 44, "buy", "MNQ1!", 2, 30000.0, 30002.0, 29995.0, 30020.0)
+    b = cap["body"]
+    assert cap["path"] == "/order/placeOSO"
+    assert b["orderType"] == "StopLimit" and b["stopPrice"] == 30000.0 and b["price"] == 30002.0   # stop-limit entry w/ allowance
+    assert b["action"] == "Buy" and b["orderQty"] == 2
+    assert b["bracket1"] == {"action": "Sell", "orderType": "Stop", "stopPrice": 29995.0}           # SL = stop-MARKET
+    assert b["bracket2"] == {"action": "Sell", "orderType": "Limit", "price": 30020.0}              # TP = limit
+
+
+def test_execute_orb_places_both_sides(monkeypatch):
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "_cancel_pending_entries_one", lambda a, s: 0)
+    calls = []
+    monkeypatch.setattr(tvo, "place_stoplimit_bracket",
+        lambda env, tok, spec, aid, action, sym, qty, es, el, sl, tp: calls.append((action, es, sl, tp)) or {"orderId": 1})
+    ls = {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020}   # long: SL<TP
+    ss = {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}   # short: SL>TP
+    out = appmod.execute_orb_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", 2, ls, ss)
+    assert sorted(c[0] for c in calls) == ["buy", "sell"]     # BOTH directions pre-placed
+    assert out["placed"] == 1
+
+
+def test_execute_orb_refuses_wrong_side_bracket(monkeypatch):
+    # A long with SL above TP is nonsense -> refuse rather than place an instantly-triggering stop.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "_cancel_pending_entries_one", lambda a, s: 0)
+    placed = []
+    monkeypatch.setattr(tvo, "place_stoplimit_bracket", lambda *a, **k: placed.append(1) or {"orderId": 1})
+    ls = {"entryStop": 30000, "entryLimit": 30002, "sl": 30050, "tp": 29990}   # SL ABOVE TP on a long -> reject
+    out = appmod.execute_orb_to_accounts([{"account_name": "A", "account_id": 44, "env": "demo"}], "MNQ1!", 2, ls, None)
+    assert placed == [] and out["placed"] == 0
+
+
+def test_cancel_pending_entries_only_stoplimit(monkeypatch):
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda e, t: [])
+    # Only asked for StopLimit orders -> returns the pending entries; brackets (Stop/Limit) never queried.
+    monkeypatch.setattr(tvo, "working_orders_for",
+        lambda o, v, a, order_type=None: [{"id": 3, "contractId": 5}] if order_type == "StopLimit" else [])
+    monkeypatch.setattr(appmod, "_contract_name", lambda e, t, c: "MNQU6")
+    cancels = []
+    monkeypatch.setattr(tvo, "cancel_order", lambda e, t, i: cancels.append(i) or {"commandId": 1})
+    n = appmod._cancel_pending_entries_one({"account_name": "A", "account_id": 44, "env": "demo"}, "MNQU6")
+    assert n == 1 and cancels == [3]                          # cancels the pending StopLimit entry only
+
+
+def test_handler_place_orb_routes(monkeypatch):
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+        lambda accts, sym, qty, ls, ss: (cap.update(sym=sym, qty=qty, ls=ls, ss=ss), {"placed": 1, "total": 1, "accounts": 1, "results": []})[1])
+    monkeypatch.setattr(appmod, "execute_to_accounts", lambda *a, **k: cap.update(entered=True) or {})
+    monkeypatch.setattr(appmod, "execute_bracket_to_accounts", lambda *a, **k: cap.update(entered=True) or {})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200
+    b = r.json()
+    assert b.get("status") == "EXECUTED" and b.get("action") == "PLACE_ORB"
+    assert cap.get("qty") == 2 and cap["ls"]["entryStop"] == 30000 and "entered" not in cap   # brackets placed, NO market entry
+
+
+def test_handler_cancel_pending_entries_routes(monkeypatch):
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "cancel_pending_entries_to_accounts",
+        lambda accts, sym: (cap.update(sym=sym), {"placed": 1, "total": 1, "accounts": 1, "results": [{"cancelled": 1}]})[1])
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "cancel_pending_entries", "symbol": "MNQ1!"})
+    assert r.status_code == 200
+    assert r.json().get("action") == "CANCEL_PENDING_ENTRIES" and cap.get("sym") == "MNQ1!"

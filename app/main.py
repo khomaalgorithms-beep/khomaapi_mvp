@@ -3282,6 +3282,104 @@ def replace_stops_to_accounts(accounts: list, symbol: str, position_side: str, n
     return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
 
 
+def _oso_ok(resp) -> bool:
+    """An OSO/OCO placement is 'ok' when the broker returned a dict with no failure flag
+    (these strategy endpoints don't always echo a single orderId like a plain order)."""
+    return isinstance(resp, dict) and not resp.get("failureReason") \
+        and not resp.get("failureText") and not resp.get("error")
+
+
+def _cancel_pending_entries_one(account, resolved_symbol) -> int:
+    """Cancel WORKING stop-limit ENTRY orders for a symbol on one account (the pending ORB
+    entries). Scoped to StopLimit order type ONLY, so it never touches the Stop/Limit bracket
+    orders that protect an already-filled position — that's how 'cancel the loser' works
+    without disarming the winner. Fail-closed on an unresolvable contract."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id, order_type="StopLimit"):
+        cname = _contract_name(env, token, o.get("contractId"))
+        if root and (not cname or symbol_root(cname) != root):
+            continue
+        if _cancel_ok(tvo.cancel_order(env, token, o.get("id"))):
+            n += 1
+    return n
+
+
+def cancel_pending_entries_to_accounts(accounts: list, symbol: str) -> dict:
+    """ADD-ONLY: cancel the pending stop-limit ORB entries for a symbol on every account —
+    used to remove the opposite (loser) entry once one side fills, and to clear both if the
+    entry window closes unfilled. Never touches a filled position's protective bracket."""
+    accounts = list(accounts or [])
+    results = []
+    for a in accounts:
+        try:
+            resolved = symbol
+            try:
+                tok = ensure_fresh_token(a)
+                resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+            except Exception:
+                pass
+            n = _cancel_pending_entries_one(a, resolved)
+            results.append({"account": a.get("account_name"), "ok": True, "cancelled": n})
+        except Exception as e:
+            results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
+    return {"results": results, "placed": sum(1 for r in results if r.get("ok")),
+            "total": len(results), "accounts": len(accounts)}
+
+
+def execute_orb_to_accounts(accounts: list, symbol: str, qty: int, long_spec, short_spec) -> dict:
+    """ADD-ONLY: place RESTING stop-limit ORB entries (long and/or short) with attached
+    stop-market SL + limit TP brackets on every account (Tradovate placeOSO). Only ONE side
+    fills in a normal breakout; cancel_pending_entries removes the loser. Idempotent: cancels
+    any existing pending stop-limit entries for the symbol first, so a webhook retry re-places
+    rather than stacks. Each spec = {entryStop, entryLimit, sl, tp} (absolute, tick-snapped)."""
+    accounts = list(accounts or [])
+    if not accounts:
+        return {"results": [], "placed": 0, "total": 0, "accounts": 0}
+    results = []
+    for a in accounts:
+        try:
+            token = ensure_fresh_token(a)
+            env = a.get("env") or "live"
+            acct_id = a.get("account_id")
+            name = a.get("account_name")
+            if not token or not acct_id:
+                results.append({"account": name, "ok": False, "error": "Reconnect required"})
+                continue
+            resolved = tvo.resolve_contract(env, token, symbol)
+            tick = _tick_for(resolved)
+            _cancel_pending_entries_one(a, resolved)   # idempotency: clear stale pending entries first
+            legs = []
+            for side, spec in (("buy", long_spec), ("sell", short_spec)):
+                if not isinstance(spec, dict):
+                    continue
+                es = _round_tick(_num(spec.get("entryStop")), tick)
+                el = _round_tick(_num(spec.get("entryLimit")), tick)
+                sl = _round_tick(_num(spec.get("sl")), tick)
+                tp = _round_tick(_num(spec.get("tp")), tick)
+                if None in (es, el, sl, tp):
+                    legs.append({"side": side, "ok": False, "error": "missing price"})
+                    continue
+                if not _bracket_side_ok(side, sl, tp):     # long: SL<TP ; short: SL>TP — never place a wrong-side bracket
+                    legs.append({"side": side, "ok": False, "error": "wrong-side SL/TP"})
+                    continue
+                resp = tvo.place_stoplimit_bracket(env, token, name, acct_id, side, resolved, int(qty), es, el, sl, tp)
+                legs.append({"side": side, "ok": _oso_ok(resp), "entry": es, "limit": el, "sl": sl, "tp": tp, "response": resp})
+            ok = bool(legs) and all(l["ok"] for l in legs)
+            results.append({"account": name, "ok": ok, "legs": legs})
+        except Exception as e:
+            results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
+    placed = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
     """Copy-trade engine: place the SAME order on every account simultaneously.
 
@@ -7553,6 +7651,51 @@ def webhook_trade(payload: WebhookTrade):
         extras = payload.model_extra or {}
         event = str(extras.get("event") or "").lower().strip()
         brackets_on = _brackets_on_for(user["email"])   # global flag + canary allow-list
+
+        # --- place_orb: pre-place RESTING stop-limit ORB entries (long and/or short) with
+        # attached stop-market SL + limit TP brackets. Routed on `event` FIRST so it never
+        # falls through to a market order. Payload carries qty + a `long`/`short` object,
+        # each {entryStop, entryLimit, sl, tp} (absolute prices from the Pine).
+        if event == "place_orb":
+            if payload.auth != user["webhook_secret"]:
+                raise Exception("Invalid webhook secret.")
+            sym = (str(payload.symbol).upper() if payload.symbol else None)
+            if not sym:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Rejected: place_orb requires a symbol."
+                log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
+            accounts, route = _route_signal_accounts(user, target_name)
+            qty = clean_qty(payload.qty)
+            long_spec = extras.get("long") if isinstance(extras.get("long"), dict) else None
+            short_spec = extras.get("short") if isinstance(extras.get("short"), dict) else None
+            response = execute_orb_to_accounts(accounts, sym, qty, long_spec, short_spec)
+            latency = round((time.perf_counter() - start_time) * 1000, 3)
+            message = f"Place ORB: {response['placed']}/{response['total']} account(s) got resting stop-limit entries + brackets."
+            log_trade(user["id"], request_id, sym, event, qty, "live", "EXECUTED", latency, message, response)
+            return {"ok": True, "action": "PLACE_ORB", "status": "EXECUTED", "message": message,
+                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
+
+        # --- cancel_pending_entries: remove the pending stop-limit ORB entries (the loser once
+        # one side fills, or both if the window closes unfilled). Cancels ONLY working StopLimit
+        # orders, never a filled position's protective bracket. Never opens/closes a position.
+        if event == "cancel_pending_entries":
+            if payload.auth != user["webhook_secret"]:
+                raise Exception("Invalid webhook secret.")
+            sym = (str(payload.symbol).upper() if payload.symbol else None)
+            if not sym:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Rejected: cancel_pending_entries requires a symbol."
+                log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
+            accounts, route = _route_signal_accounts(user, target_name)
+            response = cancel_pending_entries_to_accounts(accounts, sym)
+            cancelled = sum(int(r.get("cancelled") or 0) for r in response.get("results", []))
+            latency = round((time.perf_counter() - start_time) * 1000, 3)
+            message = f"Cancel pending entries: removed {cancelled} resting stop-limit entry(ies) on {response['accounts']} account(s)."
+            log_trade(user["id"], request_id, sym, event, 0, "live", "EXECUTED", latency, message, response)
+            return {"ok": True, "action": "CANCEL_PENDING_ENTRIES", "status": "EXECUTED", "message": message,
+                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
 
         # --- replace_stop: move the runner's protective stop to breakeven via CANCEL + re-place.
         # Routed on `event` FIRST (independent of the bracket flag) so it can NEVER fall through
