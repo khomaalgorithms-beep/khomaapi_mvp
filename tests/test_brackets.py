@@ -594,3 +594,93 @@ def test_handler_cancel_pending_entries_routes(monkeypatch):
     r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "cancel_pending_entries", "symbol": "MNQ1!"})
     assert r.status_code == 200
     assert r.json().get("action") == "CANCEL_PENDING_ENTRIES" and cap.get("sym") == "MNQ1!"
+
+
+# ---- server-side ORB manager (cancel-loser / cutoff / force-flat) -----------
+
+def _orb_session(**kw):
+    base = {"id": 7, "user_id": 1, "symbol": "MNQ1!", "target_name": "",
+            "et_date": "2026-07-23", "cutoff_min": 720, "flat_min": 960, "status": "armed"}
+    base.update(kw)
+    return base
+
+
+def _orb_mocks(monkeypatch, net, now):
+    cap = {"cancel": 0, "flat": 0, "set": []}
+    monkeypatch.setattr(appmod, "_orb_now_et", lambda: now)
+    monkeypatch.setattr(appmod, "_orb_get_user", lambda uid: {"id": uid, "email": "x"})
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda u, tn: ([{"account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda env, tok, sym: "MNQU6")
+    monkeypatch.setattr(appmod, "_net_position_for", lambda a, r: net)
+    monkeypatch.setattr(appmod, "cancel_pending_entries_to_accounts",
+                        lambda accts, sym: cap.update(cancel=cap["cancel"] + 1) or {})
+    monkeypatch.setattr(appmod, "exit_from_accounts",
+                        lambda accts, sym: cap.update(flat=cap["flat"] + 1) or {})
+    monkeypatch.setattr(appmod, "_orb_set_status", lambda sid, st: cap["set"].append(st))
+    return cap
+
+
+def test_orb_manager_cancels_loser_on_fill(monkeypatch):
+    cap = _orb_mocks(monkeypatch, net=2, now=("2026-07-23", 605))     # filled, before cutoff
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["filled"]
+
+
+def test_orb_manager_cutoff_cancels_when_flat(monkeypatch):
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 725))     # flat, past 12:00 cutoff
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["done"]
+
+
+def test_orb_manager_idle_before_cutoff(monkeypatch):
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 700))     # flat, before cutoff -> nothing
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["cancel"] == 0 and cap["flat"] == 0 and cap["set"] == []
+
+
+def test_orb_manager_force_flat_at_eod(monkeypatch):
+    cap = _orb_mocks(monkeypatch, net=2, now=("2026-07-23", 965))     # open position, past 16:00
+    appmod._orb_manage_one(_orb_session(status="filled"))
+    assert cap["flat"] == 1 and cap["cancel"] == 0 and cap["set"] == ["done"]
+
+
+def test_orb_manager_stale_day_force_flat(monkeypatch):
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-24", 600))     # session left over from prior day
+    appmod._orb_manage_one(_orb_session(et_date="2026-07-23", status="armed"))
+    assert cap["flat"] == 1 and cap["set"] == ["done"]
+
+
+def test_handler_place_orb_records_server_session(monkeypatch):
+    uid, email, secret = _mk_user()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    monkeypatch.setattr(appmod, "record_orb_session", lambda *a, **k: cap.update(rec=a))
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 40, "manage": "server", "cutoff": 720, "flat": 960,
+        "long": {"entryStop": 30000, "entryLimit": 30003, "sl": 29995, "tp": 30005},
+        "short": {"entryStop": 29900, "entryLimit": 29897, "sl": 29905, "tp": 29895}})
+    assert r.status_code == 200 and r.json().get("status") == "EXECUTED"
+    # record_orb_session(user_id, symbol, target_name, cutoff, flat, tz)
+    assert cap.get("rec") and cap["rec"][1] == "MNQ1!" and cap["rec"][3] == 720 and cap["rec"][4] == 960
+
+
+def test_handler_place_orb_no_session_without_flag(monkeypatch):
+    uid, email, secret = _mk_user()
+    cap = {"rec": False}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    monkeypatch.setattr(appmod, "record_orb_session", lambda *a, **k: cap.update(rec=True))
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200 and cap["rec"] is False   # no manage flag -> no server session

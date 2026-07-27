@@ -558,6 +558,22 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS orb_sessions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        target_name TEXT DEFAULT '',
+        et_date TEXT NOT NULL,
+        cutoff_min INTEGER,
+        flat_min INTEGER,
+        tz TEXT DEFAULT 'America/New_York',
+        status TEXT DEFAULT 'armed',
+        created_at TEXT,
+        updated_at TEXT
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS password_resets(
         token TEXT PRIMARY KEY,
         user_id INTEGER,
@@ -2675,6 +2691,22 @@ async def trade_ledger_loop():
         await asyncio.sleep(120)
 
 
+async def orb_manager_loop():
+    """Server-side ORB execution: for each active server-managed ORB session, cancel the
+    losing entry once one side fills, stop new entries after the cutoff, and force-flat at
+    EOD — so TradingView only sends the levels once and KhomaAPI owns the whole lifecycle.
+    Leader-only; every action is idempotent and fail-safe."""
+    print("ORB-MANAGER started (server-side ORB execution, 5s cadence)")
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            if await loop.run_in_executor(None, try_become_leader):
+                await loop.run_in_executor(None, process_orb_sessions)
+        except Exception as e:
+            print("ORB-MANAGER ERROR:", e)
+        await asyncio.sleep(5)
+
+
 @app.on_event("startup")
 async def _start_watchdog():
     # Disable with KHOMA_DISABLE_WATCHDOG=1 (e.g. in tests / CI).
@@ -2683,6 +2715,7 @@ async def _start_watchdog():
     asyncio.create_task(risk_watchdog_loop())
     asyncio.create_task(digest_loop())
     asyncio.create_task(trade_ledger_loop())
+    asyncio.create_task(orb_manager_loop())
 
 
 def _order_ok(resp) -> bool:
@@ -3378,6 +3411,127 @@ def execute_orb_to_accounts(accounts: list, symbol: str, qty: int, long_spec, sh
             results.append({"account": a.get("account_name"), "ok": False, "error": str(e)})
     placed = sum(1 for r in results if r.get("ok"))
     return {"results": results, "placed": placed, "total": len(results), "accounts": len(accounts)}
+
+
+# ---------- Server-side ORB lifecycle manager ----------
+# TradingView sends the OR levels ONCE (place_orb with manage:"server"); KhomaAPI then owns the
+# whole lifecycle: cancel the losing entry when one side fills, stop new entries after the cutoff,
+# and force-flat at EOD. No further alerts from Pine are needed or used. Backward-compatible:
+# a place_orb WITHOUT manage:"server" behaves exactly as before (Pine drives cancel/exit).
+_ORB_DEFAULT_CUTOFF = 12 * 60   # 12:00 ET — no new entries after this
+_ORB_DEFAULT_FLAT = 16 * 60     # 16:00 ET — force flat
+
+
+def _orb_now_et():
+    """(ET date 'YYYY-MM-DD', minute-of-day) — DST-aware, matches the Pine session clock."""
+    now = datetime.now(ZoneInfo(_ET))
+    return now.strftime("%Y-%m-%d"), now.hour * 60 + now.minute
+
+
+def record_orb_session(user_id, symbol, target_name, cutoff_min, flat_min, tz):
+    """Register/refresh a server-managed ORB session for today so the manager loop can run it.
+    Idempotent per (user, symbol, ET date): a re-fired place_orb re-arms the same day."""
+    et_date, _ = _orb_now_et()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    con = db()
+    try:
+        con.execute("DELETE FROM orb_sessions WHERE user_id=? AND symbol=? AND et_date=?",
+                    (user_id, str(symbol).upper(), et_date))
+        con.execute(
+            "INSERT INTO orb_sessions(user_id,symbol,target_name,et_date,cutoff_min,flat_min,tz,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?, 'armed', ?, ?)",
+            (user_id, str(symbol).upper(), target_name or "", et_date,
+             int(cutoff_min), int(flat_min), tz or _ET, now_iso, now_iso))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _orb_set_status(session_id, status):
+    con = db()
+    try:
+        con.execute("UPDATE orb_sessions SET status=?, updated_at=? WHERE id=?",
+                    (status, datetime.now(timezone.utc).isoformat(), session_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _orb_get_user(user_id):
+    con = db()
+    try:
+        u = con.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(u) if u else None
+    finally:
+        con.close()
+
+
+def process_orb_sessions():
+    """Leader-only tick: advance every active server-managed ORB session. Fail-safe per row."""
+    con = db()
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM orb_sessions WHERE status IN ('armed','filled')").fetchall()]
+    finally:
+        con.close()
+    for s in rows:
+        try:
+            _orb_manage_one(s)
+        except Exception as e:
+            print("ORB-MANAGER session", s.get("id"), "error:", e)
+
+
+def _orb_manage_one(s):
+    """One ORB session's state machine, priority order:
+       force-flat (EOD) > cancel-the-loser (a side filled) > no-new-trades cutoff."""
+    et_date, now_min = _orb_now_et()
+    flat_min = int(s["flat_min"]) if s.get("flat_min") is not None else _ORB_DEFAULT_FLAT
+    cutoff_min = int(s["cutoff_min"]) if s.get("cutoff_min") is not None else _ORB_DEFAULT_CUTOFF
+    user = _orb_get_user(s["user_id"])
+    if not user:
+        _orb_set_status(s["id"], "done"); return
+    accounts, _route = _route_signal_accounts(user, s.get("target_name") or "")
+    symbol = s["symbol"]
+
+    # A still-open session from a PRIOR ET day -> force flat + close (safety net).
+    if s["et_date"] != et_date:
+        if accounts:
+            exit_from_accounts(accounts, symbol)
+        _orb_set_status(s["id"], "done"); return
+
+    if not accounts:
+        if now_min >= flat_min:
+            _orb_set_status(s["id"], "done")   # nothing connected to manage; don't linger past EOD
+        return
+
+    # 1) FORCE-FLAT window (e.g. 16:00 ET): flatten any open position + cancel all working orders.
+    if now_min >= flat_min:
+        exit_from_accounts(accounts, symbol)
+        _orb_set_status(s["id"], "done"); return
+
+    # Net position across the routed accounts (detects that a side has filled).
+    net = 0
+    for a in accounts:
+        try:
+            tok = ensure_fresh_token(a)
+            resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+        except Exception:
+            resolved = symbol
+        try:
+            net += _net_position_for(a, resolved)
+        except Exception:
+            pass
+
+    # 2) CANCEL-THE-LOSER: a side filled -> cancel the opposite resting entry (StopLimit only;
+    #    never the winner's Stop/Limit bracket). Mark filled; keep watching for the flat window.
+    if net != 0 and s["status"] == "armed":
+        cancel_pending_entries_to_accounts(accounts, symbol)
+        _orb_set_status(s["id"], "filled"); return
+
+    # 3) NO-NEW-TRADES cutoff (e.g. 12:00 ET): still flat and past cutoff -> cancel resting entries.
+    if net == 0 and s["status"] == "armed" and now_min >= cutoff_min:
+        cancel_pending_entries_to_accounts(accounts, symbol)
+        _orb_set_status(s["id"], "done"); return
 
 
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
@@ -7670,6 +7824,16 @@ def webhook_trade(payload: WebhookTrade):
             long_spec = extras.get("long") if isinstance(extras.get("long"), dict) else None
             short_spec = extras.get("short") if isinstance(extras.get("short"), dict) else None
             response = execute_orb_to_accounts(accounts, sym, qty, long_spec, short_spec)
+            # Server-managed lifecycle: if the alert opts in (manage:"server"), KhomaAPI owns
+            # cancel-the-loser, the no-new-trades cutoff, and the EOD force-flat — Pine sends the
+            # levels once and nothing else. Without the flag, behavior is unchanged (Pine-driven).
+            if str(extras.get("manage") or "").lower() == "server":
+                try:
+                    _cm = int(extras["cutoff"]) if extras.get("cutoff") is not None else _ORB_DEFAULT_CUTOFF
+                    _fm = int(extras["flat"]) if extras.get("flat") is not None else _ORB_DEFAULT_FLAT
+                    record_orb_session(user["id"], sym, target_name, _cm, _fm, extras.get("tz") or _ET)
+                except Exception as e:
+                    print("record_orb_session failed:", e)
             latency = round((time.perf_counter() - start_time) * 1000, 3)
             message = f"Place ORB: {response['placed']}/{response['total']} account(s) got resting stop-limit entries + brackets."
             log_trade(user["id"], request_id, sym, event, qty, "live", "EXECUTED", latency, message, response)
