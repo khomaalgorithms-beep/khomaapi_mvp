@@ -963,13 +963,45 @@ def _ucol(user, key):
         return getter(key) if getter else None
 
 
+# ---- Team / comp access ---------------------------------------------------
+# Emails granted FULL (Elite) access to KhomaAPI independent of Whop billing — the
+# owner's own team and explicitly granted collaborators. Overrides the subscription
+# gate for these accounts; they still sign in normally (set a password at /signup, or
+# Google login). REVOKE a grant by removing the email from _COMP_ACCESS_EMAILS below,
+# or without a redeploy by adding it to the COMP_ACCESS_REVOKED env var. The
+# COMP_ACCESS_EMAILS env var can ADD emails the same way.
+_COMP_ACCESS_EMAILS = {
+    "amar.sgnm@gmail.com",
+}
+
+
+def _csv_lower_set(name: str) -> set:
+    return {e.strip().lower() for e in (os.getenv(name) or "").split(",") if e.strip()}
+
+
+def comp_access_emails() -> set:
+    """Emails with full comp access right now: code defaults + COMP_ACCESS_EMAILS (env),
+    minus COMP_ACCESS_REVOKED (env). Revoking via env needs no redeploy."""
+    return ({e.lower() for e in _COMP_ACCESS_EMAILS} | _csv_lower_set("COMP_ACCESS_EMAILS")) \
+        - _csv_lower_set("COMP_ACCESS_REVOKED")
+
+
+def has_comp_access(email) -> bool:
+    """Is this email an owner-granted full-access (Elite) comp account?"""
+    return bool(email) and str(email).lower().strip() in comp_access_emails()
+
+
 def user_entitlements(user) -> Entitlement:
-    """Resolve a user's entitlement. Whop is authoritative: if the account is
-    linked to a membership, only Whop's status counts. The manual test flag
-    applies ONLY when there is no Whop linkage AND ALLOW_MANUAL_PLAN is on — so
-    a local flag can never grant access Whop says is inactive."""
+    """Resolve a user's entitlement. An owner-granted comp email always gets full (Elite)
+    access. Otherwise Whop is authoritative: if the account is linked to a membership, only
+    Whop's status counts. The manual test flag applies ONLY when there is no Whop linkage AND
+    ALLOW_MANUAL_PLAN is on — so a local flag can never grant access Whop says is inactive."""
     if user is None:
         return Entitlement(False, None, "none")
+
+    # Owner-granted team / comp access — full Elite, independent of billing.
+    if has_comp_access(_ucol(user, "email")):
+        return Entitlement(True, "elite", "comp")
 
     membership = _ucol(user, "whop_membership_id")
     if membership:
@@ -5278,8 +5310,9 @@ def signup(email: str = Form(...), password: str = Form(...)):
 
     # Gated set-password: when enforcement is ON, only an email with an active
     # Whop purchase may create an account ("buy first, then set your password").
+    # Owner-granted comp emails bypass this — they get access without a Whop plan.
     membership = None
-    if ENFORCE_SUBSCRIPTIONS:
+    if ENFORCE_SUBSCRIPTIONS and not has_comp_access(email):
         membership = whop_membership_for_email(email)
         if not membership:
             return login_layout(
@@ -5294,7 +5327,7 @@ def signup(email: str = Form(...), password: str = Form(...)):
     # Without SMTP, auto-verify. A confirmed Whop buyer is auto-verified (their
     # Whop email is proof of purchase) so they aren't blocked behind a second step.
     verified = 0 if email_enabled() else 1
-    if membership:
+    if membership or has_comp_access(email):
         verified = 1
 
     con = db()
@@ -5520,9 +5553,10 @@ def auth_google_callback(code: str = ""):
     con.close()
 
     # Gated like every other entry point: a brand-new Google email with NO active
-    # Whop purchase does not get an account — send them to choose a plan.
+    # Whop purchase does not get an account — send them to choose a plan. Owner-granted
+    # comp emails bypass the gate (full access without a Whop plan).
     membership = None
-    if not existing_user and ENFORCE_SUBSCRIPTIONS:
+    if not existing_user and ENFORCE_SUBSCRIPTIONS and not has_comp_access(email_norm):
         membership = whop_membership_for_email(email_norm)
         if not membership:
             return RedirectResponse("/subscribe", status_code=302)
