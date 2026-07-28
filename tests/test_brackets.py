@@ -605,7 +605,7 @@ def _orb_session(**kw):
     return base
 
 
-def _orb_mocks(monkeypatch, net, now):
+def _orb_mocks(monkeypatch, net, now, entry_filled=False):
     cap = {"cancel": 0, "flat": 0, "set": []}
     monkeypatch.setattr(appmod, "_orb_now_et", lambda: now)
     monkeypatch.setattr(appmod, "_orb_get_user", lambda uid: {"id": uid, "email": "x"})
@@ -614,6 +614,7 @@ def _orb_mocks(monkeypatch, net, now):
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
     monkeypatch.setattr(tvo, "resolve_contract", lambda env, tok, sym: "MNQU6")
     monkeypatch.setattr(appmod, "_net_position_for", lambda a, r: net)
+    monkeypatch.setattr(appmod, "_orb_entry_filled", lambda a, r: entry_filled)
     monkeypatch.setattr(appmod, "cancel_pending_entries_to_accounts",
                         lambda accts, sym: cap.update(cancel=cap["cancel"] + 1) or {})
     monkeypatch.setattr(appmod, "exit_from_accounts",
@@ -624,6 +625,14 @@ def _orb_mocks(monkeypatch, net, now):
 
 def test_orb_manager_cancels_loser_on_fill(monkeypatch):
     cap = _orb_mocks(monkeypatch, net=2, now=("2026-07-23", 605))     # filled, before cutoff
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["filled"]
+
+
+def test_orb_manager_cancels_loser_on_fast_fill(monkeypatch):
+    # REGRESSION: position already flat (net=0) because the trade opened AND took profit inside
+    # one poll interval, but a StopLimit entry DID fill -> the loser must STILL be cancelled.
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 615), entry_filled=True)
     appmod._orb_manage_one(_orb_session(status="armed"))
     assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["filled"]
 
