@@ -2696,7 +2696,7 @@ async def orb_manager_loop():
     losing entry once one side fills, stop new entries after the cutoff, and force-flat at
     EOD — so TradingView only sends the levels once and KhomaAPI owns the whole lifecycle.
     Leader-only; every action is idempotent and fail-safe."""
-    print("ORB-MANAGER started (server-side ORB execution, 5s cadence)")
+    print("ORB-MANAGER started (server-side ORB execution, 3s cadence)")
     loop = asyncio.get_event_loop()
     while True:
         try:
@@ -2704,7 +2704,7 @@ async def orb_manager_loop():
                 await loop.run_in_executor(None, process_orb_sessions)
         except Exception as e:
             print("ORB-MANAGER ERROR:", e)
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
 
 @app.on_event("startup")
@@ -3481,6 +3481,40 @@ def process_orb_sessions():
             print("ORB-MANAGER session", s.get("id"), "error:", e)
 
 
+def _orb_entry_filled(account, resolved_symbol) -> bool:
+    """True if a StopLimit ENTRY for this symbol has already FILLED — a DURABLE signal that
+    survives even after the position opened AND closed (a fast take-profit) between polls.
+    This is exactly what net-position polling misses: a trade that fills and exits inside one
+    poll interval. Checking the entry order's terminal 'Filled' status catches it every time."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return False
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    ver_by_order = {}
+    for v in versions or []:
+        oid = v.get("orderId")
+        if oid is not None:
+            ver_by_order[oid] = v
+    for o in orders or []:
+        if str(o.get("accountId")) != str(acct_id):
+            continue
+        if str(o.get("ordStatus") or o.get("status") or "").lower() != "filled":
+            continue
+        v = ver_by_order.get(o.get("id"), {})
+        otype = str(v.get("orderType") or o.get("orderType") or "")
+        if otype.lower() != "stoplimit":
+            continue
+        cname = _contract_name(env, token, o.get("contractId"))
+        if root and cname and symbol_root(cname) != root:
+            continue
+        return True
+    return False
+
+
 def _orb_manage_one(s):
     """One ORB session's state machine, priority order:
        force-flat (EOD) > cancel-the-loser (a side filled) > no-new-trades cutoff."""
@@ -3509,8 +3543,13 @@ def _orb_manage_one(s):
         exit_from_accounts(accounts, symbol)
         _orb_set_status(s["id"], "done"); return
 
-    # Net position across the routed accounts (detects that a side has filled).
+    # Detect a fill across the routed accounts. TWO signals so a fill is NEVER missed:
+    #   (a) net position != 0   — a trade is currently open;
+    #   (b) a StopLimit entry already FILLED — DURABLE, so it catches a trade that opened AND
+    #       closed (fast take-profit) inside one poll interval, which (a) alone misses. This is
+    #       the bug that let a fast short slip past and leave the long entry live to fire later.
     net = 0
+    fill = False
     for a in accounts:
         try:
             tok = ensure_fresh_token(a)
@@ -3521,10 +3560,15 @@ def _orb_manage_one(s):
             net += _net_position_for(a, resolved)
         except Exception:
             pass
+        if not fill:
+            try:
+                fill = _orb_entry_filled(a, resolved)
+            except Exception:
+                pass
 
     # 2) CANCEL-THE-LOSER: a side filled -> cancel the opposite resting entry (StopLimit only;
     #    never the winner's Stop/Limit bracket). Mark filled; keep watching for the flat window.
-    if net != 0 and s["status"] == "armed":
+    if (net != 0 or fill) and s["status"] == "armed":
         cancel_pending_entries_to_accounts(accounts, symbol)
         _orb_set_status(s["id"], "filled"); return
 
