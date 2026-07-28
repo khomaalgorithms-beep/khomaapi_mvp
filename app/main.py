@@ -5330,6 +5330,24 @@ def signup(email: str = Form(...), password: str = Form(...)):
     if membership or has_comp_access(email):
         verified = 1
 
+    # Comp accounts are owner-vouched: for these emails ONLY, /signup doubles as a
+    # "set / reset my password" page, so the owner can (re)provision a collaborator whose
+    # account already exists (created via Google or an earlier signup) without depending on
+    # password-reset email delivery. Scoped strictly to the comp allowlist — a regular email
+    # that already exists still gets the normal "account already exists" message below, so
+    # this changes nothing about password security for ordinary users.
+    if has_comp_access(email):
+        con = db()
+        existing = con.execute("SELECT id FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+        if existing:
+            con.execute("UPDATE users SET password_hash=?, is_verified=1 WHERE id=?",
+                        (hash_password(password), existing["id"]))
+            con.commit(); con.close()
+            return login_layout(
+                "<h1>Password set</h1><p>Your password has been set. You can log in now with "
+                "full access.</p><a class='btn' href='/login'>Go to login</a>")
+        con.close()
+
     con = db()
     try:
         cur = con.cursor()
