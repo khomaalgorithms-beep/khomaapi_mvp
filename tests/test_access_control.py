@@ -456,3 +456,26 @@ def test_comp_access_revocable_via_env(monkeypatch):
 def test_comp_access_addable_via_env(monkeypatch):
     monkeypatch.setenv("COMP_ACCESS_EMAILS", "granted@team.com")
     assert appmod.user_entitlements({"email": "granted@team.com"}).tier == "elite"
+
+
+def test_comp_signup_sets_password_on_existing_account(monkeypatch):
+    # An existing account for a comp email: /signup acts as "set my password" (own email
+    # via env so it can't collide with the amar grant used elsewhere in this file).
+    monkeypatch.setenv("COMP_ACCESS_EMAILS", "compsetpw@test.com")
+    uid, _ = make_user(plan=None, email="compsetpw@test.com")
+    before = appmod.db().execute("SELECT password_hash FROM users WHERE id=?", (uid,)).fetchone()["password_hash"]
+    r = client.post("/signup", data={"email": "compsetpw@test.com", "password": "NewPass!234"}, follow_redirects=False)
+    assert "password" in r.text.lower() and "set" in r.text.lower()
+    after = appmod.db().execute("SELECT password_hash FROM users WHERE id=?", (uid,)).fetchone()["password_hash"]
+    assert after != before                                            # password was updated
+    assert appmod.verify_password("NewPass!234", after)               # and it's the new one
+
+
+def test_non_comp_existing_account_still_blocked_from_signup_reset():
+    # A regular (non-comp) email that already exists must NOT be resettable via /signup.
+    uid, _ = make_user(plan="solo", email="regular_existing@test.com")
+    before = appmod.db().execute("SELECT password_hash FROM users WHERE id=?", (uid,)).fetchone()["password_hash"]
+    r = client.post("/signup", data={"email": "regular_existing@test.com", "password": "Hacker!234"}, follow_redirects=False)
+    assert "password has been set" not in r.text.lower()              # NOT the comp set-password success
+    after = appmod.db().execute("SELECT password_hash FROM users WHERE id=?", (uid,)).fetchone()["password_hash"]
+    assert after == before                                            # password unchanged (no takeover)
