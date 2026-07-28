@@ -412,3 +412,47 @@ def test_whop_webhook_rejects_bad_signature(monkeypatch):
         "webhook-id": "m", "webhook-timestamp": str(int(time.time())),
         "webhook-signature": "v1,not-a-real-signature"})
     assert r.status_code == 401
+
+
+# --------------------------------------------------------------------------
+# Owner-granted comp / team access (full Elite, independent of Whop billing)
+# --------------------------------------------------------------------------
+
+COMP_EMAIL = "amar.sgnm@gmail.com"
+
+
+def test_comp_access_email_resolves_full_elite():
+    e = appmod.user_entitlements({"email": COMP_EMAIL})
+    assert e.active is True and e.tier == "elite" and e.source == "comp"
+    # a normal email with no plan is NOT granted
+    assert appmod.user_entitlements({"email": "stranger@test.com"}).active is False
+
+
+def test_comp_access_email_reaches_dashboard_and_api_under_enforcement():
+    # No plan, no Whop membership — access comes purely from the comp allowlist.
+    uid, _ = make_user(plan=None, email=COMP_EMAIL)
+    c = cookies_for(uid)
+    assert client.get("/dashboard", cookies=c).status_code == 200      # full dashboard
+    assert client.get("/api/trades", cookies=c).status_code == 200     # not 402
+    # Elite includes copy trading — a gated feature works.
+    r = client.post("/broker/copy/set", data={"account_id": "1", "in_box": "1"}, cookies=c)
+    assert r.status_code == 200 and r.json().get("ok") is True
+
+
+def test_comp_access_webhook_allowed():
+    # Trade webhook auth is by payload; the comp email must clear the subscription gate.
+    assert appmod.webhook_subscription_ok({"email": COMP_EMAIL}) is True
+    assert appmod.webhook_subscription_ok({"email": "stranger@test.com"}) is False
+
+
+def test_comp_access_revocable_via_env(monkeypatch):
+    monkeypatch.setenv("COMP_ACCESS_REVOKED", COMP_EMAIL)
+    e = appmod.user_entitlements({"email": COMP_EMAIL})
+    assert e.active is False                                           # grant pulled -> blocked
+    uid, _ = make_user(plan=None, email="amar2@test.com")             # sanity: unrelated user still blocked
+    assert client.get("/api/trades", cookies=cookies_for(uid)).status_code == 402
+
+
+def test_comp_access_addable_via_env(monkeypatch):
+    monkeypatch.setenv("COMP_ACCESS_EMAILS", "granted@team.com")
+    assert appmod.user_entitlements({"email": "granted@team.com"}).tier == "elite"
