@@ -3435,7 +3435,7 @@ def execute_orb_to_accounts(accounts: list, symbol: str, qty: int, long_spec, sh
                 if not _bracket_side_ok(side, sl, tp):     # long: SL<TP ; short: SL>TP — never place a wrong-side bracket
                     legs.append({"side": side, "ok": False, "error": "wrong-side SL/TP"})
                     continue
-                resp = tvo.place_stoplimit_bracket(env, token, name, acct_id, side, resolved, int(qty), es, el, sl, tp)
+                resp = tvo.place_stoplimit_bracket(env, token, name, acct_id, side, resolved, account_qty(a, qty), es, el, sl, tp)
                 legs.append({"side": side, "ok": _oso_ok(resp), "entry": es, "limit": el, "sl": sl, "tp": tp, "response": resp})
             ok = bool(legs) and all(l["ok"] for l in legs)
             results.append({"account": name, "ok": ok, "legs": legs})
@@ -3496,6 +3496,20 @@ def _orb_get_user(user_id):
         return dict(u) if u else None
     finally:
         con.close()
+
+
+def _orb_first_error(response) -> str:
+    """First human-readable failure reason from an execute_orb_to_accounts response, so a
+    place_orb that placed NOTHING logs WHY (Reconnect required / missing price / wrong-side
+    SL/TP / broker reject) instead of a misleading green EXECUTED."""
+    for r in (response or {}).get("results", []) or []:
+        if isinstance(r, dict) and r.get("error"):
+            return str(r["error"])
+        for leg in (r.get("legs") or []) if isinstance(r, dict) else []:
+            if isinstance(leg, dict) and leg.get("error"):
+                side = leg.get("side", "")
+                return f"{side + ': ' if side else ''}{leg['error']}"
+    return ""
 
 
 def process_orb_sessions():
@@ -3574,6 +3588,12 @@ def _orb_manage_one(s):
     if now_min >= flat_min:
         exit_from_accounts(accounts, symbol)
         _orb_set_status(s["id"], "done"); return
+
+    # A 'filled' session has nothing left to poll — the broker's OCO bracket runs the TP/SL exit and
+    # the force-flat above is its only remaining action. Skip position/order polling to save broker
+    # load (this is what keeps the loop light once many clients' sessions have filled).
+    if s["status"] != "armed":
+        return
 
     # Detect a fill across the routed accounts. TWO signals so a fill is NEVER missed:
     #   (a) net position != 0   — a trade is currently open;
@@ -7915,26 +7935,47 @@ def webhook_trade(payload: WebhookTrade):
                 msg = "Rejected: place_orb requires a symbol."
                 log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
                 return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
+            # Respect the client's Start/Stop toggle — a paused client must NOT open new ORB trades
+            # (matches the entry path's gate). The loser-cancel / cutoff / EOD manager still runs on
+            # any position already open, so a mid-session pause never strands one.
+            if user["automation_status"] != "Running":
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = "Automation paused."
+                log_trade(user["id"], request_id, sym, event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
             accounts, route = _route_signal_accounts(user, target_name)
             qty = clean_qty(payload.qty)
             long_spec = extras.get("long") if isinstance(extras.get("long"), dict) else None
             short_spec = extras.get("short") if isinstance(extras.get("short"), dict) else None
             response = execute_orb_to_accounts(accounts, sym, qty, long_spec, short_spec)
-            # Server-managed lifecycle: if the alert opts in (manage:"server"), KhomaAPI owns
-            # cancel-the-loser, the no-new-trades cutoff, and the EOD force-flat — Pine sends the
-            # levels once and nothing else. Without the flag, behavior is unchanged (Pine-driven).
-            if str(extras.get("manage") or "").lower() == "server":
-                try:
-                    _cm = int(extras["cutoff"]) if extras.get("cutoff") is not None else _ORB_DEFAULT_CUTOFF
-                    _fm = int(extras["flat"]) if extras.get("flat") is not None else _ORB_DEFAULT_FLAT
-                    record_orb_session(user["id"], sym, target_name, _cm, _fm, extras.get("tz") or _ET)
-                except Exception as e:
-                    print("record_orb_session failed:", e)
+            placed = int(response.get("placed") or 0)
+            total = int(response.get("total") or 0)
             latency = round((time.perf_counter() - start_time) * 1000, 3)
-            message = f"Place ORB: {response['placed']}/{response['total']} account(s) got resting stop-limit entries + brackets."
-            log_trade(user["id"], request_id, sym, event, qty, "live", "EXECUTED", latency, message, response)
-            return {"ok": True, "action": "PLACE_ORB", "status": "EXECUTED", "message": message,
-                    "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
+            if placed > 0:
+                # Server-managed lifecycle: if the alert opts in (manage:"server"), KhomaAPI owns
+                # cancel-the-loser, the no-new-trades cutoff, and the EOD force-flat. Only record a
+                # session once orders actually rest at the broker.
+                if str(extras.get("manage") or "").lower() == "server":
+                    try:
+                        _cm = int(extras["cutoff"]) if extras.get("cutoff") is not None else _ORB_DEFAULT_CUTOFF
+                        _fm = int(extras["flat"]) if extras.get("flat") is not None else _ORB_DEFAULT_FLAT
+                        record_orb_session(user["id"], sym, target_name, _cm, _fm, extras.get("tz") or _ET)
+                    except Exception as e:
+                        print("record_orb_session failed:", e)
+                message = f"Place ORB: {placed}/{total} account(s) got resting stop-limit entries + brackets."
+                if placed < total:                       # partial fan-out — surface why the rest failed
+                    _err = _orb_first_error(response)
+                    if _err:
+                        message += f" ({total - placed} failed: {_err})"
+                log_trade(user["id"], request_id, sym, event, qty, "live", "EXECUTED", latency, message, response)
+                return {"ok": True, "action": "PLACE_ORB", "status": "EXECUTED", "message": message,
+                        "mode": "live", "symbol": sym, "latency_ms": latency, "response": response}
+            # Nothing rested at the broker -> surface the REAL reason, not a misleading green EXECUTED.
+            reason = _orb_first_error(response) or ("No connected account — connect a broker in KhomaAPI." if total == 0 else "Placement failed.")
+            message = f"Place ORB REJECTED ({placed}/{total} account(s)): {reason}"
+            log_trade(user["id"], request_id, sym, event, qty, "rejected", "REJECTED", latency, message, response)
+            return JSONResponse(status_code=200, content={"ok": False, "action": "PLACE_ORB", "status": "REJECTED",
+                    "message": message, "error": reason, "symbol": sym, "latency_ms": latency, "response": response})
 
         # --- cancel_pending_entries: remove the pending stop-limit ORB entries (the loser once
         # one side fills, or both if the window closes unfilled). Cancels ONLY working StopLimit

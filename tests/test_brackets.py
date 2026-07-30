@@ -537,6 +537,21 @@ def test_execute_orb_places_both_sides(monkeypatch):
     assert out["placed"] == 1
 
 
+def test_execute_orb_honors_per_account_contract_qty(monkeypatch):
+    cap = {"qtys": []}
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda env, tok, sym: "MNQU6")
+    monkeypatch.setattr(appmod, "_tick_for", lambda r: 0.25)
+    monkeypatch.setattr(appmod, "_cancel_pending_entries_one", lambda a, r: 0)
+    monkeypatch.setattr(tvo, "place_stoplimit_bracket",
+        lambda env, tok, name, acct_id, side, resolved, q, es, el, sl, tp: (cap["qtys"].append(q), {"orderId": 1})[1])
+    # account fixes its own size to 3 — must override the alert's qty of 10
+    accounts = [{"account_name": "A", "account_id": 44, "env": "demo", "contract_qty": 3}]
+    long_spec = {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020}
+    appmod.execute_orb_to_accounts(accounts, "MNQ1!", 10, long_spec, None)
+    assert cap["qtys"] == [3]   # used the per-account 3, not the alert's 10
+
+
 def test_execute_orb_refuses_wrong_side_bracket(monkeypatch):
     # A long with SL above TP is nonsense -> refuse rather than place an instantly-triggering stop.
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
@@ -693,3 +708,58 @@ def test_handler_place_orb_no_session_without_flag(monkeypatch):
         "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
         "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
     assert r.status_code == 200 and cap["rec"] is False   # no manage flag -> no server session
+
+
+def test_handler_place_orb_rejected_when_paused(monkeypatch):
+    uid, email, secret = _mk_user()
+    con = appmod.db(); con.execute("UPDATE users SET automation_status='Paused' WHERE id=?", (uid,)); con.commit(); con.close()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: cap.update(ran=True) or {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200
+    b = r.json()
+    assert b.get("status") == "REJECTED" and "paused" in b.get("error", "").lower()
+    assert "ran" not in cap   # paused -> never even attempted to place
+
+
+def test_handler_place_orb_rejected_surfaces_reason(monkeypatch):
+    uid, email, secret = _mk_user()
+    cap = {"recorded": False}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: {"placed": 0, "total": 1, "accounts": 1,
+                                         "results": [{"account": "A", "ok": False, "error": "Reconnect required"}]})
+    monkeypatch.setattr(appmod, "record_orb_session", lambda *a, **k: cap.update(recorded=True))
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2, "manage": "server", "cutoff": 720, "flat": 960,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200
+    b = r.json()
+    # NOT a green EXECUTED — REJECTED with the real reason, and no phantom session recorded
+    assert b.get("status") == "REJECTED" and "Reconnect required" in b.get("error", "")
+    assert cap["recorded"] is False
+
+
+def test_handler_place_orb_rejected_no_account(monkeypatch):
+    uid, email, secret = _mk_user()
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts", lambda user, tn: ([], "BROADCAST"))   # nothing connected
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: {"placed": 0, "total": 0, "accounts": 0, "results": []})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200
+    b = r.json()
+    assert b.get("status") == "REJECTED" and "connect a broker" in b.get("error", "").lower()
