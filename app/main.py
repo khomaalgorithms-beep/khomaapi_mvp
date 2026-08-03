@@ -3561,9 +3561,46 @@ def _orb_entry_filled(account, resolved_symbol) -> bool:
     return False
 
 
+def _orb_news_locked(user_id, account_id, now_utc) -> str:
+    """Label of the news / economic-calendar lockout window covering `now_utc` (else '') so the ORB
+    won't trade during a user's calendar block. account_id=None still matches user-wide
+    (account_id IS NULL) windows."""
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT starts_at, ends_at, label FROM news_windows WHERE user_id=? AND (account_id IS NULL OR account_id=?)",
+            (user_id, account_id)).fetchall()
+    finally:
+        con.close()
+    for r in rows or []:
+        try:
+            st = datetime.fromisoformat(str(r["starts_at"]))
+            en = datetime.fromisoformat(str(r["ends_at"]))
+        except Exception:
+            continue
+        if st <= now_utc < en:
+            return str(r["label"] or "news")
+    return ""
+
+
+def _orb_trading_blocked(user, account_id, now_utc) -> str:
+    """Why ORB trading is blocked for this client right now, else ''. Two kill-switches:
+    the Start/Stop automation toggle, and an active economic-calendar news lockout."""
+    try:
+        running = user["automation_status"] == "Running"
+    except Exception:
+        running = False
+    if not running:
+        return "Automation paused."
+    lbl = _orb_news_locked(user["id"], account_id, now_utc)
+    if lbl:
+        return f"News lockout ({lbl})."
+    return ""
+
+
 def _orb_manage_one(s):
     """One ORB session's state machine, priority order:
-       force-flat (EOD) > cancel-the-loser (a side filled) > no-new-trades cutoff."""
+       kill-switch (pause / news) > force-flat (EOD) > cancel-the-loser (a side filled) > cutoff."""
     et_date, now_min = _orb_now_et()
     flat_min = int(s["flat_min"]) if s.get("flat_min") is not None else _ORB_DEFAULT_FLAT
     cutoff_min = int(s["cutoff_min"]) if s.get("cutoff_min") is not None else _ORB_DEFAULT_CUTOFF
@@ -3572,6 +3609,15 @@ def _orb_manage_one(s):
         _orb_set_status(s["id"], "done"); return
     accounts, _route = _route_signal_accounts(user, s.get("target_name") or "")
     symbol = s["symbol"]
+
+    # KILL-SWITCH: if the client Paused automation OR is inside a news lockout, stop trading NOW —
+    # cancel any resting entries AND flatten any open position (exit_from_accounts does both), then
+    # close the session. This is what makes a Pause / calendar block actually take a live position
+    # or resting orders off the table, not just block the next place_orb.
+    if _orb_trading_blocked(user, (accounts[0].get("account_id") if accounts else None), datetime.now(timezone.utc)):
+        if accounts:
+            exit_from_accounts(accounts, symbol)
+        _orb_set_status(s["id"], "done"); return
 
     # A still-open session from a PRIOR ET day -> force flat + close (safety net).
     if s["et_date"] != et_date:
@@ -7935,15 +7981,15 @@ def webhook_trade(payload: WebhookTrade):
                 msg = "Rejected: place_orb requires a symbol."
                 log_trade(user["id"], request_id, "*", event, 0, "rejected", "REJECTED", latency, msg, {})
                 return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
-            # Respect the client's Start/Stop toggle — a paused client must NOT open new ORB trades
-            # (matches the entry path's gate). The loser-cancel / cutoff / EOD manager still runs on
-            # any position already open, so a mid-session pause never strands one.
-            if user["automation_status"] != "Running":
-                latency = round((time.perf_counter() - start_time) * 1000, 3)
-                msg = "Automation paused."
-                log_trade(user["id"], request_id, sym, event, 0, "rejected", "REJECTED", latency, msg, {})
-                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
             accounts, route = _route_signal_accounts(user, target_name)
+            # KILL-SWITCH: block new ORB entries if the client Paused automation OR is inside a news
+            # lockout window (economic calendar). No orders are placed; the reason is logged. The
+            # manager also tears down an already-armed session on pause/news within one poll.
+            blk = _orb_trading_blocked(user, (accounts[0].get("account_id") if accounts else None), datetime.now(timezone.utc))
+            if blk:
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                log_trade(user["id"], request_id, sym, event, 0, "rejected", "REJECTED", latency, blk, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": blk})
             qty = clean_qty(payload.qty)
             long_spec = extras.get("long") if isinstance(extras.get("long"), dict) else None
             short_spec = extras.get("short") if isinstance(extras.get("short"), dict) else None
