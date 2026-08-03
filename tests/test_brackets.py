@@ -620,10 +620,11 @@ def _orb_session(**kw):
     return base
 
 
-def _orb_mocks(monkeypatch, net, now, entry_filled=False):
+def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked=""):
     cap = {"cancel": 0, "flat": 0, "set": []}
     monkeypatch.setattr(appmod, "_orb_now_et", lambda: now)
-    monkeypatch.setattr(appmod, "_orb_get_user", lambda uid: {"id": uid, "email": "x"})
+    monkeypatch.setattr(appmod, "_orb_trading_blocked", lambda u, aid, nowu: blocked)
+    monkeypatch.setattr(appmod, "_orb_get_user", lambda uid: {"id": uid, "email": "x", "automation_status": "Running"})
     monkeypatch.setattr(appmod, "_route_signal_accounts",
                         lambda u, tn: ([{"account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
@@ -642,6 +643,14 @@ def test_orb_manager_cancels_loser_on_fill(monkeypatch):
     cap = _orb_mocks(monkeypatch, net=2, now=("2026-07-23", 605))     # filled, before cutoff
     appmod._orb_manage_one(_orb_session(status="armed"))
     assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["filled"]
+
+
+def test_orb_manager_kill_switch_pauses_and_flattens(monkeypatch):
+    # Paused automation OR active news lockout -> exit_from_accounts (cancel resting + flatten) + done,
+    # BEFORE any fill/cancel logic. This is the fix for "I paused but a resting order still filled".
+    cap = _orb_mocks(monkeypatch, net=2, now=("2026-07-23", 615), entry_filled=True, blocked="Automation paused.")
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["flat"] == 1 and cap["cancel"] == 0 and cap["set"] == ["done"]
 
 
 def test_orb_manager_cancels_loser_on_fast_fill(monkeypatch):
@@ -748,6 +757,28 @@ def test_handler_place_orb_rejected_surfaces_reason(monkeypatch):
     # NOT a green EXECUTED — REJECTED with the real reason, and no phantom session recorded
     assert b.get("status") == "REJECTED" and "Reconnect required" in b.get("error", "")
     assert cap["recorded"] is False
+
+
+def test_handler_place_orb_rejected_during_news(monkeypatch):
+    uid, email, secret = _mk_user()
+    con = appmod.db()   # an always-active news lockout window (user-wide, account_id NULL)
+    con.execute("INSERT INTO news_windows(user_id,account_id,starts_at,ends_at,label,created_at) VALUES(?,?,?,?,?,?)",
+                (uid, None, "2000-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00", "CPI", "2026-01-01T00:00:00+00:00"))
+    con.commit(); con.close()
+    cap = {}
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "_route_signal_accounts",
+                        lambda user, tn: ([{"id": 1, "account_name": "A", "account_id": 44, "env": "demo"}], "BROADCAST"))
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts",
+                        lambda *a, **k: cap.update(ran=True) or {"placed": 1, "total": 1, "accounts": 1, "results": []})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb",
+        "symbol": "MNQ1!", "qty": 2,
+        "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020},
+        "short": {"entryStop": 29900, "entryLimit": 29898, "sl": 29905, "tp": 29880}})
+    assert r.status_code == 200
+    b = r.json()
+    assert b.get("status") == "REJECTED" and "news lockout" in b.get("error", "").lower()
+    assert "ran" not in cap   # never placed during the lockout window
 
 
 def test_handler_place_orb_rejected_no_account(monkeypatch):
