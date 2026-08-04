@@ -2989,6 +2989,31 @@ def _resting_stop_count(account, resolved_symbol) -> int:
     return n
 
 
+def _resting_entry_count(account, resolved_symbol) -> int:
+    """How many WORKING stop-limit ORB ENTRY orders still rest for this contract — i.e. how
+    many un-triggered breakout entries are live. Used to CONFIRM the loser was actually
+    cancelled before a session goes quiet (a single best-effort cancel can be rejected or
+    race the fill; we retry until this is 0)."""
+    token = ensure_fresh_token(account)
+    env = account.get("env") or "live"
+    acct_id = account.get("account_id")
+    if not token or not acct_id:
+        return 0
+    root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
+    orders = tvo.get_orders(env, token)
+    versions = tvo.get_order_versions(env, token)
+    n = 0
+    for o in tvo.working_orders_for(orders, versions, acct_id, order_type="StopLimit"):
+        cname = _contract_name(env, token, o.get("contractId"))
+        # Fail CLOSED: a working stop-limit whose contract can't be named this poll is COUNTED as a
+        # live entry (the canceller also fails closed and won't cancel such an order), so
+        # _orb_loser_cleared can never falsely report the loser gone and let the session go quiet
+        # with an entry still live on the book.
+        if (not root) or (not cname) or (symbol_root(cname) == root):
+            n += 1
+    return n
+
+
 # Retry window while the placeOSO bracket legs register at Tradovate before we decide a
 # stop is genuinely missing (env-tunable so a slow broker doesn't cause a false flatten).
 _STOP_CONFIRM_TRIES = int(os.getenv("BRACKET_CONFIRM_TRIES", "5"))
@@ -3527,38 +3552,67 @@ def process_orb_sessions():
             print("ORB-MANAGER session", s.get("id"), "error:", e)
 
 
-def _orb_entry_filled(account, resolved_symbol) -> bool:
-    """True if a StopLimit ENTRY for this symbol has already FILLED — a DURABLE signal that
-    survives even after the position opened AND closed (a fast take-profit) between polls.
-    This is exactly what net-position polling misses: a trade that fills and exits inside one
-    poll interval. Checking the entry order's terminal 'Filled' status catches it every time."""
+def _orb_entry_filled(account, resolved_symbol, since_dt=None) -> bool:
+    """True if a side of THIS ORB session has EXECUTED — a DURABLE signal that survives even
+    after the position opened AND closed (a fast take-profit) inside one poll interval, which
+    net-position polling misses.
+
+    CRITICAL FIX (2026-08-04): the old check required the filled order's type to be 'StopLimit'.
+    But Tradovate converts a stop-limit ENTRY into a 'Limit' order the instant its stop triggers,
+    so a filled entry is reported with orderType 'Limit' — the 'StopLimit'-only filter matched
+    NOTHING and every fast fill+TP slipped through, leaving the loser's resting entry on the book
+    until the 16:00 force-flat. We now treat ANY terminal 'Filled' order for this contract root as
+    proof a side filled (entry-as-Limit OR the TP/SL exit — either way a side executed). Scoped to
+    orders created at/after `since_dt` (the session start, with a margin) so a PRIOR trade's fill
+    on the same contract can never false-trigger a cancel of a fresh session's entries."""
     token = ensure_fresh_token(account)
     env = account.get("env") or "live"
     acct_id = account.get("account_id")
     if not token or not acct_id:
         return False
     root = symbol_root(str(resolved_symbol).upper()) if resolved_symbol else ""
-    orders = tvo.get_orders(env, token)
-    versions = tvo.get_order_versions(env, token)
-    ver_by_order = {}
-    for v in versions or []:
-        oid = v.get("orderId")
-        if oid is not None:
-            ver_by_order[oid] = v
-    for o in orders or []:
+    for o in (tvo.get_orders(env, token) or []):
         if str(o.get("accountId")) != str(acct_id):
             continue
         if str(o.get("ordStatus") or o.get("status") or "").lower() != "filled":
             continue
-        v = ver_by_order.get(o.get("id"), {})
-        otype = str(v.get("orderType") or o.get("orderType") or "")
-        if otype.lower() != "stoplimit":
-            continue
+        if since_dt is not None:
+            ots = _parse_iso(o.get("timestamp") or "")
+            if ots is None:
+                continue   # no usable timestamp -> can't prove it's THIS session's fill; ignore (fail closed)
+            if ots.tzinfo is None:
+                ots = ots.replace(tzinfo=timezone.utc)
+            if ots < since_dt:
+                continue   # a prior session's fill on this contract -> ignore
         cname = _contract_name(env, token, o.get("contractId"))
-        if root and cname and symbol_root(cname) != root:
+        # Fail CLOSED: only count a fill we can POSITIVELY attribute to this contract root. A
+        # transiently-unnamed contract is skipped (retried next 3s poll once the name resolves)
+        # rather than attributed to this session — so an unrelated instrument's fill can't
+        # false-trigger a cancel of a fresh session's entries.
+        if root and (not cname or symbol_root(cname) != root):
             continue
         return True
     return False
+
+
+def _orb_loser_cleared(accounts, symbol) -> bool:
+    """True once NO resting stop-limit ORB entry remains for the symbol on ANY routed account —
+    i.e. the loser has actually been cancelled at the broker. Gates the 'filled' transition so a
+    failed / racey / partial cancel keeps the session 'armed' and is retried next poll instead of
+    going silently quiet with an order still sitting on the other side of the OR. Fail-closed:
+    any account we cannot confirm is treated as NOT cleared."""
+    for a in accounts or []:
+        try:
+            tok = ensure_fresh_token(a)
+            resolved = tvo.resolve_contract(a.get("env") or "live", tok, symbol)
+        except Exception:
+            resolved = symbol
+        try:
+            if _resting_entry_count(a, resolved) > 0:
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _orb_news_locked(user_id, account_id, now_utc) -> str:
@@ -3642,10 +3696,15 @@ def _orb_manage_one(s):
         return
 
     # Detect a fill across the routed accounts. TWO signals so a fill is NEVER missed:
-    #   (a) net position != 0   — a trade is currently open;
-    #   (b) a StopLimit entry already FILLED — DURABLE, so it catches a trade that opened AND
-    #       closed (fast take-profit) inside one poll interval, which (a) alone misses. This is
-    #       the bug that let a fast short slip past and leave the long entry live to fire later.
+    #   (a) net position != 0   — a trade is currently OPEN;
+    #   (b) a side already FILLED — DURABLE, so it catches a trade that opened AND closed
+    #       (fast take-profit) inside one poll interval, which (a) alone misses. Scoped to this
+    #       session's start so a prior trade on the same contract can't false-trigger.
+    since_dt = _parse_iso(s.get("created_at") or "")
+    if since_dt is not None:
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        since_dt = since_dt - timedelta(minutes=5)   # margin: entry can register just before the session row
     net = 0
     fill = False
     for a in accounts:
@@ -3660,20 +3719,31 @@ def _orb_manage_one(s):
             pass
         if not fill:
             try:
-                fill = _orb_entry_filled(a, resolved)
+                fill = _orb_entry_filled(a, resolved, since_dt)
             except Exception:
                 pass
 
-    # 2) CANCEL-THE-LOSER: a side filled -> cancel the opposite resting entry (StopLimit only;
-    #    never the winner's Stop/Limit bracket). Mark filled; keep watching for the flat window.
+    # 2) CANCEL-THE-LOSER: a side filled -> cancel the opposite resting entry with the StopLimit-ONLY
+    #    canceller. It removes the loser's resting ENTRY and, via Tradovate's OSO linkage, that entry's
+    #    still-'Suspended' bracket legs — but it can NEVER touch the winner's live Stop/Limit protection.
+    #    So it is safe whether the winner is still OPEN or has already exited, on every account.
+    #    (An earlier draft swept ALL working orders whenever the SUMMED net read 0; that was unsafe — a
+    #    lagged/failed or offsetting position read could report 0 while a winner was actually open and
+    #    strip its bracket, leaving a NAKED position. Never authorize a full sweep from the aggregate net.)
+    #    Only go quiet once the loser is CONFIRMED gone; a single cancel can be rejected or race the fill,
+    #    so if it did not fully take we stay 'armed' and retry on the next 3s poll.
     if (net != 0 or fill) and s["status"] == "armed":
         cancel_pending_entries_to_accounts(accounts, symbol)
-        _orb_set_status(s["id"], "filled"); return
+        if _orb_loser_cleared(accounts, symbol):
+            _orb_set_status(s["id"], "filled")
+        return
 
     # 3) NO-NEW-TRADES cutoff (e.g. 12:00 ET): still flat and past cutoff -> cancel resting entries.
     if net == 0 and s["status"] == "armed" and now_min >= cutoff_min:
         cancel_pending_entries_to_accounts(accounts, symbol)
-        _orb_set_status(s["id"], "done"); return
+        if _orb_loser_cleared(accounts, symbol):
+            _orb_set_status(s["id"], "done")
+        return
 
 
 def execute_to_accounts(accounts: list, symbol: str, side: str, qty: int) -> dict:
