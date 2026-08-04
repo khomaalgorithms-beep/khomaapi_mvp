@@ -620,8 +620,11 @@ def _orb_session(**kw):
     return base
 
 
-def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked=""):
-    cap = {"cancel": 0, "flat": 0, "set": []}
+def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked="", loser_cleared=True):
+    # cap["pending"] = StopLimit-only loser cancels (SAFE); cap["sweep"] = cancel-ALL-orders calls
+    # (would strip a winner's bracket — must be 0 on the fill path); cap["cancel"] = either, for
+    # back-compat assertions.
+    cap = {"cancel": 0, "pending": 0, "sweep": 0, "flat": 0, "set": []}
     monkeypatch.setattr(appmod, "_orb_now_et", lambda: now)
     monkeypatch.setattr(appmod, "_orb_trading_blocked", lambda u, aid, nowu: blocked)
     monkeypatch.setattr(appmod, "_orb_get_user", lambda uid: {"id": uid, "email": "x", "automation_status": "Running"})
@@ -630,9 +633,12 @@ def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked=""):
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
     monkeypatch.setattr(tvo, "resolve_contract", lambda env, tok, sym: "MNQU6")
     monkeypatch.setattr(appmod, "_net_position_for", lambda a, r: net)
-    monkeypatch.setattr(appmod, "_orb_entry_filled", lambda a, r: entry_filled)
+    monkeypatch.setattr(appmod, "_orb_entry_filled", lambda a, r, since=None: entry_filled)
     monkeypatch.setattr(appmod, "cancel_pending_entries_to_accounts",
-                        lambda accts, sym: cap.update(cancel=cap["cancel"] + 1) or {})
+                        lambda accts, sym: cap.update(cancel=cap["cancel"] + 1, pending=cap["pending"] + 1) or {})
+    monkeypatch.setattr(appmod, "cancel_working_orders_for",
+                        lambda a, sym: cap.update(cancel=cap["cancel"] + 1, sweep=cap["sweep"] + 1) or 0)
+    monkeypatch.setattr(appmod, "_orb_loser_cleared", lambda accts, sym: loser_cleared)
     monkeypatch.setattr(appmod, "exit_from_accounts",
                         lambda accts, sym: cap.update(flat=cap["flat"] + 1) or {})
     monkeypatch.setattr(appmod, "_orb_set_status", lambda sid, st: cap["set"].append(st))
@@ -683,6 +689,108 @@ def test_orb_manager_stale_day_force_flat(monkeypatch):
     cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-24", 600))     # session left over from prior day
     appmod._orb_manage_one(_orb_session(et_date="2026-07-23", status="armed"))
     assert cap["flat"] == 1 and cap["set"] == ["done"]
+
+
+def test_orb_manager_fast_fill_cancels_loser_without_sweeping_all(monkeypatch):
+    # 2026-08-04 live bug: winner filled AND took profit (net=0) leaving the LOSER entry + its
+    # suspended bracket on the other side of the OR. The manager must cancel the loser using the
+    # StopLimit-ONLY canceller (which cascade-clears the suspended legs) and MUST NOT sweep all
+    # working orders (an aggregate-net sweep could strip an open winner's bracket -> naked position).
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 615), entry_filled=True)
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["pending"] == 1 and cap["sweep"] == 0 and cap["flat"] == 0 and cap["set"] == ["filled"]
+
+
+def test_orb_manager_stays_armed_until_loser_confirmed_cleared(monkeypatch):
+    # A single best-effort cancel can be rejected / race the fill. Until the loser is CONFIRMED
+    # gone, the session stays 'armed' and retries next poll instead of going silently quiet.
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 615), entry_filled=True, loser_cleared=False)
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["cancel"] == 1 and cap["set"] == []      # cancel attempted, but NOT marked filled
+
+
+def test_orb_entry_filled_detects_triggered_stoplimit_reported_as_limit(monkeypatch):
+    # THE root-cause regression: a stop-limit ENTRY, once triggered, is reported by Tradovate with
+    # orderType 'Limit'. The old check required 'StopLimit' and so returned False for every fast
+    # fill. The fix must return True for any terminal 'Filled' order on the contract.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "MNQU6")
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [
+        {"accountId": 44, "ordStatus": "Filled", "contractId": 1, "orderType": "Limit",
+         "timestamp": "2026-08-04T14:05:00+00:00"},   # the winner's triggered entry, now 'Limit'
+    ])
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6") is True
+
+
+def test_orb_entry_filled_false_when_nothing_filled(monkeypatch):
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "MNQU6")
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [
+        {"accountId": 44, "ordStatus": "Working",  "contractId": 1, "timestamp": "2026-08-04T14:05:00+00:00"},
+        {"accountId": 44, "ordStatus": "Canceled", "contractId": 1, "timestamp": "2026-08-04T14:05:00+00:00"},
+    ])
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6") is False
+
+
+def test_orb_entry_filled_ignores_prior_session_fill(monkeypatch):
+    # A fill from a PRIOR trade on the same contract (older than the session start) must NOT
+    # false-trigger a cancel of a fresh session's live entries.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "MNQU6")
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [
+        {"accountId": 44, "ordStatus": "Filled", "contractId": 1, "orderType": "Limit",
+         "timestamp": "2026-08-03T14:05:00+00:00"},   # YESTERDAY's fill
+    ])
+    since = appmod._parse_iso("2026-08-04T13:55:00+00:00")
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6", since) is False
+
+
+def test_orb_loser_cleared_gates_on_resting_entries(monkeypatch):
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda env, tok, sym: "MNQU6")
+    accts = [{"env": "demo", "account_id": 44}]
+    monkeypatch.setattr(appmod, "_resting_entry_count", lambda a, r: 0)
+    assert appmod._orb_loser_cleared(accts, "MNQ1!") is True
+    monkeypatch.setattr(appmod, "_resting_entry_count", lambda a, r: 1)   # loser still resting
+    assert appmod._orb_loser_cleared(accts, "MNQ1!") is False
+
+
+def test_orb_entry_filled_fail_closed_on_missing_timestamp(monkeypatch):
+    # A Filled order with NO parseable timestamp cannot be proven to belong to THIS session, so with
+    # a session scope active it must be IGNORED (fail closed) — otherwise a stale prior-day fill could
+    # false-trigger a cancel of a fresh session's live entries.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "MNQU6")
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [
+        {"accountId": 44, "ordStatus": "Filled", "contractId": 1, "orderType": "Limit"},  # no timestamp
+    ])
+    since = appmod._parse_iso("2026-08-04T13:55:00+00:00")
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6", since) is False
+    # ...but with NO session scope (since_dt=None) it still counts (fixes the original miss).
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6", None) is True
+
+
+def test_orb_entry_filled_fail_closed_on_unnamed_contract(monkeypatch):
+    # A Filled order whose contract can't be named this poll must NOT be attributed to this root
+    # (fail closed) — else another instrument's fill could false-trigger a loser cancel.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "")   # unresolvable
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [
+        {"accountId": 44, "ordStatus": "Filled", "contractId": 1, "orderType": "Limit"},
+    ])
+    assert appmod._orb_entry_filled({"env": "demo", "account_id": 44}, "MNQU6", None) is False
+
+
+def test_resting_entry_count_fails_closed_on_unnamed_contract(monkeypatch):
+    # A working stop-limit whose contract can't be named this poll must be COUNTED as live (the
+    # canceller also fails closed on it), so _orb_loser_cleared can't falsely report it gone.
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "get_orders", lambda env, tok: [{"id": 1}])
+    monkeypatch.setattr(tvo, "get_order_versions", lambda env, tok: [])
+    monkeypatch.setattr(tvo, "working_orders_for",
+                        lambda o, v, aid, order_type=None: [{"id": 1, "orderType": "StopLimit", "contractId": 99}])
+    monkeypatch.setattr(appmod, "_contract_name", lambda env, tok, cid: "")   # unresolvable
+    assert appmod._resting_entry_count({"env": "demo", "account_id": 44}, "MNQU6") == 1
 
 
 def test_handler_place_orb_records_server_session(monkeypatch):
