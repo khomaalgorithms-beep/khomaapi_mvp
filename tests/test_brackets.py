@@ -564,6 +564,41 @@ def test_execute_orb_refuses_wrong_side_bracket(monkeypatch):
     assert placed == [] and out["placed"] == 0
 
 
+def test_orb_account_risk_locked_helper(monkeypatch):
+    monkeypatch.setattr(appmod, "_maybe_auto_unlock", lambda cfg: cfg)
+    monkeypatch.setattr(appmod, "ensure_risk_config",
+                        lambda aid, uid: {"account_id": aid, "locked": 1, "locked_reason": "Max drawdown."})
+    assert "Max drawdown" in appmod._orb_account_risk_locked({"id": 91, "user_id": 2})
+    monkeypatch.setattr(appmod, "ensure_risk_config", lambda aid, uid: {"account_id": aid, "locked": 0})
+    assert appmod._orb_account_risk_locked({"id": 91, "user_id": 2}) == ""
+    # fail CLOSED: if the config read raises, the account is treated as locked (entry blocked).
+    def _boom(aid, uid):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(appmod, "ensure_risk_config", _boom)
+    assert appmod._orb_account_risk_locked({"id": 91, "user_id": 2}) != ""           # placement: block
+    # fail OPEN for the manager re-sweep: a read error must NOT cancel a legit resting entry.
+    assert appmod._orb_account_risk_locked({"id": 91, "user_id": 2}, fail_closed=False) == ""
+
+
+def test_execute_orb_skips_risk_locked_account(monkeypatch):
+    # A daily-loss / drawdown lock must block a NEW ORB entry (same as risk_gate on other paths):
+    # the account is skipped, nothing is placed, and the lock reason is surfaced.
+    monkeypatch.setattr(appmod, "_maybe_auto_unlock", lambda cfg: cfg)
+    monkeypatch.setattr(appmod, "ensure_risk_config",
+                        lambda aid, uid: {"account_id": aid, "locked": 1, "locked_reason": "Daily loss limit hit."})
+    monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
+    monkeypatch.setattr(tvo, "resolve_contract", lambda e, t, s: "MNQU6")
+    monkeypatch.setattr(appmod, "_cancel_pending_entries_one", lambda a, s: 0)
+    placed = []
+    monkeypatch.setattr(tvo, "place_stoplimit_bracket", lambda *a, **k: placed.append(1) or {"orderId": 1})
+    ls = {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020}
+    out = appmod.execute_orb_to_accounts(
+        [{"account_name": "A", "account_id": 44, "id": 91, "user_id": 2, "env": "demo"}], "MNQ1!", 2, ls, None)
+    assert placed == []                                          # locked -> nothing placed
+    assert out["placed"] == 0
+    assert "Daily loss limit" in (out["results"][0].get("error") or "")
+
+
 def test_cancel_pending_entries_only_stoplimit(monkeypatch):
     monkeypatch.setattr(appmod, "ensure_fresh_token", lambda a: "tok")
     monkeypatch.setattr(tvo, "get_orders", lambda e, t: [])
@@ -620,7 +655,7 @@ def _orb_session(**kw):
     return base
 
 
-def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked="", loser_cleared=True):
+def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked="", loser_cleared=True, risk_locked=False):
     # cap["pending"] = StopLimit-only loser cancels (SAFE); cap["sweep"] = cancel-ALL-orders calls
     # (would strip a winner's bracket — must be 0 on the fill path); cap["cancel"] = either, for
     # back-compat assertions.
@@ -639,6 +674,8 @@ def _orb_mocks(monkeypatch, net, now, entry_filled=False, blocked="", loser_clea
     monkeypatch.setattr(appmod, "cancel_working_orders_for",
                         lambda a, sym: cap.update(cancel=cap["cancel"] + 1, sweep=cap["sweep"] + 1) or 0)
     monkeypatch.setattr(appmod, "_orb_loser_cleared", lambda accts, sym: loser_cleared)
+    monkeypatch.setattr(appmod, "_orb_account_risk_locked",
+                        lambda a, fail_closed=True: "Daily loss limit hit." if risk_locked else "")
     monkeypatch.setattr(appmod, "exit_from_accounts",
                         lambda accts, sym: cap.update(flat=cap["flat"] + 1) or {})
     monkeypatch.setattr(appmod, "_orb_set_status", lambda sid, st: cap["set"].append(st))
@@ -665,6 +702,16 @@ def test_orb_manager_cancels_loser_on_fast_fill(monkeypatch):
     cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 615), entry_filled=True)
     appmod._orb_manage_one(_orb_session(status="armed"))
     assert cap["cancel"] == 1 and cap["flat"] == 0 and cap["set"] == ["filled"]
+
+
+def test_orb_manager_resweeps_entries_on_risk_locked_account(monkeypatch):
+    # DEFENSE-IN-DEPTH: no fill yet (net=0), but the risk engine LOCKED the account (daily-loss /
+    # drawdown). The manager must re-cancel the locked account's resting entries (StopLimit-only)
+    # every poll so a surviving entry can't trigger a new position on a locked account.
+    cap = _orb_mocks(monkeypatch, net=0, now=("2026-07-23", 615), entry_filled=False, risk_locked=True)
+    appmod._orb_manage_one(_orb_session(status="armed"))
+    assert cap["pending"] == 1 and cap["sweep"] == 0    # StopLimit-only re-sweep, never a full sweep
+    assert cap["set"] == []                              # session stays armed; lock handled out-of-band
 
 
 def test_orb_manager_cutoff_cancels_when_flat(monkeypatch):

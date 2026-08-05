@@ -3424,6 +3424,28 @@ def cancel_pending_entries_to_accounts(accounts: list, symbol: str) -> dict:
             "total": len(results), "accounts": len(accounts)}
 
 
+def _orb_account_risk_locked(account, fail_closed=True) -> str:
+    """Risk-engine lock reason for one account (daily-loss / drawdown / trailing-DD breach), else ''.
+    Mirrors the check `risk_gate` uses so the ORB placement path respects a lock exactly like every
+    other order path — a locked account must NEVER receive a new ORB entry. (The breach itself already
+    flattened the position AND cancelled resting orders via flatten_and_lock_account; this is what
+    stops the account from re-entering while still locked.) Auto-unlocks at the next session reset.
+
+    Fail direction depends on the caller, because it must always bias toward SAFETY:
+      • PLACEMENT (fail_closed=True, default): if the lock can't be read, BLOCK the entry — a lock must
+        not be bypassed by a transient DB error, and a webhook can't be retried (matches risk_gate).
+      • MANAGER RE-SWEEP (fail_closed=False): that path CANCELS resting entries, so an unreadable lock
+        must fail OPEN — never cancel a legit resting entry on a transient error; it just retries next
+        3s poll. Only a CONFIRMED lock cancels."""
+    try:
+        cfg = _maybe_auto_unlock(ensure_risk_config(account.get("id"), account.get("user_id")))
+    except Exception:
+        return "Risk state unavailable — entry blocked (fail-closed)." if fail_closed else ""
+    if cfg.get("locked"):
+        return cfg.get("locked_reason") or "Risk lock active."
+    return ""
+
+
 def execute_orb_to_accounts(accounts: list, symbol: str, qty: int, long_spec, short_spec) -> dict:
     """ADD-ONLY: place RESTING stop-limit ORB entries (long and/or short) with attached
     stop-market SL + limit TP brackets on every account (Tradovate placeOSO). Only ONE side
@@ -3436,6 +3458,10 @@ def execute_orb_to_accounts(accounts: list, symbol: str, qty: int, long_spec, sh
     results = []
     for a in accounts:
         try:
+            rlock = _orb_account_risk_locked(a)          # daily-loss / drawdown lock -> no new entry
+            if rlock:
+                results.append({"account": a.get("account_name"), "ok": False, "error": rlock})
+                continue
             token = ensure_fresh_token(a)
             env = a.get("env") or "live"
             acct_id = a.get("account_id")
@@ -3694,6 +3720,18 @@ def _orb_manage_one(s):
     # load (this is what keeps the loop light once many clients' sessions have filled).
     if s["status"] != "armed":
         return
+
+    # DEFENSE-IN-DEPTH for a risk-engine lock (daily-loss / drawdown). flatten_and_lock_account
+    # already cancels working orders + flattens at the breach instant, but that sweep runs ONCE and
+    # is not retried once the account is locked — so a transient broker error there could leave a
+    # resting ORB entry on a LOCKED account that later triggers a new position. Re-cancel the LOCKED
+    # accounts' resting entries every poll (StopLimit-only -> never touches a winner's Stop/Limit
+    # bracket; scoped to the locked accounts only, so an unlocked routed account is untouched).
+    # fail_closed=False: on an unreadable lock, do NOT cancel a legit resting entry (a transient DB
+    # error must never kill a real trade) — this is only a backstop and retries on the next poll.
+    locked_accts = [a for a in accounts if _orb_account_risk_locked(a, fail_closed=False)]
+    if locked_accts:
+        cancel_pending_entries_to_accounts(locked_accts, symbol)
 
     # Detect a fill across the routed accounts. TWO signals so a fill is NEVER missed:
     #   (a) net position != 0   — a trade is currently OPEN;
