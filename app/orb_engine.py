@@ -22,6 +22,9 @@ import json
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
+from fastapi import Request                     # module-level so route annotations resolve
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse  # (with `from __future__ import annotations`)
+
 from app import tradovate_oauth as tvo
 from app.orb_live import (Autopilot, AccountConfig, DEFAULT_PARAMS, INSTRUMENTS,
                          plan_total_micros, split_micros)
@@ -306,6 +309,8 @@ def install(app) -> None:
     def prop_engine_page(request: Request):
         main = _main()
         user = main.require_user(request)
+        if not user:
+            return RedirectResponse("/login", status_code=302)
         accounts = _connected_accounts(user["id"])
         cfgs = {a["account_id"]: get_config(user["id"], a["account_id"]) for a in accounts}
         body = _render_dashboard(accounts, cfgs)
@@ -318,6 +323,8 @@ def install(app) -> None:
     async def prop_engine_save(request: Request):
         main = _main()
         user = main.require_user(request)
+        if not user:
+            return JSONResponse({"ok": False, "error": "login required"}, status_code=401)
         form = await request.form()
         account_id = str(form.get("account_id") or "")
         acct = next((a for a in _connected_accounts(user["id"]) if a["account_id"] == account_id), None)
@@ -338,6 +345,8 @@ def install(app) -> None:
     def prop_engine_status(request: Request):
         main = _main()
         user = main.require_user(request)
+        if not user:
+            return JSONResponse({"engine": _LAST_STATUS, "accounts": {}})
         mine = {a["account_id"]: get_config(user["id"], a["account_id"])
                 for a in _connected_accounts(user["id"])}
         return JSONResponse({"engine": _LAST_STATUS, "accounts": mine})
