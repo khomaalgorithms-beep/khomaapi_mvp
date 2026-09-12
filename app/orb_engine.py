@@ -315,7 +315,8 @@ def install(app) -> None:
         cfgs = {a["account_id"]: get_config(user["id"], a["account_id"]) for a in accounts}
         body = _render_dashboard(accounts, cfgs)
         try:
-            return HTMLResponse(main.layout("Prop Engine", body, user=user))
+            # layout(content, user=None, active="dashboard") — wrap in KhomaAPI chrome + sidebar
+            return HTMLResponse(main.layout(body, user=user, active="prop"))
         except Exception:
             return HTMLResponse(body)   # fall back to a bare page if layout() signature differs
 

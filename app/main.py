@@ -5304,6 +5304,7 @@ document.addEventListener("click", function(event) {{
 </div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
   <div class="nav">
     {nav_item(active,'dashboard','/dashboard','⌁','Dashboard')}
+    {nav_item(active,'prop','/prop-engine','⚡','KhomaVolume ORB')}
     {nav_item(active,'broker','/broker','◇','Broker Connect')}
     {nav_item(active,'webhooks','/webhooks','⌘','Webhooks')}
     {nav_item(active,'logs','/logs','▥','Trade Logs')}
