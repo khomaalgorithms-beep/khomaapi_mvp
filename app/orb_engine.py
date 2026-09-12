@@ -119,16 +119,36 @@ def save_config(user_id: int, account_pk: int, account_id: str, *, enabled: bool
 
 
 def enabled_rows() -> List[dict]:
-    """Every ENABLED autopilot joined to its CONNECTED broker account (so a disconnected account
-    silently drops out until it reconnects)."""
+    """Every ARMED autopilot that is actually allowed to trade right now: the account is
+    connected AND the owner's MASTER automation switch is Running. So hitting Pause on the main
+    dashboard (users.automation_status='Paused') stops the ORB engine too — it places nothing."""
     con = _db()
     rows = con.execute("""
         SELECT ap.*, ba.account_name, ba.env, ba.status
-        FROM orb_autopilot ap JOIN broker_accounts ba ON ba.id = ap.account_pk
-        WHERE ap.enabled=1 AND ba.status='connected'
+        FROM orb_autopilot ap
+        JOIN broker_accounts ba ON ba.id = ap.account_pk
+        JOIN users u ON u.id = ap.user_id
+        WHERE ap.enabled=1 AND ba.status='connected' AND u.automation_status='Running'
     """).fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+def master_running(user_id: int) -> bool:
+    """Is the owner's master automation switch Running? (The main-dashboard Start/Pause.)"""
+    con = _db()
+    row = con.execute("SELECT automation_status FROM users WHERE id=?", (user_id,)).fetchone()
+    con.close()
+    return bool(row) and dict(row).get("automation_status") == "Running"
+
+
+def set_master_running(user_id: int) -> None:
+    """Flip the master switch ON when the user Starts the ORB engine, so arming actually results
+    in execution (main-dashboard Pause can still stop everything)."""
+    con = _db()
+    con.execute("UPDATE users SET automation_status='Running' WHERE id=?", (user_id,))
+    con.commit()
+    con.close()
 
 
 # ---------------------------------------------------------------------------
@@ -331,26 +351,29 @@ def install(app) -> None:
         acct = next((a for a in _connected_accounts(user["id"]) if a["account_id"] == account_id), None)
         if not acct:
             return JSONResponse({"ok": False, "error": "account not connected"}, status_code=400)
+        enabling = form.get("enabled") in ("1", "true", "on", True)
         try:
-            save_config(user["id"], acct["id"], account_id,
-                        enabled=(form.get("enabled") in ("1", "true", "on", True)),
+            save_config(user["id"], acct["id"], account_id, enabled=enabling,
                         mode=str(form.get("mode") or "eval"), acct_size=str(form.get("acct_size") or "50K"),
                         preset=str(form.get("preset") or "norm"), asset=str(form.get("asset") or "both"))
         except AssertionError:
             return JSONResponse({"ok": False, "error": "invalid settings"}, status_code=400)
-        return JSONResponse({"ok": True, "qty": qty_for(str(form.get("mode") or "eval"),
-                            str(form.get("acct_size") or "50K"), str(form.get("preset") or "norm"),
-                            str(form.get("asset") or "both"))})
+        if enabling:
+            set_master_running(user["id"])   # Start here = allow execution (Dashboard Pause still stops it)
+        return JSONResponse({"ok": True, "enabled": enabling, "master_running": master_running(user["id"]),
+                            "qty": qty_for(str(form.get("mode") or "eval"), str(form.get("acct_size") or "50K"),
+                            str(form.get("preset") or "norm"), str(form.get("asset") or "both"))})
 
     @app.get("/prop-engine/status")
     def prop_engine_status(request: Request):
         main = _main()
         user = main.require_user(request)
         if not user:
-            return JSONResponse({"engine": _LAST_STATUS, "accounts": {}})
+            return JSONResponse({"engine": _LAST_STATUS, "accounts": {}, "master_running": False})
         mine = {a["account_id"]: get_config(user["id"], a["account_id"])
                 for a in _connected_accounts(user["id"])}
-        return JSONResponse({"engine": _LAST_STATUS, "accounts": mine})
+        return JSONResponse({"engine": _LAST_STATUS, "accounts": mine,
+                            "master_running": master_running(user["id"])})
 
 
 def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]]) -> str:
@@ -369,7 +392,13 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]]) -> 
                                  "asset": c.get("asset", "both"), "bal": c.get("bal", 25000),
                                  "dd": c.get("dd", 15)}
     return (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
-                 .replace("__CONFIGS__", json.dumps(conf)))
+                 .replace("__CONFIGS__", json.dumps(conf))
+                 .replace("__EQUITY__", _EQUITY_JSON))
+
+
+# Validated equity curves + stats (per micro), generated from the 2019-2026 backtest:
+# NQ MNQ 30/75, RTY M2K 8/20, and the NQ+RTY portfolio (1 MNQ + 1 M2K per day).
+_EQUITY_JSON = r"""{"NQ":{"cum":[961,734,1170,1031,1426,1624,1588,2018,2118,2479,2273,2297,2406,2863,3088,3523,3809,4248,4596,4979,5675,6297,6352,6584,6794,6929,6994,7498,7538,7811,8072,9453,9740,9728,9749,10184,10100,10201,10451,10763,10900,11125,10990,11033,10780,11302,11580,11830,12390,12430,12941,13216,13342,13802,13272,13881,13772,14084,14333,14622,15144,15840,15788,15889,16302,16170,16987,17237,17512,18556,19165,19898,20692,21240,21849,22073,22857,22500,22801,23435,23617,23615,24286,24598,25120,25580,25558,26229,25934,26061,26546,26386,26325],"stats":{"n":1145,"net":26325,"pf":1.67,"win":42,"maxdd":-716,"ret_dd":36.8}},"RTY":{"cum":[119,2,226,245,505,323,595,773,1168,1085,1065,956,1142,1154,1184,1329,1360,1852,1749,1804,1994,2121,2049,2190,2562,3284,3539,3698,3591,3620,4260,4355,4458,4432,4561,4873,4862,5147,5572,5827,5941,6154,6165,6221,6236,6267,6324,6297,6158,6313,6476,6654,6721,6715,6846,6854,6882,6907,7021,6949,7160,7066,7180,7466,7679,7489,7660,7907,8065,8221,8231,8218,8134,8444,8672,8885,8750,8599,8659,8673,8890,9082,8957,8990,8975,9206,9293,9423,9528,9377,9828,9947,10058],"stats":{"n":775,"net":10058,"pf":1.64,"win":47,"maxdd":-429,"ret_dd":23.4}},"PF":{"cum":[1080,736,1396,1276,1931,1948,2183,2791,3286,3563,3339,3252,3548,4017,4272,4852,5169,6100,6345,6782,7669,8418,8401,8774,9356,10213,10532,11197,11129,11430,12332,13808,14197,14160,14310,15057,14962,15348,16024,16590,16842,17279,17156,17254,17016,17569,17904,18128,18548,18743,19417,19870,20063,20518,20118,20736,20654,20990,21354,21571,22304,22906,22968,23355,23982,23659,24647,25144,25577,26778,27396,28116,28827,29684,30521,30959,31606,31099,31460,32108,32507,32698,33243,33588,34095,34786,34851,35652,35463,35437,36374,36334,36382],"stats":{"n":1391,"net":36382,"pf":1.8,"win":48,"maxdd":-784,"ret_dd":46.4}},"months":["2019-01","2019-02","2019-03","2019-04","2019-05","2019-06","2019-07","2019-08","2019-09","2019-10","2019-11","2019-12","2020-01","2020-02","2020-03","2020-04","2020-05","2020-06","2020-07","2020-08","2020-09","2020-10","2020-11","2020-12","2021-01","2021-02","2021-03","2021-04","2021-05","2021-06","2021-07","2021-08","2021-09","2021-10","2021-11","2021-12","2022-01","2022-02","2022-03","2022-04","2022-05","2022-06","2022-07","2022-08","2022-09","2022-10","2022-11","2022-12","2023-01","2023-02","2023-03","2023-04","2023-05","2023-06","2023-07","2023-08","2023-09","2023-10","2023-11","2023-12","2024-01","2024-02","2024-03","2024-04","2024-05","2024-06","2024-07","2024-08","2024-09","2024-10","2024-11","2024-12","2025-01","2025-02","2025-03","2025-04","2025-05","2025-06","2025-07","2025-08","2025-09","2025-10","2025-11","2025-12","2026-01","2026-02","2026-03","2026-04","2026-05","2026-06","2026-07","2026-08","2026-09"]}"""
 
 
 _PAGE = r"""
@@ -439,6 +468,18 @@ _PAGE = r"""
   .kv .note{display:flex;gap:12px;background:var(--bg);border:1px solid var(--ln);border-left:4px solid var(--g);border-radius:14px;padding:14px 16px;margin-top:16px;font-size:12.5px;color:var(--mu);line-height:1.5}
   .kv .note b{color:var(--tx)}
   .kv .empty{background:var(--card);border:1px solid var(--ln);border-radius:18px;padding:26px;text-align:center;color:var(--mu)}
+  .kv .eqwrap{display:block;margin-top:22px;background:var(--card);border:1px solid var(--ln);border-radius:20px;box-shadow:0 18px 60px rgba(17,24,39,.06);padding:20px 22px 22px}
+  .kv .eqhead{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
+  .kv .eqhead h2{font-size:16px;font-weight:800;letter-spacing:-.3px;margin:0}.kv .eqhead p{color:var(--mu);font-size:12px;margin:4px 0 0}
+  .kv .eqtabs{display:flex;gap:6px;background:#f4f6f5;border:1px solid var(--ln);border-radius:12px;padding:4px}
+  .kv .eqtab{border:0;background:transparent;color:var(--mu);font:inherit;font-size:12.5px;font-weight:700;padding:7px 12px;border-radius:8px;cursor:pointer}
+  .kv .eqtab.on{background:#fff;color:var(--gd);box-shadow:0 6px 16px rgba(17,24,39,.06);font-weight:800}
+  .kv .eqchart{margin-top:14px}.kv .eqchart svg{width:100%;height:auto;display:block}
+  .kv .eqtiles{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--ln);border:1px solid var(--ln);border-radius:14px;overflow:hidden;margin-top:14px}
+  @media(max-width:760px){.kv .eqtiles{grid-template-columns:repeat(3,1fr)}}
+  .kv .eqt{background:#fff;padding:12px 14px}.kv .eqt .k{font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
+  .kv .eqt .v{font-size:18px;font-weight:900;letter-spacing:-.5px;margin-top:3px;font-variant-numeric:tabular-nums}
+  .kv .eqnote{font-size:12.5px;color:var(--mu);line-height:1.5;margin-top:14px;background:var(--gs);border:1px solid var(--gl);border-radius:12px;padding:12px 14px}
 </style>
 <div class="kv" id="kv">
   <div class="top">
@@ -453,9 +494,10 @@ _PAGE = r"""
     </div>
   </div>
   <div id="app"></div>
+  <section id="eqSection" class="eqwrap"></section>
 </div>
 <script>
-const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__;
+const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, EQ=__EQUITY__;
 const EVAL={"25K":{cons:[4,86,36],norm:[6,76,21],aggr:[10,64,10]},"50K":{cons:[8,84,45],norm:[12,74,25],aggr:[20,62,11]},"100K":{cons:[12,84,62],norm:[18,72,35],aggr:[30,59,15]},"150K":{cons:[20,81,53],norm:[30,69,29],aggr:[50,57,14]}};
 const FUNDED={"25K":{cons:2,norm:4,aggr:6},"50K":{cons:4,norm:8,aggr:12},"100K":{cons:6,norm:12,aggr:18},"150K":{cons:10,norm:20,aggr:30}};
 const CAP={"25K":1000,"50K":2000,"100K":2500,"150K":3000},TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
@@ -573,6 +615,41 @@ function poll(){
 const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});
 sel.onchange=()=>loadAcct(sel.value);
+// ---- validated equity curves (NQ / RTY / Portfolio), from the 2019-2026 backtest ----
+let eqTab="PF";
+function eqPath(cum,W,H,L,R,T,B){
+  const n=cum.length,mx=Math.max(...cum),mn=Math.min(...cum,0);
+  const x=i=>L+i/(n-1)*(W-L-R),y=v=>T+(1-(v-mn)/(mx-mn||1))*(H-T-B);
+  let ln="M"+x(0).toFixed(1)+" "+y(cum[0]).toFixed(1);
+  cum.forEach((v,i)=>{if(i)ln+=" L"+x(i).toFixed(1)+" "+y(v).toFixed(1);});
+  const ar=ln+" L"+x(n-1).toFixed(1)+" "+(H-B)+" L"+x(0).toFixed(1)+" "+(H-B)+" Z";
+  const zy=y(0),g=`<line x1="${L}" y1="${zy.toFixed(1)}" x2="${W-R}" y2="${zy.toFixed(1)}" stroke="#e5e7eb"/>`
+    +`<text x="${L-6}" y="${(y(mx)+9).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">$${(mx/1000).toFixed(0)}k</text>`
+    +`<text x="${L-6}" y="${(zy+3).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">0</text>`;
+  return {ln,ar,g,x:x(n-1),y:y(cum[n-1])};
+}
+function renderEquity(){
+  const d=EQ[eqTab],c=d.cum,s=d.stats,W=780,H=210,L=40,R=12,T=14,B=20;
+  const p=eqPath(c,W,H,L,R,T,B);
+  const yr=EQ.months.map((m,i)=>[i,m]).filter(([i,m])=>m.endsWith("-01")).map(([i,m])=>
+    `<text x="${(L+i/(c.length-1)*(W-L-R)).toFixed(1)}" y="${H-5}" text-anchor="middle" font-size="10" font-weight="700" fill="#9ca3af">${m.slice(0,4)}</text>`).join("");
+  const tabs=[["PF","Portfolio · NQ+RTY"],["NQ","NQ only"],["RTY","RTY only"]].map(([k,t])=>
+    `<button class="eqtab ${k===eqTab?'on':''}" data-k="${k}">${t}</button>`).join("");
+  const tiles=[["Net / micro","$"+s.net.toLocaleString()],["Profit factor",s.pf],["Win rate",s.win+"%"],
+    ["Max drawdown","$"+s.maxdd.toLocaleString()],["Return / DD",s.ret_dd+"×"],["Trades",s.n.toLocaleString()]];
+  document.getElementById("eqSection").innerHTML=`
+    <div class="eqhead"><div><h2>Validated equity curve</h2><p>Real 1-minute data, 2019–2026 · honest fills (slippage + commissions) · per micro contract</p></div>
+      <div class="eqtabs">${tabs}</div></div>
+    <div class="eqchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${eqTab} equity curve">
+      <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16a34a" stop-opacity=".16"/><stop offset="1" stop-color="#16a34a" stop-opacity="0"/></linearGradient></defs>
+      ${p.g}<path d="${p.ar}" fill="url(#eqg)"/><path d="${p.ln}" fill="none" stroke="#0f8f45" stroke-width="2.4" stroke-linejoin="round"/>
+      <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yr}</svg></div>
+    <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
+    <div class="eqnote">Portfolio (NQ + RTY) is the smoothest — PF ${EQ.PF.stats.pf}, ${EQ.PF.stats.ret_dd}× return-to-drawdown vs ${EQ.NQ.stats.ret_dd}× (NQ) and ${EQ.RTY.stats.ret_dd}× (RTY) alone. Their winning days barely overlap, so running both cuts the drawdown. This is the exact engine that trades your account.</div>`;
+  document.querySelectorAll(".eqtab").forEach(b=>b.onclick=()=>{eqTab=b.dataset.k;renderEquity();});
+}
+renderEquity();
+
 if(ACCOUNTS.length){loadAcct(ACCOUNTS[0].id);setInterval(poll,4000);poll();}else render();
 </script>
 """
