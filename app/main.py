@@ -9439,3 +9439,13 @@ def debug_db_path():
     except Exception as e:
         return {"db_path": str(DB_PATH), "error": str(e)}
 
+
+
+# --- KhomaVolume live execution engine (add-only; off by default until armed per account) ---
+# Fail-safe: a fault here must NEVER stop the rest of KhomaAPI from booting.
+try:
+    from app import orb_engine as _orb_engine  # noqa: E402
+    _orb_engine.install(app)
+except Exception as _orb_e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger("uvicorn.error").warning("orb_engine not installed: %s", _orb_e)
