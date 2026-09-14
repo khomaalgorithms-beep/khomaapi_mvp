@@ -28,12 +28,34 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse  # (w
 from app import tradovate_oauth as tvo
 from app.orb_live import (Autopilot, AccountConfig, DEFAULT_PARAMS, INSTRUMENTS,
                          plan_total_micros, split_micros)
-from app.orb_runtime import build_account_engine, LiveEngine
+from app.orb_massive import MassiveFeed, subscriptions_for, _ET
 from app.orb_selective import Bar
 
 POLL_INTERVAL = float(__import__("os").getenv("ORB_LIVE_POLL_INTERVAL", "3"))
 # instrument root -> the asset key the sizing/split uses
 _ASSET_ROOTS = {"nq": ["MNQ"], "rty": ["M2K"], "both": ["MNQ", "M2K"]}
+
+
+def _now_et() -> datetime:
+    return datetime.now(_ET)
+
+
+def _massive_key() -> Optional[str]:
+    return __import__("os").getenv("MASSIVE_API_KEY") or None
+
+
+def _make_autopilot(cfg: AccountConfig, token_provider) -> Autopilot:
+    """One Autopilot per account, executing to that account's Tradovate connection."""
+    return Autopilot(cfg, get_token=token_provider, now_et=_now_et)
+
+
+def _make_massive_feed(subscriptions, on_bar):
+    """The single shared Massive real-time feed for the whole engine (needs MASSIVE_API_KEY)."""
+    return MassiveFeed(get_key=_massive_key, subscriptions=subscriptions, on_bar=on_bar)
+
+
+def _subscriptions_for(roots):
+    return subscriptions_for(roots)
 
 
 # ---------------------------------------------------------------------------
@@ -194,45 +216,65 @@ def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
 # manager — owns the live autopilots + feeds, reconciles them to the enabled set
 # ---------------------------------------------------------------------------
 class EngineManager:
-    """Keeps exactly one (Autopilot, feed) alive per enabled account and polls them. `sync()`
-    starts new/changed accounts and stops removed ones; `poll()` reconciles all against the
-    broker. Broker/feed construction is injected so the whole lifecycle is unit-testable."""
+    """Owns one Autopilot per armed account and ONE shared Massive data feed for the whole
+    business. Each completed bar from the single feed is dispatched to EVERY armed account's
+    autopilot, so one $199 feed powers signals for all accounts — clients never buy data.
+    `sync()` starts/stops autopilots and (re)subscribes the feed to the union of instruments;
+    `poll()` reconciles every account against its broker. Feed/autopilot construction is injected
+    for unit-testing without a socket."""
 
-    def __init__(self, engine_factory=build_account_engine, start_feed=True):
-        self._factory = engine_factory
+    def __init__(self, feed_factory=None, autopilot_factory=None, start_feed=True):
+        self._feed_factory = feed_factory        # (subscriptions, on_bar) -> feed
+        self._autopilot_factory = autopilot_factory or _make_autopilot
         self._start_feed = start_feed
-        self._active: Dict[int, dict] = {}   # account_id -> {sig, autopilot, feed, task}
+        self._active: Dict[int, dict] = {}       # account_id -> {sig, autopilot}
+        self._feed = None
+        self._feed_task = None
+        self._feed_roots: tuple = ()             # exec roots the feed is currently subscribed to
 
+    # ---- accounts + shared feed ----
     def sync(self, configs: List[dict]) -> None:
-        """configs: [{"row":row, "cfg":AccountConfig, "sig":str, "token_provider":callable}]."""
+        """configs: [{"cfg":AccountConfig, "sig":str, "token_provider":callable}]."""
         wanted = {c["cfg"].account_id: c for c in configs}
-        # stop accounts no longer wanted (or whose settings changed)
-        for acct_id in list(self._active):
+        for acct_id in list(self._active):        # drop removed / changed
             if acct_id not in wanted or wanted[acct_id]["sig"] != self._active[acct_id]["sig"]:
-                self._stop(acct_id)
-        # start accounts not yet active
-        for acct_id, c in wanted.items():
+                self._active.pop(acct_id, None)
+        for acct_id, c in wanted.items():         # add new
             if acct_id not in self._active:
-                self._start(acct_id, c)
+                ap = self._autopilot_factory(c["cfg"], c["token_provider"])
+                self._active[acct_id] = {"sig": c["sig"], "autopilot": ap}
+        self._ensure_feed()
 
-    def _start(self, acct_id: int, c: dict) -> None:
-        ap, feed = self._factory(c["cfg"], get_token=c["token_provider"])
-        task = None
-        if self._start_feed:
-            task = asyncio.create_task(feed.run())
-        self._active[acct_id] = {"sig": c["sig"], "autopilot": ap, "feed": feed, "task": task}
-
-    def _stop(self, acct_id: int) -> None:
-        st = self._active.pop(acct_id, None)
-        if not st:
+    def _ensure_feed(self) -> None:
+        """Keep the single shared feed subscribed to the union of instruments across all armed
+        accounts; stop it when nothing is armed; restart it when the instrument set changes."""
+        roots = tuple(sorted({r for st in self._active.values()
+                              for r in st["autopilot"].cfg.instruments}))
+        if roots == self._feed_roots and (self._feed is not None or not roots):
             return
+        self._stop_feed()
+        self._feed_roots = roots
+        if not roots or not self._start_feed:
+            return
+        subs = _subscriptions_for(roots)
+        self._feed = (self._feed_factory or _make_massive_feed)(subs, self.on_bar)
         try:
-            if st.get("feed"):
-                st["feed"].stop()
-            if st.get("task"):
-                st["task"].cancel()
-        except Exception:
-            pass
+            self._feed_task = asyncio.create_task(self._feed.run())
+        except RuntimeError:
+            self._feed_task = None                # no running loop (tests) — feed built, not run
+
+    def on_bar(self, root: str, bar: Bar) -> List[dict]:
+        """Dispatch ONE completed bar to every armed account. (Broker order I/O inside on_bar is
+        brief and per-minute; for very large fleets this should move to a thread pool.)"""
+        out = []
+        for acct_id, st in list(self._active.items()):
+            try:
+                r = st["autopilot"].on_bar(root, bar)
+                if r:
+                    out.append({"account_id": acct_id, **r})
+            except Exception as e:
+                out.append({"account_id": acct_id, "error": str(e)})
+        return out
 
     def poll(self) -> List[dict]:
         out: List[dict] = []
@@ -243,12 +285,26 @@ class EngineManager:
                 out.append({"account_id": acct_id, "error": str(e)})
         return out
 
+    def _stop_feed(self) -> None:
+        try:
+            if self._feed:
+                self._feed.stop()
+            if self._feed_task:
+                self._feed_task.cancel()
+        except Exception:
+            pass
+        self._feed, self._feed_task = None, None
+
     def active_ids(self) -> List[int]:
         return list(self._active)
 
+    def feed_roots(self) -> tuple:
+        return self._feed_roots
+
     def stop_all(self) -> None:
-        for acct_id in list(self._active):
-            self._stop(acct_id)
+        self._active.clear()
+        self._stop_feed()
+        self._feed_roots = ()
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +348,8 @@ async def engine_loop() -> None:
                 _MANAGER.sync(configs)
                 actions = _MANAGER.poll()
                 _LAST_STATUS.update(running=True, accounts=len(_MANAGER.active_ids()),
+                                    data_key=bool(_massive_key()),
+                                    feed_instruments=list(_MANAGER.feed_roots()),
                                     actions=[a for a in actions if a.get("action") not in (None,)][-20:],
                                     ts=datetime.now(timezone.utc).isoformat())
             else:

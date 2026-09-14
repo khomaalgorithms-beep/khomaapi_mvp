@@ -53,50 +53,85 @@ def test_config_signature_changes_on_setting_change():
     assert s1 != s2 and s1 == s3
 
 
-# ---- EngineManager lifecycle (fake factory, no real feeds) ----
+# ---- EngineManager lifecycle: ONE shared feed dispatched to all accounts ----
 class FakeAP:
-    def __init__(self, tag):
-        self.tag = tag
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.bars = []
+    def on_bar(self, root, bar):
+        self.bars.append((root, bar)); return {"action": "seen", "root": root}
     def poll(self):
-        return [{"account_id": self.tag, "action": "tick"}]
+        return [{"account_id": self.cfg.account_id, "action": "tick"}]
 
 
 class FakeFeed:
-    def __init__(self):
-        self.stopped = False
+    def __init__(self, subs, on_bar):
+        self.subs = subs; self.on_bar = on_bar; self.stopped = False
     def run(self):
         return None
     def stop(self):
         self.stopped = True
 
 
-def _cfg(acct_id):
+def _cfg(acct_id, roots=("MNQ",)):
     return AccountConfig(env="demo", account_spec="D", account_id=acct_id, account_name="D",
-                         instruments={"MNQ": "MNQZ5"}, qty={"MNQ": 6})
+                         instruments={r: r + "Z6" for r in roots}, qty={r: 6 for r in roots})
 
 
-def _item(acct_id, sig):
-    return {"cfg": _cfg(acct_id), "sig": sig, "token_provider": lambda: "t"}
+def _item(acct_id, sig, roots=("MNQ",)):
+    return {"cfg": _cfg(acct_id, roots), "sig": sig, "token_provider": lambda: "t"}
 
 
-def test_manager_starts_stops_and_polls():
-    made = []
-    def factory(cfg, get_token):
-        ap = FakeAP(cfg.account_id); made.append(ap)
-        return ap, FakeFeed()
-    m = eng.EngineManager(engine_factory=factory, start_feed=False)
+def _mgr():
+    made = {}
+    feeds = []
+    def apf(cfg, tp):
+        ap = FakeAP(cfg); made[cfg.account_id] = ap; return ap
+    def ff(subs, on_bar):
+        f = FakeFeed(subs, on_bar); feeds.append(f); return f
+    m = eng.EngineManager(feed_factory=ff, autopilot_factory=apf, start_feed=True)
+    return m, made, feeds
 
+
+def test_one_shared_feed_for_all_accounts():
+    m, made, feeds = _mgr()
     m.sync([_item(1, "a"), _item(2, "a")])
     assert sorted(m.active_ids()) == [1, 2]
-    assert len(m.poll()) == 2                              # both polled
+    # exactly ONE feed for both accounts, subscribed to the NQ data ticker -> MNQ
+    assert len(feeds) == 1 and list(feeds[0].subs.values()) == ["MNQ"]
+    assert m.feed_roots() == ("MNQ",)
 
-    # account 2 removed -> its feed stopped; account 1 unchanged -> kept (not rebuilt)
+
+def test_bar_dispatched_to_every_account():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a"), _item(2, "a")])
+    from app.orb_selective import Bar
+    from datetime import datetime
+    out = m.on_bar("MNQ", Bar(datetime(2026, 1, 2, 9, 50), 1, 2, 0, 1, 5))
+    assert len(out) == 2                          # both accounts saw the one bar
+    assert made[1].bars and made[2].bars
+
+
+def test_feed_resubscribes_when_instrument_set_changes():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a", roots=("MNQ",))])
+    assert m.feed_roots() == ("MNQ",)
+    # add an account that also trades RTY -> feed must resubscribe to both
+    m.sync([_item(1, "a", roots=("MNQ",)), _item(2, "b", roots=("MNQ", "M2K"))])
+    assert m.feed_roots() == ("M2K", "MNQ")
+    assert sorted(feeds[-1].subs.values()) == ["M2K", "MNQ"]   # newest feed has both
+
+
+def test_feed_stops_when_all_disarmed():
+    m, made, feeds = _mgr()
     m.sync([_item(1, "a")])
-    assert m.active_ids() == [1] and len(made) == 2        # no rebuild of acct 1
+    m.sync([])                                    # all disarmed
+    assert m.active_ids() == [] and m.feed_roots() == () and feeds[0].stopped
 
-    # account 1 settings change (new sig) -> rebuilt
-    m.sync([_item(1, "b")])
-    assert m.active_ids() == [1] and len(made) == 3
 
+def test_poll_all_accounts():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a"), _item(2, "a")])
+    assert len(m.poll()) == 2
     m.stop_all()
-    assert m.active_ids() == []
+    assert m.active_ids() == [] and feeds[-1].stopped
