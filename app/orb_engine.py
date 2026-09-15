@@ -58,6 +58,13 @@ def _subscriptions_for(roots):
     return subscriptions_for(roots)
 
 
+def _fetch_today_bars(root):
+    """Today's elapsed 1-min bars for a root via Massive REST (for opening-range backfill)."""
+    from app.orb_massive import fetch_today_bars
+    key = _massive_key()
+    return fetch_today_bars(key, root) if key else []
+
+
 # ---------------------------------------------------------------------------
 # lazy access to main.py (avoids an import cycle; works across main.py versions)
 # ---------------------------------------------------------------------------
@@ -245,8 +252,33 @@ class EngineManager:
         for acct_id, c in wanted.items():         # add new
             if acct_id not in self._active:
                 ap = self._autopilot_factory(c["cfg"], c["token_provider"])
-                self._active[acct_id] = {"sig": c["sig"], "autopilot": ap}
+                # needs_backfill: on (re)start mid-session, rebuild today's opening range from REST
+                self._active[acct_id] = {"sig": c["sig"], "autopilot": ap, "needs_backfill": True}
         self._ensure_feed()
+
+    def run_backfills(self, fetch_bars) -> List[dict]:
+        """For each newly-armed autopilot, backfill today's elapsed bars per instrument so the
+        opening range survives a restart. One REST fetch per root, shared across accounts.
+        fetch_bars(root) -> [Bar]. Runs off the loop thread (network); never raises out."""
+        pending = [(aid, st) for aid, st in self._active.items() if st.get("needs_backfill")]
+        if not pending:
+            return []
+        roots = sorted({r for _, st in pending for r in st["autopilot"].cfg.instruments})
+        cache = {}
+        for r in roots:
+            try:
+                cache[r] = fetch_bars(r) or []
+            except Exception as e:
+                print("ORB backfill fetch error:", r, e); cache[r] = []
+        out = []
+        for aid, st in pending:
+            for r in list(st["autopilot"].cfg.instruments):
+                try:
+                    out.append({"account_id": aid, **st["autopilot"].backfill(r, cache.get(r, []))})
+                except Exception as e:
+                    out.append({"account_id": aid, "root": r, "error": str(e)})
+            st["needs_backfill"] = False
+        return out
 
     def _ensure_feed(self) -> None:
         """Keep the single shared feed subscribed to the union of instruments across all armed
@@ -356,6 +388,11 @@ async def engine_loop() -> None:
             if is_leader:
                 configs = await asyncio.get_event_loop().run_in_executor(None, _plan_configs)
                 _MANAGER.sync(configs)
+                # backfill today's opening range for any newly-armed account (restart-proof)
+                bf = await asyncio.get_event_loop().run_in_executor(None, _MANAGER.run_backfills, _fetch_today_bars)
+                for a in bf:
+                    if a.get("action") in ("backfill_ready", "backfill_missed"):
+                        print("ORB backfill:", a)
                 actions = _MANAGER.poll()
                 _LAST_STATUS.update(running=True, accounts=len(_MANAGER.active_ids()),
                                     data_key=bool(_massive_key()),

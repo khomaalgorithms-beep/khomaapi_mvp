@@ -319,6 +319,30 @@ class Autopilot:
         return {"root": root, "action": "placed", "side": sig.side, "qty": qty,
                 "order_id": oid, "plan": plan}
 
+    # ---- restart-proof opening-range backfill ------------------------------
+    def backfill(self, root: str, bars: List[Bar]) -> dict:
+        """Seed today's already-elapsed 1-min bars (from REST) so the opening range is rebuilt
+        after a restart — WITHOUT entering on a breakout that already fired (no stale/late entry).
+        If a qualifying signal already fired in the backfill, mark the day DONE; otherwise stay
+        IDLE so a LIVE breakout going forward is still taken. Idempotent (skips if bars already)."""
+        if root not in self.cfg.instruments or not bars:
+            return {"root": root, "action": "backfill_skip", "reason": "no bars"}
+        st = self._day(root, bars[-1])
+        if st.status != _IDLE or st.bars:
+            return {"root": root, "action": "backfill_skip", "reason": "already active"}
+        st.bars.extend(sorted(bars, key=lambda b: b.dt))    # elapsed bars -> reconstruct the OR
+        params = self.cfg.params.get(root, DEFAULT_PARAMS.get(root))
+        sig = find_signal(st.bars, self.atr[root].value(),
+                          stop_points=params.stop_points, target_points=params.target_points,
+                          min_or_points=params.min_or_points, tick=INSTRUMENTS[root].tick,
+                          cutoff_min=self.cfg.cutoff_min)
+        if sig is not None:                                 # breakout already fired -> don't chase
+            st.status = _DONE
+            st.signal = sig
+            return {"root": root, "action": "backfill_missed", "side": sig.side, "bars": len(st.bars)}
+        return {"root": root, "action": "backfill_ready", "bars": len(st.bars),
+                "has_or": opening_range(st.bars) is not None}
+
     # ---- periodic reconcile (seconds cadence) ------------------------------
     def poll(self) -> List[dict]:
         """Reconcile each armed/live instrument against broker truth: detect the entry fill,

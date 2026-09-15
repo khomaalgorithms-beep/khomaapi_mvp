@@ -248,3 +248,29 @@ def test_day_rollover_rolls_atr_and_resets():
     ap.on_bar("MNQ", Bar(datetime(2026, 1, 3, 9, 30), 20000, 20000, 20000, 20000, 1))
     assert ap.atr["MNQ"].value() == 80.0
     assert ap._state["MNQ"].trading_date == "2026-01-03" and ap._state["MNQ"].status == "IDLE"
+
+
+# ---- restart-proof opening-range backfill ----
+def test_backfill_marks_done_if_breakout_already_fired():
+    fb = FakeBroker()
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
+    res = ap.backfill("MNQ", breakout_day())        # OR + decisive breakout already elapsed
+    assert res["action"] == "backfill_missed"
+    assert ap._state["MNQ"].status == "DONE"        # won't enter late on a past breakout
+    assert fb.place_calls == []                     # backfill places NO order
+
+
+def test_backfill_ready_then_live_breakout_trades():
+    fb = FakeBroker()
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
+    orb = [mk(9, 30 + i, 19975, 20000, 19950, 19975, 100) for i in range(15)]  # OR only, no breakout
+    res = ap.backfill("MNQ", orb)
+    assert res["action"] == "backfill_ready" and res["has_or"] is True
+    assert ap._state["MNQ"].status == "IDLE"        # ready to catch a LIVE breakout
+    ap.on_bar("MNQ", mk(9, 50, 20000, 20030, 19995, 20025, 300))   # live breakout after restart
+    assert len(fb.place_calls) == 1                 # trades the live breakout normally
+
+
+def test_backfill_empty_is_safe():
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=FakeBroker())
+    assert ap.backfill("MNQ", [])["action"] == "backfill_skip"

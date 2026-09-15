@@ -56,6 +56,37 @@ def subscriptions_for(exec_roots, today=None) -> Dict[str, str]:
     return out
 
 
+REST_BASE = "https://api.massive.com"
+
+
+def fetch_today_bars(api_key: str, exec_root: str, now=None) -> List[Bar]:
+    """Backfill: today's 1-minute bars (from ~09:00 ET) for the exec_root's data contract, via
+    Massive REST. Lets the engine reconstruct the opening range after a mid-session restart so a
+    deploy/restart never blinds it. Returns ET Bars ascending; [] on any failure (never raises)."""
+    import requests
+    now = now or datetime.now(_ET)
+    ticker = front_ticker(_DATA_ROOT.get(exec_root, exec_root), now.date())
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0)   # 09:00 ET today
+    try:
+        r = requests.get(f"{REST_BASE}/futures/v1/aggs/{ticker}",
+                         params={"resolution": "1min", "window_start.gte": int(start.timestamp() * 1e9),
+                                 "limit": 600, "apiKey": api_key}, timeout=20)
+        results = (r.json() or {}).get("results") or []
+    except Exception as e:
+        print("ORB MASSIVE backfill error:", e)
+        return []
+    out: List[Bar] = []
+    for a in results:
+        ws = a.get("window_start")
+        if ws is None:
+            continue
+        dt = datetime.fromtimestamp(int(ws) / 1e9, tz=timezone.utc).astimezone(_ET)
+        out.append(Bar(dt, float(a["open"]), float(a["high"]), float(a["low"]),
+                       float(a["close"]), float(a.get("volume", 0) or 0)))
+    out.sort(key=lambda b: b.dt)
+    return out
+
+
 def am_to_bar(msg: dict) -> Optional[Bar]:
     """Convert one Massive AM (aggregate-per-minute) message into a completed ET Bar. Uses the
     window START timestamp `s` (Unix ms) as the bar's open time, converted to America/New_York

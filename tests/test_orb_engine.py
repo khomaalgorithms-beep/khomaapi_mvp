@@ -58,8 +58,11 @@ class FakeAP:
     def __init__(self, cfg):
         self.cfg = cfg
         self.bars = []
+        self.backfilled = []
     def on_bar(self, root, bar):
         self.bars.append((root, bar)); return {"action": "seen", "root": root}
+    def backfill(self, root, bars):
+        self.backfilled.append((root, tuple(bars))); return {"root": root, "action": "backfill_ready"}
     def poll(self):
         return [{"account_id": self.cfg.account_id, "action": "tick"}]
 
@@ -135,3 +138,17 @@ def test_poll_all_accounts():
     assert len(m.poll()) == 2
     m.stop_all()
     assert m.active_ids() == [] and feeds[-1].stopped
+
+
+def test_run_backfills_once_per_root_then_cleared():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a", roots=("MNQ", "M2K")), _item(2, "a", roots=("MNQ",))])
+    fetched = []
+    def fetch(root):
+        fetched.append(root); return [f"bar-{root}"]
+    out = m.run_backfills(fetch)
+    assert sorted(set(fetched)) == ["M2K", "MNQ"]              # one REST fetch per unique root
+    assert {r for r, _ in made[1].backfilled} == {"MNQ", "M2K"}
+    assert [r for r, _ in made[2].backfilled] == ["MNQ"]
+    assert any(a["action"] == "backfill_ready" for a in out)
+    assert m.run_backfills(fetch) == []                        # needs_backfill cleared -> no-op
