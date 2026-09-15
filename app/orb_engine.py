@@ -228,6 +228,8 @@ class EngineManager:
         self._autopilot_factory = autopilot_factory or _make_autopilot
         self._start_feed = start_feed
         self._active: Dict[int, dict] = {}       # account_id -> {sig, autopilot}
+        self.bars_seen = 0                       # observability: bars dispatched to the engine
+        self.last_bar = None                     # e.g. "MNQ 09:47" — proves data reaches the engine
         self._feed = None
         self._feed_task = None
         self._feed_roots: tuple = ()             # exec roots the feed is currently subscribed to
@@ -266,6 +268,11 @@ class EngineManager:
     def on_bar(self, root: str, bar: Bar) -> List[dict]:
         """Dispatch ONE completed bar to every armed account. (Broker order I/O inside on_bar is
         brief and per-minute; for very large fleets this should move to a thread pool.)"""
+        self.bars_seen += 1
+        try:
+            self.last_bar = f"{root} {bar.dt:%H:%M} c={bar.c}"
+        except Exception:
+            self.last_bar = root
         out = []
         for acct_id, st in list(self._active.items()):
             try:
@@ -350,6 +357,7 @@ async def engine_loop() -> None:
                 _LAST_STATUS.update(running=True, accounts=len(_MANAGER.active_ids()),
                                     data_key=bool(_massive_key()),
                                     feed_instruments=list(_MANAGER.feed_roots()),
+                                    bars_seen=_MANAGER.bars_seen, last_bar=_MANAGER.last_bar,
                                     actions=[a for a in actions if a.get("action") not in (None,)][-20:],
                                     ts=datetime.now(timezone.utc).isoformat())
             else:
