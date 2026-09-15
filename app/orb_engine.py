@@ -230,6 +230,7 @@ class EngineManager:
         self._active: Dict[int, dict] = {}       # account_id -> {sig, autopilot}
         self.bars_seen = 0                       # observability: bars dispatched to the engine
         self.last_bar = None                     # e.g. "MNQ 09:47" — proves data reaches the engine
+        self.events: List[dict] = []             # trade events pending an email notification
         self._feed = None
         self._feed_task = None
         self._feed_roots: tuple = ()             # exec roots the feed is currently subscribed to
@@ -279,6 +280,8 @@ class EngineManager:
                 r = st["autopilot"].on_bar(root, bar)
                 if r:
                     out.append({"account_id": acct_id, **r})
+                    if r.get("action") == "placed":     # a trade fired -> queue an email
+                        self.events.append({"account_id": acct_id, "root": root, **r})
             except Exception as e:
                 out.append({"account_id": acct_id, "error": str(e)})
         return out
@@ -360,11 +363,80 @@ async def engine_loop() -> None:
                                     bars_seen=_MANAGER.bars_seen, last_bar=_MANAGER.last_bar,
                                     actions=[a for a in actions if a.get("action") not in (None,)][-20:],
                                     ts=datetime.now(timezone.utc).isoformat())
+                # email the account owner for each trade that just fired (off the loop thread)
+                while _MANAGER.events:
+                    ev = _MANAGER.events.pop(0)
+                    await asyncio.get_event_loop().run_in_executor(None, notify_trade, ev)
             else:
                 _LAST_STATUS.update(running=False)
         except Exception as e:
             print("ORB LIVE ENGINE ERROR:", e)
         await asyncio.sleep(POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# trade email notifications ("Trade Triggered") — branded like every KhomaAPI email
+# ---------------------------------------------------------------------------
+_ROOT_NAME = {"MNQ": "NQ &middot; Micro Nasdaq-100", "M2K": "RTY &middot; Micro Russell 2000"}
+
+
+def notify_trade(ev: dict) -> None:
+    """Email the account owner a branded 'Trade Triggered' notice. Runs off the loop thread and
+    never raises out — a failed email must never affect trading."""
+    try:
+        main = _main()
+        con = _db()
+        row = con.execute(
+            "SELECT ba.account_name, u.email FROM broker_accounts ba JOIN users u ON u.id = ba.user_id "
+            "WHERE ba.account_id = ? LIMIT 1", (str(ev.get("account_id")),)).fetchone()
+        con.close()
+        d = dict(row) if row else {}
+        if not d.get("email"):
+            return
+        subject, heading, html = _trade_email(d.get("account_name") or "your account", ev)
+        main.send_branded_email(d["email"], subject, heading, html,
+                                button_label="Open KhomaVolume ORB",
+                                button_url="https://app.khomaapi.com/prop-engine")
+        print("ORB trade email sent ->", d["email"])
+    except Exception as e:
+        print("ORB trade email error:", e)
+
+
+def _fmt(x) -> str:
+    try:
+        return f"{float(x):,.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(x)
+
+
+def _trade_email(account_name: str, ev: dict):
+    """(subject, heading, message_html) for a trade-triggered email."""
+    root = ev.get("root", ""); side = str(ev.get("side", "")).upper(); qty = ev.get("qty", "")
+    plan = ev.get("plan")
+    entry, sl, tp = (getattr(plan, "entry_stop", None), getattr(plan, "sl_price", None),
+                     getattr(plan, "tp_price", None))
+    name = _ROOT_NAME.get(root, root)
+    color = "#0f8f45" if side == "LONG" else "#dc2626"
+    when = (_now_et().strftime("%I:%M %p ET").lstrip("0") + " &middot; "
+            + _now_et().strftime("%b %d").replace(" 0", " "))
+
+    def r(k, v):
+        return (f'<tr><td style="padding:9px 2px;color:#6b7280;font-size:13px;">{k}</td>'
+                f'<td style="padding:9px 2px;color:#111827;font-size:14px;font-weight:700;text-align:right;'
+                f'font-family:Arial;">{v}</td></tr>')
+    msg = (
+        f'<p style="margin:0 0 4px;">Your <b>KhomaVolume ORB</b> engine just triggered a trade on '
+        f'<b>{account_name}</b> &mdash; a decisive breakout fired and the order was placed automatically.</p>'
+        f'<div style="margin:20px 0;border:1px solid #e8eae9;border-radius:14px;overflow:hidden;">'
+        f'<div style="background:{color};padding:13px 18px;color:#fff;font-weight:800;font-size:15px;'
+        f'letter-spacing:.3px;">{side} &nbsp;&middot;&nbsp; {name}</div>'
+        f'<table width="100%" cellpadding="0" cellspacing="0" style="padding:4px 18px 12px;">'
+        f'{r("Contracts", f"{qty} {root}")}{r("Entry", _fmt(entry))}'
+        f'{r("Stop-loss", _fmt(sl))}{r("Take-profit", _fmt(tp))}{r("Triggered", when)}'
+        f'</table></div>'
+        f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.6;">You only receive this email '
+        f'when a trade fires — <b>no email means the engine took no trade.</b></p>')
+    return f"Trade Triggered - {side} {root} on {account_name}", "Trade Triggered", msg
 
 
 # ---------------------------------------------------------------------------
