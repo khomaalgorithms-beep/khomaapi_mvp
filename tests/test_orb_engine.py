@@ -59,8 +59,11 @@ class FakeAP:
         self.cfg = cfg
         self.bars = []
         self.backfilled = []
+        self.seeded = []
     def on_bar(self, root, bar):
         self.bars.append((root, bar)); return {"action": "seen", "root": root}
+    def seed_atr(self, root, ranges):
+        self.seeded.append((root, tuple(ranges)))
     def backfill(self, root, bars):
         self.backfilled.append((root, tuple(bars))); return {"root": root, "action": "backfill_ready"}
     def poll(self):
@@ -152,3 +155,24 @@ def test_run_backfills_once_per_root_then_cleared():
     assert [r for r, _ in made[2].backfilled] == ["MNQ"]
     assert any(a["action"] == "backfill_ready" for a in out)
     assert m.run_backfills(fetch) == []                        # needs_backfill cleared -> no-op
+
+
+def test_run_backfills_seeds_atr_once_per_root():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a", roots=("MNQ", "M2K")), _item(2, "a", roots=("MNQ",))])
+    rfetched = []
+    def fetch(root):
+        return [f"bar-{root}"]
+    def franges(root):
+        rfetched.append(root); return {"MNQ": [400.0, 420.0], "M2K": [30.0, 32.0]}[root]
+    m.run_backfills(fetch, franges)
+    assert sorted(set(rfetched)) == ["M2K", "MNQ"]             # one daily-range fetch per unique root
+    assert dict(made[1].seeded) == {"MNQ": (400.0, 420.0), "M2K": (30.0, 32.0)}
+    assert made[2].seeded == [("MNQ", (400.0, 420.0))]         # NQ-only account seeded only MNQ
+
+
+def test_run_backfills_without_ranges_skips_seeding():
+    m, made, feeds = _mgr()
+    m.sync([_item(1, "a")])
+    m.run_backfills(lambda r: [f"bar-{r}"])                    # no fetch_ranges -> ATR untouched
+    assert made[1].seeded == []

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 try:
@@ -85,6 +85,38 @@ def fetch_today_bars(api_key: str, exec_root: str, now=None) -> List[Bar]:
                        float(a["close"]), float(a.get("volume", 0) or 0)))
     out.sort(key=lambda b: b.dt)
     return out
+
+
+def fetch_daily_ranges(api_key: str, exec_root: str, now=None, days: int = 25) -> List[float]:
+    """Prior sessions' true ranges (excluding today) for the exec_root's data contract, via
+    Massive REST daily bars — seeds the rolling ATR so the OR-vs-ATR gate matches the backtest
+    from day one. Ascending (oldest first); [] on failure."""
+    import requests
+    now = now or datetime.now(_ET)
+    ticker = front_ticker(_DATA_ROOT.get(exec_root, exec_root), now.date())
+    start = (now.date() - timedelta(days=days + 12)).isoformat()   # pad for weekends/holidays
+    try:
+        r = requests.get(f"{REST_BASE}/futures/v1/aggs/{ticker}",
+                         params={"resolution": "1day", "window_start.gte": start,
+                                 "limit": days + 15, "apiKey": api_key}, timeout=20)
+        results = (r.json() or {}).get("results") or []
+    except Exception as e:
+        print("ORB MASSIVE daily-range error:", e)
+        return []
+    today = now.strftime("%Y-%m-%d")
+    ranges: List[float] = []
+    prev_close = None
+    for a in sorted(results, key=lambda x: x.get("window_start", 0)):
+        try:
+            hi, lo, cl = float(a["high"]), float(a["low"]), float(a["close"])
+        except (KeyError, TypeError):
+            continue
+        if str(a.get("session_end_date", "")) >= today:           # only PRIOR sessions
+            continue
+        tr = (hi - lo) if prev_close is None else max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        ranges.append(round(tr, 2))
+        prev_close = cl
+    return ranges
 
 
 def am_to_bar(msg: dict) -> Optional[Bar]:

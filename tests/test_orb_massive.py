@@ -3,7 +3,8 @@ detection, ticker/subscription mapping, and the dispatch that routes a ticker to
 from datetime import date, datetime, timezone
 
 from app.orb_massive import (am_to_bar, parse_frames, status_of, front_ticker,
-                            subscriptions_for, MassiveFeed)
+                            subscriptions_for, MassiveFeed, fetch_daily_ranges,
+                            fetch_today_bars)
 from app.orb_selective import Bar
 
 
@@ -59,3 +60,56 @@ def test_dispatch_survives_bad_callback():
         raise RuntimeError("x")
     feed = MassiveFeed(get_key=lambda: "k", subscriptions={"NQZ6": "MNQ"}, on_bar=boom)
     feed._dispatch([_am()])                                    # must not raise
+
+
+# ---- REST backfill / ATR-seed fetchers (network monkeypatched) ----
+class _Resp:
+    def __init__(self, payload):
+        self._p = payload
+    def json(self):
+        return self._p
+
+
+def _patch_requests_get(monkeypatch, payload, captured):
+    import requests
+    def fake_get(url, params=None, timeout=None):
+        captured["url"] = url; captured["params"] = params or {}
+        return _Resp(payload)
+    monkeypatch.setattr(requests, "get", fake_get)
+
+
+def test_fetch_daily_ranges_computes_true_range_excluding_today(monkeypatch):
+    now = datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc)     # "today" = 2026-09-15
+    payload = {"results": [
+        {"high": 100, "low": 90, "close": 95, "session_end_date": "2026-09-11"},
+        {"high": 108, "low": 96, "close": 104, "session_end_date": "2026-09-12"},
+        {"high": 120, "low": 110, "close": 118, "session_end_date": "2026-09-15"},  # today -> excluded
+    ]}
+    cap = {}
+    _patch_requests_get(monkeypatch, payload, cap)
+    ranges = fetch_daily_ranges("KEY", "MNQ", now=now)
+    # day1 TR = 100-90 = 10; day2 TR = max(108-96, |108-95|, |96-95|) = 13; today dropped
+    assert ranges == [10.0, 13.0]
+    assert cap["params"]["resolution"] == "1day"
+
+
+def test_fetch_daily_ranges_empty_on_error(monkeypatch):
+    import requests
+    def boom(*a, **k):
+        raise RuntimeError("net down")
+    monkeypatch.setattr(requests, "get", boom)
+    assert fetch_daily_ranges("KEY", "MNQ") == []
+
+
+def test_fetch_today_bars_parses_ns_and_sorts_ascending(monkeypatch):
+    now = datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc)
+    base = int(datetime(2026, 9, 15, 13, 32, tzinfo=timezone.utc).timestamp() * 1e9)  # ns
+    payload = {"results": [                                     # DESCENDING as Massive returns
+        {"window_start": base + 60_000_000_000, "open": 2, "high": 3, "low": 1, "close": 2, "volume": 5},
+        {"window_start": base, "open": 1, "high": 2, "low": 0, "close": 1, "volume": 4},
+    ]}
+    cap = {}
+    _patch_requests_get(monkeypatch, payload, cap)
+    bars = fetch_today_bars("KEY", "MNQ", now=now)
+    assert [b.c for b in bars] == [1.0, 2.0]                    # sorted ascending by time
+    assert cap["params"]["resolution"] == "1min"

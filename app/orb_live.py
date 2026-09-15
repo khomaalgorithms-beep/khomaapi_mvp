@@ -319,6 +319,16 @@ class Autopilot:
         return {"root": root, "action": "placed", "side": sig.side, "qty": qty,
                 "order_id": oid, "plan": plan}
 
+    # ---- ATR seed (so the OR-vs-ATR gate matches the backtest from day one) -
+    def seed_atr(self, root: str, ranges: List[float]) -> None:
+        """Seed the rolling ATR from prior sessions' true ranges. Idempotent — only seeds an
+        empty ATR, so it runs once at startup and daily rolls take over afterward."""
+        a = self.atr.get(root)
+        if a is None or a.value() is not None:
+            return
+        for tr in ranges:
+            a.add_session_range(tr)
+
     # ---- restart-proof opening-range backfill ------------------------------
     def backfill(self, root: str, bars: List[Bar]) -> dict:
         """Seed today's already-elapsed 1-min bars (from REST) so the opening range is rebuilt

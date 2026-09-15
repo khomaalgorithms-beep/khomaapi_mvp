@@ -274,3 +274,23 @@ def test_backfill_ready_then_live_breakout_trades():
 def test_backfill_empty_is_safe():
     ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=FakeBroker())
     assert ap.backfill("MNQ", [])["action"] == "backfill_skip"
+
+
+# ---- ATR seeding from historical daily ranges ----
+def test_seed_atr_fills_empty_atr():
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=FakeBroker())
+    assert ap.atr["MNQ"].value() is None
+    ap.seed_atr("MNQ", [400.0, 420.0, 380.0])
+    assert ap.atr["MNQ"].value() == (400 + 420 + 380) / 3
+
+
+def test_seed_atr_is_idempotent_and_never_overwrites():
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=FakeBroker())
+    ap.seed_atr("MNQ", [400.0])
+    ap.seed_atr("MNQ", [999.0])                     # second seed is a no-op (ATR already primed)
+    assert ap.atr["MNQ"].value() == 400.0
+
+
+def test_seed_atr_unknown_root_is_safe():
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=FakeBroker())
+    ap.seed_atr("ZZZ", [1.0])                        # no such instrument -> no crash

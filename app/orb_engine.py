@@ -65,6 +65,13 @@ def _fetch_today_bars(root):
     return fetch_today_bars(key, root) if key else []
 
 
+def _fetch_daily_ranges(root):
+    """Prior sessions' true ranges for a root via Massive REST (to seed the rolling ATR)."""
+    from app.orb_massive import fetch_daily_ranges
+    key = _massive_key()
+    return fetch_daily_ranges(key, root) if key else []
+
+
 # ---------------------------------------------------------------------------
 # lazy access to main.py (avoids an import cycle; works across main.py versions)
 # ---------------------------------------------------------------------------
@@ -256,24 +263,32 @@ class EngineManager:
                 self._active[acct_id] = {"sig": c["sig"], "autopilot": ap, "needs_backfill": True}
         self._ensure_feed()
 
-    def run_backfills(self, fetch_bars) -> List[dict]:
-        """For each newly-armed autopilot, backfill today's elapsed bars per instrument so the
-        opening range survives a restart. One REST fetch per root, shared across accounts.
-        fetch_bars(root) -> [Bar]. Runs off the loop thread (network); never raises out."""
+    def run_backfills(self, fetch_bars, fetch_ranges=None) -> List[dict]:
+        """For each newly-armed autopilot: seed the ATR from prior daily ranges, then backfill
+        today's elapsed bars so the opening range survives a restart. One REST fetch per root,
+        shared across accounts. fetch_bars(root)->[Bar], fetch_ranges(root)->[float]. Runs off the
+        loop thread (network); never raises out."""
         pending = [(aid, st) for aid, st in self._active.items() if st.get("needs_backfill")]
         if not pending:
             return []
         roots = sorted({r for _, st in pending for r in st["autopilot"].cfg.instruments})
-        cache = {}
+        cache, rcache = {}, {}
         for r in roots:
             try:
                 cache[r] = fetch_bars(r) or []
             except Exception as e:
                 print("ORB backfill fetch error:", r, e); cache[r] = []
+            if fetch_ranges is not None:
+                try:
+                    rcache[r] = fetch_ranges(r) or []
+                except Exception as e:
+                    print("ORB atr fetch error:", r, e); rcache[r] = []
         out = []
         for aid, st in pending:
             for r in list(st["autopilot"].cfg.instruments):
                 try:
+                    if fetch_ranges is not None:
+                        st["autopilot"].seed_atr(r, rcache.get(r, []))   # seed ATR before the OR check
                     out.append({"account_id": aid, **st["autopilot"].backfill(r, cache.get(r, []))})
                 except Exception as e:
                     out.append({"account_id": aid, "root": r, "error": str(e)})
@@ -388,8 +403,9 @@ async def engine_loop() -> None:
             if is_leader:
                 configs = await asyncio.get_event_loop().run_in_executor(None, _plan_configs)
                 _MANAGER.sync(configs)
-                # backfill today's opening range for any newly-armed account (restart-proof)
-                bf = await asyncio.get_event_loop().run_in_executor(None, _MANAGER.run_backfills, _fetch_today_bars)
+                # seed ATR + backfill today's opening range for any newly-armed account (restart-proof)
+                bf = await asyncio.get_event_loop().run_in_executor(
+                    None, _MANAGER.run_backfills, _fetch_today_bars, _fetch_daily_ranges)
                 for a in bf:
                     if a.get("action") in ("backfill_ready", "backfill_missed"):
                         print("ORB backfill:", a)
