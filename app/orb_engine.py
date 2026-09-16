@@ -327,8 +327,6 @@ class EngineManager:
                 r = st["autopilot"].on_bar(root, bar)
                 if r:
                     out.append({"account_id": acct_id, **r})
-                    if r.get("action") == "placed":     # a trade fired -> queue an email
-                        self.events.append({"account_id": acct_id, "root": root, **r})
             except Exception as e:
                 out.append({"account_id": acct_id, "error": str(e)})
         return out
@@ -337,7 +335,13 @@ class EngineManager:
         out: List[dict] = []
         for acct_id, st in list(self._active.items()):
             try:
-                out.extend(st["autopilot"].poll())
+                res = st["autopilot"].poll()
+                out.extend(res)
+                for r in res:
+                    # email ONLY when a real position actually FILLS on the account — never on mere
+                    # order submission, so a rejected order sends no "Trade Triggered" email.
+                    if r.get("action") == "filled":
+                        self.events.append({"account_id": acct_id, "root": r.get("root"), **r})
             except Exception as e:
                 out.append({"account_id": acct_id, "error": str(e)})
         return out
@@ -466,8 +470,10 @@ def _trade_email(account_name: str, ev: dict):
     """(subject, heading, message_html) for a trade-triggered email."""
     root = ev.get("root", ""); side = str(ev.get("side", "")).upper(); qty = ev.get("qty", "")
     plan = ev.get("plan")
-    entry, sl, tp = (getattr(plan, "entry_stop", None), getattr(plan, "sl_price", None),
-                     getattr(plan, "tp_price", None))
+    entry = ev.get("entry")                              # actual fill price when known
+    if entry is None:
+        entry = getattr(plan, "entry_limit", None) or getattr(plan, "entry_stop", None)
+    sl, tp = getattr(plan, "sl_price", None), getattr(plan, "tp_price", None)
     name = _ROOT_NAME.get(root, root)
     color = "#0f8f45" if side == "LONG" else "#dc2626"
     when = (_now_et().strftime("%I:%M %p ET").lstrip("0") + " &middot; "
@@ -478,8 +484,8 @@ def _trade_email(account_name: str, ev: dict):
                 f'<td style="padding:9px 2px;color:#111827;font-size:14px;font-weight:700;text-align:right;'
                 f'font-family:Arial;">{v}</td></tr>')
     msg = (
-        f'<p style="margin:0 0 4px;">Your <b>KhomaVolume ORB</b> engine just triggered a trade on '
-        f'<b>{account_name}</b> &mdash; a decisive breakout fired and the order was placed automatically.</p>'
+        f'<p style="margin:0 0 4px;">Your <b>KhomaVolume ORB</b> engine just filled a trade on '
+        f'<b>{account_name}</b> &mdash; a decisive breakout fired and your position is now live at the broker.</p>'
         f'<div style="margin:20px 0;border:1px solid #e8eae9;border-radius:14px;overflow:hidden;">'
         f'<div style="background:{color};padding:13px 18px;color:#fff;font-weight:800;font-size:15px;'
         f'letter-spacing:.3px;">{side} &nbsp;&middot;&nbsp; {name}</div>'

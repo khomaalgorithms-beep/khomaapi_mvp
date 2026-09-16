@@ -224,6 +224,7 @@ class _DayState:
     bars: List[Bar] = field(default_factory=list)
     status: str = _IDLE
     signal: Optional[Signal] = None
+    plan: Optional[object] = None
     entry_order_id: Optional[object] = None
     oso_ids: List[object] = field(default_factory=list)
     was_filled: bool = False
@@ -305,16 +306,22 @@ class Autopilot:
         token = self._get_token()
         if not token:
             return {"root": root, "action": "error", "reason": "no token"}
-        resp = self._broker.place_stoplimit_bracket(
+        # MARKET entry + attached OSO bracket (stop-market SL + limit TP). The breakout is already
+        # CONFIRMED — the bar CLOSED beyond the level — so we enter at market immediately. A resting
+        # STOP entry at the breakout level would sit on the WRONG side of the market by the time it
+        # is placed (price has already passed it), and the broker rejects it. Market fills at the
+        # breakout and the bracket protects the fill the instant it opens (no naked window).
+        resp = self._broker.place_bracket_order(
             self.cfg.env, token, self.cfg.account_spec, self.cfg.account_id,
             plan.entry_action, self.cfg.instruments[root], qty,
-            plan.entry_stop, plan.entry_limit, plan.sl_price, plan.tp_price)
+            stop_price=plan.sl_price, limit_price=plan.tp_price)
         oid = resp.get("orderId") if isinstance(resp, dict) else None
         if oid is None:
             st.status = _DONE                    # don't retry a rejected entry; one shot/day
             return {"root": root, "action": "reject", "resp": resp, "plan": plan}
         st.status = _ARMED
         st.signal = sig
+        st.plan = plan
         st.entry_order_id = oid
         return {"root": root, "action": "placed", "side": sig.side, "qty": qty,
                 "order_id": oid, "plan": plan}
@@ -373,12 +380,14 @@ class Autopilot:
                 self._eod_flatten(root, st)
                 out.append({"root": root, "action": "eod"})
                 continue
-            net, _, _ = self._net_position(root, token)
+            net, price, _ = self._net_position(root, token)
             if net != 0:
                 st.was_filled = True
                 if st.status == _ARMED:
                     st.status = _LIVE
-                    out.append({"root": root, "action": "filled", "net": net})
+                    out.append({"root": root, "action": "filled", "net": net,
+                                "side": (st.signal.side if st.signal else ""),
+                                "qty": abs(net), "entry": price, "plan": st.plan})
             else:
                 if st.status == _LIVE and st.was_filled:
                     # we were in a position and now we're flat -> SL or TP closed it

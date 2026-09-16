@@ -96,6 +96,14 @@ class FakeBroker:
         self.versions = []
         self.contracts = {901: {"name": "MNQZ5"}}
 
+    def place_bracket_order(self, env, token, spec, acct, action, symbol, qty,
+                            stop_price=None, limit_price=None):
+        # MARKET entry + OSO bracket (the engine's real entry path). No stop trigger to be rejected.
+        self.place_calls.append(dict(action=action, symbol=symbol, qty=qty,
+                                     sl=stop_price, tp=limit_price, entry_type="market"))
+        oid = self.next_order_id; self.next_order_id += 1
+        return {"orderId": oid}
+
     def place_stoplimit_bracket(self, env, token, spec, acct, action, symbol, qty,
                                 es, el, sl, tp):
         self.place_calls.append(dict(action=action, symbol=symbol, qty=qty,
@@ -192,11 +200,27 @@ def test_zero_qty_skips():
 
 def test_rejected_entry_is_not_retried():
     fb = FakeBroker()
-    fb.place_stoplimit_bracket = lambda *a, **k: {"error": "rejected"}
+    fb.place_bracket_order = lambda *a, **k: {"error": "rejected"}
     ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
     bars = breakout_day() + [mk(10, 10, 20030, 20060, 20025, 20055, 400)]
     feed(ap, bars)
     assert ap._state["MNQ"].status == "DONE"
+
+
+def test_entry_is_market_bracket_not_invalid_stop():
+    # REGRESSION: a breakout that has already CLOSED beyond the OR must NOT be entered with a stop
+    # order at the breakout level — that stop sits on the wrong side of the market once the bar
+    # closed past it, and the broker rejects it (real incident 2026-09-16). We now enter at MARKET
+    # with the OSO bracket, which always fills at the breakout and carries no stop trigger.
+    fb = FakeBroker()
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
+    feed(ap, breakout_day())
+    assert len(fb.place_calls) == 1
+    call = fb.place_calls[0]
+    assert call.get("entry_type") == "market"       # market entry, not a resting stop-limit
+    assert "entry_stop" not in call                 # no stop trigger that could be rejected
+    assert call["action"] == "buy" and call["qty"] == 3
+    assert call["sl"] == 20025 - 30 and call["tp"] == 20025 + 75
 
 
 def test_poll_detects_fill_then_close():

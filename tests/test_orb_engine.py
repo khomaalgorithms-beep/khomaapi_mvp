@@ -176,3 +176,31 @@ def test_run_backfills_without_ranges_skips_seeding():
     m.sync([_item(1, "a")])
     m.run_backfills(lambda r: [f"bar-{r}"])                    # no fetch_ranges -> ATR untouched
     assert made[1].seeded == []
+
+
+def test_email_fires_on_fill_not_on_submission():
+    # REGRESSION (2026-09-16): the "Trade Triggered" email must fire only when a position actually
+    # FILLS on the account (poll -> filled), never on mere order submission (on_bar -> placed) —
+    # otherwise a rejected order emails a trade that does not exist.
+    class AP:
+        def __init__(self, cfg):
+            self.cfg = cfg
+        def on_bar(self, root, bar):
+            return {"root": root, "action": "placed", "side": "long", "plan": None}
+        def seed_atr(self, root, ranges):
+            pass
+        def backfill(self, root, bars):
+            return {"root": root, "action": "backfill_ready"}
+        def poll(self):
+            return [{"root": "MNQ", "action": "filled", "side": "long", "qty": 6,
+                     "entry": 20000.0, "plan": None}]
+    m = eng.EngineManager(feed_factory=lambda subs, on_bar: FakeFeed(subs, on_bar),
+                          autopilot_factory=lambda cfg, tp: AP(cfg), start_feed=True)
+    m.sync([_item(1, "a")])
+    from app.orb_selective import Bar
+    from datetime import datetime
+    m.on_bar("MNQ", Bar(datetime(2026, 1, 2, 9, 50), 1, 2, 0, 1, 5))
+    assert m.events == []                                      # submission alone queues NO email
+    m.poll()
+    assert len(m.events) == 1 and m.events[0]["action"] == "filled"   # a real fill DOES
+    assert m.events[0]["account_id"] == 1 and m.events[0]["root"] == "MNQ"
