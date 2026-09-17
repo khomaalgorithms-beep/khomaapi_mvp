@@ -204,3 +204,34 @@ def test_email_fires_on_fill_not_on_submission():
     m.poll()
     assert len(m.events) == 1 and m.events[0]["action"] == "filled"   # a real fill DOES
     assert m.events[0]["account_id"] == 1 and m.events[0]["root"] == "MNQ"
+
+
+# ---- copy-box bridge: copy-trading accounts trade the owner's ORB template ----
+def test_copy_config_rows_applies_template_uniformly():
+    templates = {18: {"mode": "eval", "acct_size": "150K", "preset": "cons", "asset": "both"}}
+    copy_accounts = [
+        {"account_pk": 1, "user_id": 18, "account_name": "A1", "env": "demo", "account_id": "111", "status": "connected"},
+        {"account_pk": 2, "user_id": 18, "account_name": "A2", "env": "demo", "account_id": "222", "status": "connected"},
+    ]
+    rows = eng._copy_config_rows(copy_accounts, templates)
+    assert len(rows) == 2
+    for r in rows:                                   # uniform: every box account inherits 150K/cons
+        assert (r["mode"], r["acct_size"], r["preset"], r["asset"]) == ("eval", "150K", "cons", "both")
+        assert r["enabled"] == 1 and r["source"] == "copy"
+    assert {r["account_pk"] for r in rows} == {1, 2}
+
+
+def test_copy_config_rows_skips_owner_without_template():
+    # a user with copy accounts but no ORB config -> nothing to copy, skipped (no surprise trades)
+    accts = [{"account_pk": 9, "user_id": 10, "account_name": "X", "env": "demo", "account_id": "999"}]
+    assert eng._copy_config_rows(accts, templates={}) == []
+
+
+def test_copy_config_rows_per_owner_templates():
+    templates = {18: {"mode": "eval", "acct_size": "150K", "preset": "cons", "asset": "both"},
+                 5:  {"mode": "eval", "acct_size": "50K", "preset": "aggr", "asset": "nq"}}
+    accts = [{"account_pk": 1, "user_id": 18, "account_name": "A", "env": "demo", "account_id": "1"},
+             {"account_pk": 2, "user_id": 5,  "account_name": "B", "env": "demo", "account_id": "2"}]
+    rows = {r["account_pk"]: r for r in eng._copy_config_rows(accts, templates)}
+    assert rows[1]["acct_size"] == "150K" and rows[1]["preset"] == "cons"
+    assert rows[2]["acct_size"] == "50K" and rows[2]["preset"] == "aggr" and rows[2]["asset"] == "nq"

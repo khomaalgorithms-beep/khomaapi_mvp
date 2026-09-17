@@ -170,6 +170,43 @@ def enabled_rows() -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def _copy_config_rows(copy_accounts: List[dict], templates: Dict[int, dict]) -> List[dict]:
+    """Pure: apply each owner's ORB template (the account size + preset they picked in the ORB
+    section) UNIFORMLY to every account in their Copy Trading box, so 'drop accounts in the box'
+    makes them all trade KhomaVolume ORB on those exact conditions. A copy account whose owner has
+    NOT set an ORB config yet is skipped (there is nothing to copy). Sizing is uniform by design —
+    group same-size accounts in a box; a smaller account in a larger-size box would be over-sized."""
+    out = []
+    for a in copy_accounts:
+        t = templates.get(a["user_id"])
+        if not t:
+            continue
+        out.append({"account_pk": a["account_pk"], "user_id": a["user_id"],
+                    "account_name": a["account_name"], "env": a["env"],
+                    "status": a.get("status", "connected"), "account_id": a["account_id"],
+                    "enabled": 1, "mode": t["mode"], "acct_size": t["acct_size"],
+                    "preset": t["preset"], "asset": t["asset"], "source": "copy"})
+    return out
+
+
+def copy_rows() -> List[dict]:
+    """Every Copy-Trading-box account (group_type='copy') whose owner has an ORB template config
+    AND master switch Running, as a config row using the owner's template applied uniformly."""
+    con = _db()
+    templates: Dict[int, dict] = {}
+    for r in con.execute("SELECT * FROM orb_autopilot WHERE enabled=1 ORDER BY updated_at ASC").fetchall():
+        d = dict(r)
+        templates[d["user_id"]] = d          # most-recently-updated enabled config = the template
+    accts = [dict(r) for r in con.execute("""
+        SELECT ba.id AS account_pk, ba.user_id, ba.account_name, ba.env, ba.status, ba.account_id
+        FROM broker_accounts ba JOIN users u ON u.id = ba.user_id
+        WHERE ba.status='connected' AND COALESCE(ba.group_type,'independent')='copy'
+              AND u.automation_status='Running'
+    """).fetchall()]
+    con.close()
+    return _copy_config_rows(accts, templates)
+
+
 def master_running(user_id: int) -> bool:
     """Is the owner's master automation switch Running? (The main-dashboard Start/Pause.)"""
     con = _db()
@@ -376,10 +413,17 @@ _LAST_STATUS: Dict[str, object] = {"running": False, "accounts": 0, "actions": [
 
 
 def _plan_configs() -> List[dict]:
-    """Build the config list for every enabled+connected account (needs a token per account)."""
+    """Config list for every account that should trade: accounts ARMED in the ORB section
+    (enabled_rows) PLUS every account in a Copy Trading box, which trades the owner's ORB template
+    conditions (copy_rows). Deduped by account — an armed account also in a box counts once."""
     out = []
-    for row in enabled_rows():
-        token = _fresh_token_for(row["account_pk"])
+    seen = set()
+    for row in list(enabled_rows()) + copy_rows():
+        pk = row["account_pk"]
+        if pk in seen:
+            continue
+        seen.add(pk)
+        token = _fresh_token_for(pk)
         if not token:
             continue
         cfg = build_account_config(row, token)
@@ -389,7 +433,7 @@ def _plan_configs() -> List[dict]:
         contracts = dict(cfg.instruments)
         qty = {r: cfg.qty.get(r, 0) for r in roots}
         out.append({"row": row, "cfg": cfg, "sig": config_signature(row, contracts, qty),
-                    "token_provider": (lambda pk=row["account_pk"]: _fresh_token_for(pk))})
+                    "token_provider": (lambda pk=pk: _fresh_token_for(pk))})
     return out
 
 
