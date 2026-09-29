@@ -572,6 +572,10 @@ def install(app) -> None:
         user = main.require_user(request)
         if not user:
             return RedirectResponse("/login", status_code=302)
+        # KhomaVolume ORB is a separate product — hide the control room from anyone who isn't a
+        # comp account or an ORB-plan buyer (they don't see the nav link either).
+        if not main.has_orb_access(user):
+            return RedirectResponse("/dashboard", status_code=302)
         accounts = _connected_accounts(user["id"])
         cfgs = {a["account_id"]: get_config(user["id"], a["account_id"]) for a in accounts}
         body = _render_dashboard(accounts, cfgs)
@@ -587,6 +591,9 @@ def install(app) -> None:
         user = main.require_user(request)
         if not user:
             return JSONResponse({"ok": False, "error": "login required"}, status_code=401)
+        # Hard block: only comp accounts / ORB-plan buyers may arm KhomaVolume ORB.
+        if not main.has_orb_access(user):
+            return JSONResponse({"ok": False, "error": "KhomaVolume ORB is not included in your plan"}, status_code=403)
         form = await request.form()
         account_id = str(form.get("account_id") or "")
         acct = next((a for a in _connected_accounts(user["id"]) if a["account_id"] == account_id), None)

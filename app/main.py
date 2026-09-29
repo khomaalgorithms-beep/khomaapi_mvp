@@ -991,6 +991,22 @@ def has_comp_access(email) -> bool:
     return bool(email) and str(email).lower().strip() in comp_access_emails()
 
 
+# KhomaVolume ORB is a SEPARATE product: the ORB section (/prop-engine) is visible and usable
+# ONLY to owner-granted comp accounts or buyers of the dedicated ORB Whop plan(s). No standard
+# platform plan includes it. Plan ids come from WHOP_PLAN_ORB (comma-separated) with a safe
+# default so the gate still holds if the env var is ever unset.
+_ORB_PLAN_IDS = {p.strip() for p in (os.getenv("WHOP_PLAN_ORB") or "plan_YVvwKsS4DffkB").split(",") if p.strip()}
+
+
+def has_orb_access(user) -> bool:
+    """True only for comp accounts or ORB-plan buyers — everyone else cannot see or arm ORB."""
+    if user is None:
+        return False
+    if has_comp_access(_ucol(user, "email")):
+        return True
+    return str(_ucol(user, "whop_plan_id") or "").strip() in _ORB_PLAN_IDS
+
+
 def user_entitlements(user) -> Entitlement:
     """Resolve a user's entitlement. An owner-granted comp email always gets full (Elite)
     access. Otherwise Whop is authoritative: if the account is linked to a membership, only
@@ -5304,7 +5320,7 @@ document.addEventListener("click", function(event) {{
 </div><div><h1>KhomaAPI</h1><small>Execution Infrastructure</small></div></div>
   <div class="nav">
     {nav_item(active,'dashboard','/dashboard','⌁','Dashboard')}
-    {nav_item(active,'prop','/prop-engine','▲','KhomaVolume ORB')}
+    {nav_item(active,'prop','/prop-engine','▲','KhomaVolume ORB') if has_orb_access(user) else ''}
     {nav_item(active,'broker','/broker','◇','Broker Connect')}
     {nav_item(active,'webhooks','/webhooks','⌘','Webhooks')}
     {nav_item(active,'logs','/logs','▥','Trade Logs')}
