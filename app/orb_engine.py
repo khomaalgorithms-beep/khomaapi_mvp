@@ -645,13 +645,13 @@ def _send_health_email(main, user) -> bool:
         # Armed for the algo but no connected broker account found — tell them to reconnect.
         subject = "⚠️ KhomaVolume ORB - Reconnect Your Account"
         heading = "Reconnect your broker to resume the algo"
-        msg = ('<p style="margin:0 0 12px;color:#cdd8ef;line-height:1.6;">Your KhomaVolume ORB is set '
+        msg = ('<p style="margin:0 0 12px;color:#4b5563;line-height:1.6;">Your KhomaVolume ORB is set '
                'up, but this morning we could <b>not find a connected broker account</b> on your profile. '
                'The algo cannot trade until a broker account is connected.</p>'
-               '<div style="margin:14px 0;padding:12px 14px;background:#3a1414;border:1px solid #7f1d1d;'
-               'border-radius:8px;color:#fecaca;font-size:14px;line-height:1.6;">'
+               '<div style="margin:14px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;'
+               'border-radius:8px;color:#991b1b;font-size:14px;line-height:1.6;">'
                'Open KhomaAPI and <b>reconnect your broker</b> so your account is armed and active again.</div>'
-               f'<p style="margin:14px 0 0;color:#8296b6;font-size:13px;line-height:1.6;">This is your '
+               f'<p style="margin:14px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">This is your '
                f'automatic daily status email from KhomaAPI, sent every morning at {_HEALTH_HOUR_ET}:00 AM ET.</p>')
         return main.send_branded_email(email, subject, heading, msg,
                                        "Reconnect Broker", f"{_APP_URL}/broker", heading)
@@ -665,10 +665,10 @@ def _send_health_email(main, user) -> bool:
     for name, good, detail in lines:
         color = "#16a34a" if good else "#dc2626"
         mark = "&#9989;" if good else "&#9888;&#65039;"
-        row_html += (f'<tr><td style="padding:9px 12px;border-bottom:1px solid #23304a;font-size:14px;">'
+        row_html += (f'<tr><td style="padding:9px 12px;border-bottom:1px solid #eef0ef;font-size:14px;">'
                      f'<span style="color:{color};">{mark}</span> '
-                     f'<b style="color:#e5edff;">{esc(name)}</b>'
-                     f'<span style="color:#9fb0cc;"> &mdash; {esc(detail)}</span></td></tr>')
+                     f'<b style="color:#111827;">{esc(name)}</b>'
+                     f'<span style="color:#6b7280;"> &mdash; {esc(detail)}</span></td></tr>')
 
     if ok:
         subject = "✅ KhomaVolume ORB - Daily Check: Armed & Active"
@@ -686,12 +686,12 @@ def _send_health_email(main, user) -> bool:
             fixes.append("Your automation is <b>PAUSED</b> - open KhomaAPI and press <b>Start</b>.")
         if any(not g for _, g, _ in lines):
             fixes.append("Reconnect any <b>disconnected/expired</b> broker account, or set a preset on any <b>unconfigured</b> one.")
-        note = ('<div style="margin:14px 0;padding:12px 14px;background:#3a1414;border:1px solid #7f1d1d;'
-                'border-radius:8px;color:#fecaca;font-size:14px;line-height:1.6;">' + "<br>".join(fixes) + "</div>")
+        note = ('<div style="margin:14px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;'
+                'border-radius:8px;color:#991b1b;font-size:14px;line-height:1.6;">' + "<br>".join(fixes) + "</div>")
 
-    msg = (f'<p style="margin:0 0 12px;color:#cdd8ef;line-height:1.6;">{intro}</p>{note}'
+    msg = (f'<p style="margin:0 0 12px;color:#4b5563;line-height:1.6;">{intro}</p>{note}'
            f'<table style="width:100%;border-collapse:collapse;margin:6px 0 4px;">{row_html}</table>'
-           f'<p style="margin:14px 0 0;color:#8296b6;font-size:13px;line-height:1.6;">'
+           f'<p style="margin:14px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">'
            f'This is your automatic daily status email from KhomaAPI, sent every morning at '
            f'{_HEALTH_HOUR_ET}:00 AM ET so you always know your accounts are armed and connected.</p>')
     text = heading + "\n\n" + "\n".join(
