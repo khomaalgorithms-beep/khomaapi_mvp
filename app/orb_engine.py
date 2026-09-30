@@ -554,6 +554,188 @@ def _connected_accounts(user_id: int) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Daily morning health email — 9:00 AM ET to EVERY client running the algo.
+# Confirms each account is ARMED + CONNECTED + automation Running, and ALERTS on
+# anything disconnected, paused, unconfigured, or whose broker link has expired.
+# Leader-only; sent once per day (guard table so restarts never double-send).
+# ---------------------------------------------------------------------------
+_HEALTH_HOUR_ET = int(__import__("os").getenv("ORB_HEALTH_HOUR_ET", "9"))
+_APP_URL = __import__("os").getenv("APP_BASE_URL", "https://app.khomaapi.com")
+
+
+def _ensure_health_table() -> None:
+    con = _db()
+    con.execute("CREATE TABLE IF NOT EXISTS morning_health_sent("
+                "date TEXT PRIMARY KEY, sent_at TEXT, recipients INTEGER)")
+    con.commit(); con.close()
+
+
+def _algo_users() -> List[dict]:
+    """Every client running the algo: has >=1 armed ORB config OR an account in the Copy box.
+    Returned regardless of current health — we WANT to reach the disconnected/paused ones."""
+    con = _db()
+    rows = con.execute(
+        "SELECT DISTINCT u.* FROM users u "
+        "WHERE EXISTS(SELECT 1 FROM orb_autopilot o WHERE o.user_id=u.id AND o.enabled=1) "
+        "   OR EXISTS(SELECT 1 FROM broker_accounts b WHERE b.user_id=u.id "
+        "             AND COALESCE(b.group_type,'independent')='copy')").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _algo_accounts(user_id: int) -> List[dict]:
+    """The user's accounts the algo is meant to run (armed OR in the Copy box), with status."""
+    con = _db()
+    rows = con.execute(
+        "SELECT ba.id AS pk, ba.account_id, ba.account_name, ba.status, "
+        "       COALESCE(ba.group_type,'independent') AS grp, "
+        "       COALESCE(ap.enabled,0) AS armed, ap.acct_size, ap.preset "
+        "FROM broker_accounts ba "
+        "LEFT JOIN orb_autopilot ap ON ap.account_pk=ba.id AND ap.user_id=ba.user_id "
+        "WHERE ba.user_id=? AND (COALESCE(ap.enabled,0)=1 "
+        "      OR COALESCE(ba.group_type,'independent')='copy')", (user_id,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _health_rows(user) -> tuple:
+    """(lines[(name, ok, detail)], issues[], automation_running). Checks connected + broker
+    token + armed for each of the user's algo accounts."""
+    running = (user.get("automation_status") == "Running")
+    accts = _algo_accounts(user["id"])
+    has_template = any(a.get("armed") for a in accts)
+    lines, issues = [], []
+    for a in accts:
+        name = a.get("account_name") or str(a.get("account_id"))
+        connected = (a.get("status") == "connected")
+        armed = bool(a.get("armed")) or (a.get("grp") == "copy" and has_template)
+        token_ok = True
+        if connected:
+            try:
+                token_ok = bool(_fresh_token_for(a["pk"]))
+            except Exception:
+                token_ok = True  # never raise a false alarm on a transient check error
+        if not connected:
+            lines.append((name, False, "broker DISCONNECTED - reconnect it")); issues.append(name)
+        elif not token_ok:
+            lines.append((name, False, "connection expired - reconnect your broker")); issues.append(name)
+        elif not armed:
+            lines.append((name, False, "no ORB preset set - pick account size + preset")); issues.append(name)
+        else:
+            size = f" - {a.get('acct_size')}/{a.get('preset')}" if a.get("acct_size") else ""
+            lines.append((name, True, f"Armed & Connected{size}"))
+    return lines, issues, running
+
+
+def _send_health_email(main, user) -> bool:
+    import re as _re
+    email = user.get("email")
+    if not email:
+        return False
+    # Only email clients who are actually entitled — active subscription or comp access.
+    # (Canceled / dormant accounts are not nagged.)
+    try:
+        if not main.user_entitlements(user).active:
+            return False
+    except Exception:
+        pass
+    lines, issues, running = _health_rows(user)
+    if not lines:
+        # Armed for the algo but no connected broker account found — tell them to reconnect.
+        subject = "⚠️ KhomaVolume ORB - Reconnect Your Account"
+        heading = "Reconnect your broker to resume the algo"
+        msg = ('<p style="margin:0 0 12px;color:#cdd8ef;line-height:1.6;">Your KhomaVolume ORB is set '
+               'up, but this morning we could <b>not find a connected broker account</b> on your profile. '
+               'The algo cannot trade until a broker account is connected.</p>'
+               '<div style="margin:14px 0;padding:12px 14px;background:#3a1414;border:1px solid #7f1d1d;'
+               'border-radius:8px;color:#fecaca;font-size:14px;line-height:1.6;">'
+               'Open KhomaAPI and <b>reconnect your broker</b> so your account is armed and active again.</div>'
+               f'<p style="margin:14px 0 0;color:#8296b6;font-size:13px;line-height:1.6;">This is your '
+               f'automatic daily status email from KhomaAPI, sent every morning at {_HEALTH_HOUR_ET}:00 AM ET.</p>')
+        return main.send_branded_email(email, subject, heading, msg,
+                                       "Reconnect Broker", f"{_APP_URL}/broker", heading)
+    if not running:
+        issues.append("automation")
+    ok = (not issues)
+
+    def esc(s):
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    row_html = ""
+    for name, good, detail in lines:
+        color = "#16a34a" if good else "#dc2626"
+        mark = "&#9989;" if good else "&#9888;&#65039;"
+        row_html += (f'<tr><td style="padding:9px 12px;border-bottom:1px solid #23304a;font-size:14px;">'
+                     f'<span style="color:{color};">{mark}</span> '
+                     f'<b style="color:#e5edff;">{esc(name)}</b>'
+                     f'<span style="color:#9fb0cc;"> &mdash; {esc(detail)}</span></td></tr>')
+
+    if ok:
+        subject = "✅ KhomaVolume ORB - Daily Check: Armed & Active"
+        heading = "Good morning - your algo is armed and running"
+        intro = ("Your daily KhomaAPI status check is complete. Every account below is "
+                 "<b>connected, armed, and set to trade</b> today. No action needed.")
+        note = ""
+    else:
+        subject = "⚠️ KhomaVolume ORB - Action Needed on Your Account"
+        heading = "Action needed to keep your algo running"
+        intro = ("Your daily KhomaAPI status check found something that needs attention "
+                 "<b>before the algo can trade today</b>. Please review the item(s) marked below.")
+        fixes = []
+        if not running:
+            fixes.append("Your automation is <b>PAUSED</b> - open KhomaAPI and press <b>Start</b>.")
+        if any(not g for _, g, _ in lines):
+            fixes.append("Reconnect any <b>disconnected/expired</b> broker account, or set a preset on any <b>unconfigured</b> one.")
+        note = ('<div style="margin:14px 0;padding:12px 14px;background:#3a1414;border:1px solid #7f1d1d;'
+                'border-radius:8px;color:#fecaca;font-size:14px;line-height:1.6;">' + "<br>".join(fixes) + "</div>")
+
+    msg = (f'<p style="margin:0 0 12px;color:#cdd8ef;line-height:1.6;">{intro}</p>{note}'
+           f'<table style="width:100%;border-collapse:collapse;margin:6px 0 4px;">{row_html}</table>'
+           f'<p style="margin:14px 0 0;color:#8296b6;font-size:13px;line-height:1.6;">'
+           f'This is your automatic daily status email from KhomaAPI, sent every morning at '
+           f'{_HEALTH_HOUR_ET}:00 AM ET so you always know your accounts are armed and connected.</p>')
+    text = heading + "\n\n" + "\n".join(
+        f"{'OK' if g else 'ACTION'}: {n} - {_re.sub('<[^>]+>', '', d)}" for n, g, d in lines)
+    return main.send_branded_email(email, subject, heading, msg,
+                                   "Open KhomaAPI", f"{_APP_URL}/prop-engine", text)
+
+
+def _run_morning_health(today: str) -> None:
+    con = _db()
+    if con.execute("SELECT 1 FROM morning_health_sent WHERE date=?", (today,)).fetchone():
+        con.close(); return                       # already sent today
+    con.execute("INSERT INTO morning_health_sent(date, sent_at, recipients) VALUES(?,?,?)",
+                (today, datetime.now(timezone.utc).isoformat(), 0))
+    con.commit(); con.close()
+    main = _main(); users = _algo_users(); sent = 0
+    for u in users:
+        try:
+            if _send_health_email(main, u):
+                sent += 1
+        except Exception as e:
+            print("morning health email error for", u.get("email"), ":", e)
+    con = _db()
+    con.execute("UPDATE morning_health_sent SET recipients=? WHERE date=?", (sent, today))
+    con.commit(); con.close()
+    print(f"MORNING HEALTH: emailed {sent}/{len(users)} clients for {today}")
+
+
+async def morning_health_loop() -> None:
+    _ensure_health_table()
+    loop = asyncio.get_event_loop()
+    print("MORNING HEALTH EMAIL loop started - %d:00 ET daily to every armed client" % _HEALTH_HOUR_ET)
+    while True:
+        try:
+            await asyncio.sleep(300)              # re-check every 5 minutes
+            if not await loop.run_in_executor(None, _main().try_become_leader):
+                continue                          # not the worker instance
+            now = _now_et()
+            if now.hour == _HEALTH_HOUR_ET and now.minute < 20:   # 9:00-9:19 ET window
+                await loop.run_in_executor(None, _run_morning_health, now.strftime("%Y-%m-%d"))
+        except Exception as e:
+            print("morning health loop error:", e)
+
+
 def install(app) -> None:
     """Wire the engine into a FastAPI app: create the table, register the background loop on
     startup, and add the control routes. Call ONCE from main.py after `app` is created."""
@@ -561,10 +743,12 @@ def install(app) -> None:
     from fastapi.responses import HTMLResponse, JSONResponse
 
     ensure_table()
+    _ensure_health_table()
 
     @app.on_event("startup")
     async def _orb_live_startup():
         asyncio.create_task(engine_loop())
+        asyncio.create_task(morning_health_loop())
 
     @app.get("/prop-engine", response_class=HTMLResponse)
     def prop_engine_page(request: Request):
