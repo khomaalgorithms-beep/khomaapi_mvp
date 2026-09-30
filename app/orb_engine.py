@@ -562,12 +562,22 @@ def _connected_accounts(user_id: int) -> List[dict]:
 # ---------------------------------------------------------------------------
 _HEALTH_HOUR_ET = int(__import__("os").getenv("ORB_HEALTH_HOUR_ET", "9"))
 _APP_URL = __import__("os").getenv("APP_BASE_URL", "https://app.khomaapi.com")
+# Per-client send-hour overrides (ET, 24h clock). Default is _HEALTH_HOUR_ET (9 AM). Nandan's two
+# KhomaAPI accounts get their health email at 20:00 (8 PM ET) instead of the morning.
+_HEALTH_HOUR_OVERRIDES = {"n@idealstor.com": 20, "narora@idealstor.com": 20}
+
+
+def _health_hour_for(email) -> int:
+    return _HEALTH_HOUR_OVERRIDES.get((email or "").lower().strip(), _HEALTH_HOUR_ET)
 
 
 def _ensure_health_table() -> None:
     con = _db()
     con.execute("CREATE TABLE IF NOT EXISTS morning_health_sent("
                 "date TEXT PRIMARY KEY, sent_at TEXT, recipients INTEGER)")
+    # Per-(date, user) log so each client is emailed exactly once/day AT THEIR OWN hour.
+    con.execute("CREATE TABLE IF NOT EXISTS orb_health_log("
+                "date TEXT, user_id INTEGER, sent_at TEXT, PRIMARY KEY(date, user_id))")
     con.commit(); con.close()
 
 
@@ -640,19 +650,22 @@ def _send_health_email(main, user) -> bool:
             return False
     except Exception:
         pass
+    # This client's own send-hour, as a friendly label for the footer ("9:00 AM ET" / "8:00 PM ET").
+    _hh = _health_hour_for(email)
+    _when = f"{((_hh - 1) % 12) + 1}:00 {'AM' if _hh < 12 else 'PM'} ET"
     lines, issues, running = _health_rows(user)
     if not lines:
         # Armed for the algo but no connected broker account found — tell them to reconnect.
         subject = "⚠️ KhomaVolume ORB - Reconnect Your Account"
         heading = "Reconnect your broker to resume the algo"
         msg = ('<p style="margin:0 0 12px;color:#4b5563;line-height:1.6;">Your KhomaVolume ORB is set '
-               'up, but this morning we could <b>not find a connected broker account</b> on your profile. '
+               'up, but we could <b>not find a connected broker account</b> on your profile. '
                'The algo cannot trade until a broker account is connected.</p>'
                '<div style="margin:14px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;'
                'border-radius:8px;color:#991b1b;font-size:14px;line-height:1.6;">'
                'Open KhomaAPI and <b>reconnect your broker</b> so your account is armed and active again.</div>'
                f'<p style="margin:14px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">This is your '
-               f'automatic daily status email from KhomaAPI, sent every morning at {_HEALTH_HOUR_ET}:00 AM ET.</p>')
+               f'automatic daily status email from KhomaAPI, sent every day at {_when}.</p>')
         return main.send_branded_email(email, subject, heading, msg,
                                        "Reconnect Broker", f"{_APP_URL}/broker", heading)
     if not running:
@@ -692,46 +705,49 @@ def _send_health_email(main, user) -> bool:
     msg = (f'<p style="margin:0 0 12px;color:#4b5563;line-height:1.6;">{intro}</p>{note}'
            f'<table style="width:100%;border-collapse:collapse;margin:6px 0 4px;">{row_html}</table>'
            f'<p style="margin:14px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">'
-           f'This is your automatic daily status email from KhomaAPI, sent every morning at '
-           f'{_HEALTH_HOUR_ET}:00 AM ET so you always know your accounts are armed and connected.</p>')
+           f'This is your automatic daily status email from KhomaAPI, sent every day at '
+           f'{_when} so you always know your accounts are armed and connected.</p>')
     text = heading + "\n\n" + "\n".join(
         f"{'OK' if g else 'ACTION'}: {n} - {_re.sub('<[^>]+>', '', d)}" for n, g, d in lines)
     return main.send_branded_email(email, subject, heading, msg,
                                    "Open KhomaAPI", f"{_APP_URL}/prop-engine", text)
 
 
-def _run_morning_health(today: str) -> None:
-    con = _db()
-    if con.execute("SELECT 1 FROM morning_health_sent WHERE date=?", (today,)).fetchone():
-        con.close(); return                       # already sent today
-    con.execute("INSERT INTO morning_health_sent(date, sent_at, recipients) VALUES(?,?,?)",
-                (today, datetime.now(timezone.utc).isoformat(), 0))
-    con.commit(); con.close()
-    main = _main(); users = _algo_users(); sent = 0
+def _run_morning_health(today: str, hour: int) -> None:
+    """Email each client whose OWN send-hour == `hour` and who hasn't been emailed today. Per-user
+    guard (orb_health_log) => everyone gets exactly one email/day, each at their own configured time."""
+    main = _main(); users = _algo_users(); sent = 0; due = 0
     for u in users:
+        if _health_hour_for(u.get("email")) != hour:
+            continue                              # not this client's send-hour
+        due += 1
+        con = _db()
+        if con.execute("SELECT 1 FROM orb_health_log WHERE date=? AND user_id=?", (today, u["id"])).fetchone():
+            con.close(); continue                 # already emailed this client today
+        con.execute("INSERT INTO orb_health_log(date, user_id, sent_at) VALUES(?,?,?)",
+                    (today, u["id"], datetime.now(timezone.utc).isoformat()))
+        con.commit(); con.close()
         try:
             if _send_health_email(main, u):
                 sent += 1
         except Exception as e:
             print("morning health email error for", u.get("email"), ":", e)
-    con = _db()
-    con.execute("UPDATE morning_health_sent SET recipients=? WHERE date=?", (sent, today))
-    con.commit(); con.close()
-    print(f"MORNING HEALTH: emailed {sent}/{len(users)} clients for {today}")
+    if due:
+        print(f"MORNING HEALTH: hour {hour} ET — emailed {sent}/{due} due clients for {today}")
 
 
 async def morning_health_loop() -> None:
     _ensure_health_table()
     loop = asyncio.get_event_loop()
-    print("MORNING HEALTH EMAIL loop started - %d:00 ET daily to every armed client" % _HEALTH_HOUR_ET)
+    print("HEALTH EMAIL loop started - default %d:00 ET; overrides %s" % (_HEALTH_HOUR_ET, _HEALTH_HOUR_OVERRIDES))
     while True:
         try:
             await asyncio.sleep(300)              # re-check every 5 minutes
             if not await loop.run_in_executor(None, _main().try_become_leader):
                 continue                          # not the worker instance
             now = _now_et()
-            if now.hour == _HEALTH_HOUR_ET and now.minute < 20:   # 9:00-9:19 ET window
-                await loop.run_in_executor(None, _run_morning_health, now.strftime("%Y-%m-%d"))
+            # each tick, send any client whose configured hour == the current hour (per-user once/day)
+            await loop.run_in_executor(None, _run_morning_health, now.strftime("%Y-%m-%d"), now.hour)
         except Exception as e:
             print("morning health loop error:", e)
 
