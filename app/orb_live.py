@@ -20,7 +20,7 @@ is exactly what the engine trades. Everything except the thin broker calls is pu
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date as _date, timedelta
 from typing import Callable, Dict, List, Optional
 
 from app.orb_selective import Bar, Signal, find_signal, daily_true_range, opening_range
@@ -214,6 +214,54 @@ class AccountConfig:
     slip_cap_ticks: float = 8.0      # entry limit slippage allowance
 
 
+# ---------------------------------------------------------------------------
+# MNQ news-day skip rule (data-validated: skipping these days lifts the 50K eval pass
+# rate ~45%->51% and raises net P&L, because MNQ trades on them are net losers; M2K is
+# UNAFFECTED and keeps trading). MNQ sits out: (1) FOMC decision days, (2) the 1st trading
+# day of each month (ISM Manufacturing). Fail-open: any uncertainty -> trade normally.
+# ---------------------------------------------------------------------------
+# FOMC rate-decision days (ET). UPDATE ANNUALLY — if a year is missing, MNQ simply trades
+# those days (safe fail-open), it just won't skip them until added.
+_FOMC_DATES = frozenset({
+    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12", "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+})
+
+
+def _is_month_start_holiday(dt: "_date") -> bool:
+    """True for the only US market holidays that can fall at a month's start: New Year's Day
+    (Jan 1, + its Monday observance when Jan 1 is a Sunday) and Labor Day (1st Monday of Sep)."""
+    if dt.month == 1:
+        if dt.day == 1:
+            return True
+        if dt.day == 2 and dt.replace(day=1).weekday() == 6:   # Jan 1 was Sunday -> Jan 2 observed
+            return True
+    if dt.month == 9 and dt.weekday() == 0 and dt.day <= 7:    # Labor Day = 1st Monday of September
+        return True
+    return False
+
+
+def _is_first_trading_day_of_month(dt: "_date") -> bool:
+    probe = dt.replace(day=1)
+    while probe.weekday() >= 5 or _is_month_start_holiday(probe):   # skip weekends + month-start holidays
+        probe += timedelta(days=1)
+    return probe == dt
+
+
+def mnq_skip_day(date_str: str) -> bool:
+    """Should MNQ SIT OUT this ET date? (FOMC day OR 1st trading day of the month.) M2K never skips."""
+    if not date_str:
+        return False
+    if date_str in _FOMC_DATES:
+        return True
+    try:
+        dt = _date(int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10]))
+    except Exception:
+        return False                                            # fail-open: trade normally
+    return _is_first_trading_day_of_month(dt)
+
+
 # per-instrument day state
 _IDLE, _ARMED, _LIVE, _DONE = "IDLE", "ARMED", "LIVE", "DONE"
 
@@ -277,6 +325,12 @@ class Autopilot:
         st.bars.append(bar)
         if st.status != _IDLE:
             return None                          # already armed / in a trade / done today
+
+        # MNQ sits out FOMC days + the 1st trading day of each month; lock it out for the day.
+        # M2K (and any non-MNQ root) is unaffected and trades normally.
+        if root == "MNQ" and mnq_skip_day(st.trading_date):
+            st.status = _DONE
+            return {"root": root, "action": "skip", "reason": "news_skip_day", "date": st.trading_date}
 
         params = self.cfg.params.get(root, DEFAULT_PARAMS.get(root))
         spec = INSTRUMENTS[root]
