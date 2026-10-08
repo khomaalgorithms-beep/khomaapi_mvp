@@ -416,6 +416,59 @@ def send_email(to_email, subject, body, html=None):
     return False
 
 
+@app.get("/debug/_orb_blast_x7k2p9")
+def _orb_blast_x7k2p9(key: str = ""):
+    """TEMPORARY one-shot: send the honest ORB performance-update email to the ORB client list.
+    Gated by a random key; this endpoint is removed from the codebase immediately after use."""
+    if key != "Qm9Zx7Lp4Kt2Wv":
+        return {"error": "forbidden"}
+    recipients = [
+        "amar.sgnm@gmail.com", "apattersonlifeagency.sfg@gmail.com",
+        "mark.sargent@eatsleepgrindrepeat.com", "narora@idealstor.com",
+        "na@idealstor.com", "danielginther2@gmail.com", "armirol@gmail.com",
+        "n@idealstor.com", "davidoclarko561@gmail.com",
+    ]
+    subject = "An honest update on your KhomaVolume ORB performance"
+    body = (
+        "Hi there,\n\n"
+        "I want to give you a straight update on the KhomaVolume ORB software.\n\n"
+        "The last few weeks have been a rough stretch for the strategy. Results across our "
+        "clients have been mixed — some accounts are still net positive, others are in a "
+        "drawdown. I'm writing to everyone because you deserve to know exactly what's going on, "
+        "not a spin on it.\n\n"
+        "That rough patch prompted me to re-validate the entire engine from scratch — on real "
+        "NQ and Russell data going back to 2019, this time with realistic fills instead of "
+        "idealized ones. Here's what I found, plainly:\n\n"
+        "- The strategy is still profitable over the long run, net positive across 7+ years of data.\n"
+        "- But the real edge is more modest than the numbers we originally shared. Those assumed "
+        "near-perfect execution. With real-world fills, the win rate is lower and losing stretches "
+        "hit harder — especially on the Aggressive and larger-size settings.\n"
+        "- This is normal for a real trading edge, but I'd rather you have honest expectations than "
+        "be caught off guard.\n\n"
+        "What this means for you:\n"
+        "- Your setup and the system itself don't change. You don't need to do anything.\n"
+        "- We're updating how the engine enters trades to fix the single biggest drag on real "
+        "performance (entry slippage). It's an execution improvement, not a change to the strategy "
+        "you signed up for.\n"
+        "- Once it's tested, I'll send you updated, honest numbers for every account size and risk "
+        "setting.\n\n"
+        "If your account is down right now, I understand the frustration, and I'm taking it "
+        "seriously — this update is exactly about making the real results better. Reply to this "
+        "email or reach me on Discord and I'll answer you personally.\n\n"
+        "Thank you for trusting me. I'd always rather be honest with you than comfortable.\n\n"
+        "— Dmytrii\n"
+        "KhomaAlgorithms\n\n"
+        "(If you'd prefer not to receive these occasional updates, just reply and let me know.)\n"
+    )
+    results = {}
+    for to in recipients:
+        try:
+            results[to] = bool(send_email(to, subject, body))
+        except Exception as e:
+            results[to] = "error: " + type(e).__name__ + ": " + str(e)[:100]
+    return {"results": results, "last_error": LAST_EMAIL_ERROR}
+
+
 def email_html(heading: str, message_html: str, button_label: str = "", button_url: str = "") -> str:
     """Branded HTML email — logo banner, body, optional CTA button, footer."""
     logo = f"{APP_URL.rstrip('/')}/static/logo.png"
