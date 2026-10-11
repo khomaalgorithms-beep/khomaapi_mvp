@@ -947,6 +947,21 @@ _PAGE = r"""
   .kv .eqt{background:#fff;padding:12px 14px}.kv .eqt .k{font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
   .kv .eqt .v{font-size:18px;font-weight:900;letter-spacing:-.5px;margin-top:3px;font-variant-numeric:tabular-nums}
   .kv .eqnote{font-size:12.5px;color:var(--mu);line-height:1.5;margin-top:14px;background:var(--gs);border:1px solid var(--gl);border-radius:12px;padding:12px 14px}
+  .kv .truth{margin-top:22px}
+  .kv .odds{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+  @media(max-width:620px){.kv .odds{grid-template-columns:1fr}}
+  .kv .odd{background:var(--gs);border:1px solid var(--gl);border-radius:16px;padding:16px 18px;text-align:center}
+  .kv .odd .ob{font-size:30px;font-weight:900;letter-spacing:-1.2px;color:var(--gd);font-variant-numeric:tabular-nums}
+  .kv .odd .ol{font-size:12px;color:var(--mu);margin-top:6px;line-height:1.35}
+  .kv .howhd{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--fa);margin:22px 0 10px}
+  .kv .steps{display:grid;gap:8px}
+  .kv .step{display:flex;gap:12px;align-items:flex-start;background:#fff;border:1px solid var(--ln);border-radius:13px;padding:12px 14px;font-size:12.5px;color:var(--mu);line-height:1.45}
+  .kv .step .sn{flex:none;width:22px;height:22px;border-radius:50%;background:var(--gs);border:1px solid var(--gl);color:var(--gd);font-weight:900;font-size:11px;display:grid;place-items:center;margin-top:1px}
+  .kv .step b{color:var(--tx)}
+  .kv .truths{list-style:none;padding:0;margin:20px 0 0;display:grid;gap:9px}
+  .kv .truths li{display:flex;gap:10px;align-items:flex-start;font-size:12.5px;color:var(--tx);line-height:1.45}
+  .kv .truths li::before{content:"";flex:none;width:6px;height:6px;border-radius:50%;background:var(--g);margin-top:7px}
+  .kv .truths b{font-weight:800}
 </style>
 <div class="kv" id="kv">
   <div class="top">
@@ -962,6 +977,28 @@ _PAGE = r"""
   </div>
   <div id="app"></div>
   <section id="eqSection" class="eqwrap"></section>
+  <section class="eqwrap truth">
+    <div class="eqhead"><div><h2>What to actually expect</h2><p>The real probabilities, and exactly how your account is traded. Honest numbers only &mdash; no inflated backtests.</p></div></div>
+    <div class="odds">
+      <div class="odd"><div class="ob">~1 in 3</div><div class="ol">chance to pass a single evaluation</div></div>
+      <div class="odd"><div class="ob">~1 in 6</div><div class="ol">chance one account reaches a payout</div></div>
+      <div class="odd"><div class="ob">~65%</div><div class="ol">chance of a payout across 5&ndash;6 accounts</div></div>
+    </div>
+    <div class="note" style="margin-top:16px"><div><b>The buffer comes first.</b> On a funded 50K you have to grow the account about <b>$2,600</b> &mdash; clear the ~$2,100 drawdown buffer plus the $500 minimum &mdash; before you can withdraw a single dollar, and the account can blow during that grind. <b>Getting funded is not the same as getting paid.</b></div></div>
+    <div class="howhd">How your account is traded</div>
+    <div class="steps">
+      <div class="step"><span class="sn">1</span><div><b>NQ only.</b> One market &mdash; micro Nasdaq (MNQ). RTY was retired for carrying no reliable edge.</div></div>
+      <div class="step"><span class="sn">2</span><div><b>One decision a day, at 10:30 ET.</b> The engine takes a trade only when three things agree: momentum, a breakout beyond the 9:30&ndash;9:45 opening range, and the 20-day trend. Most days it sits out and risks nothing.</div></div>
+      <div class="step"><span class="sn">3</span><div><b>Risk-sized, with a hard stop.</b> Every trade risks a fixed amount (one opening-range width = 1R). Winners are trailed so they can run; losers are capped at the stop.</div></div>
+      <div class="step"><span class="sn">4</span><div><b>Flat by 15:55 ET &mdash; never overnight.</b> High-impact news days (FOMC, CPI, NFP, PCE&hellip;) are skipped entirely.</div></div>
+    </div>
+    <ul class="truths">
+      <li><b>It&rsquo;s a numbers game, not a money printer.</b> A real but thin edge (profit factor ~1.1, ~35% win rate &mdash; winners run, losers are capped). It pays off played in volume with discipline, not on one lucky account.</li>
+      <li><b>Income is modest per account</b> &mdash; expect roughly ~$70&ndash;150/month on a funded 50K. Bigger income comes from running more accounts, not a bigger per-account dream.</li>
+      <li><b>Spread your accounts out &mdash; don&rsquo;t run them in lockstep.</b> Accounts firing the same signal on the same day all win, and all blow, together. Distributing across days, sizes and firms is what makes several accounts behave like several real shots.</li>
+      <li><b>No guarantees.</b> Some evaluations fail and some funded accounts blow &mdash; that is normal and planned for. The edge works over time and across accounts, not on any single one.</li>
+    </ul>
+  </section>
 </div>
 <script>
 const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, EQ=__EQUITY__;
