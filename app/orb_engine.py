@@ -846,107 +846,13 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], leg
                                  "dd": c.get("dd", 15)}
     html = (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
                  .replace("__CONFIGS__", json.dumps(conf))
-                 .replace("__EQUITY__", _EQUITY_JSON))
+                 .replace("__EQUITY__", _EQUITY_JSON_LEGACY if legacy else _EQUITY_JSON))
     if legacy:
         import re as _re
         html = _re.sub(r'const EVAL=\{.*?\};', lambda m: _EVAL_LEGACY, html, count=1)
         html = _re.sub(r'const NOTES=\{.*?\};', lambda m: _NOTES_LEGACY, html, count=1)
         html = _re.sub(r'<div class="eqnote">.*?</div>', lambda m: _EQNOTE_LEGACY, html, count=1)
-        html = _owner_validated_panel() + html
     return html
-
-
-# ---- Owner-only validated numbers (khomadima89) ---------------------------------------
-# Source: 2016-2026 real NQ+RTY 1-min backtest, net 5-tick cost (commission+slippage),
-# FOMC days skipped, 3-way confluence entry + trail-to-close, OOS-validated (2016-21 build /
-# 2022-26 confirm), overfitting-checked. Lucid specs. See orb_research/*.
-# cols per account/mode: eval pass%, eval median days, funded reach%, funded blow%,
-# funded median days to first payout, live-cash net $/yr per surviving account.
-_OWNER_MATRIX = {
-    "25K":  {"tgt": 1250, "dd": 1000,
-             "Conservative": (35, 20, 26, 38, 166, 794),
-             "Normal":       (36, 9,  39, 71, 102, 1357),
-             "Aggressive":   (38, 5,  36, 96, 44,  1981)},
-    "50K":  {"tgt": 3000, "dd": 2000,
-             "Conservative": (28, 24, 37, 40, 142, 1470),
-             "Normal":       (30, 11, 44, 76, 83,  2586),
-             "Aggressive":   (32, 6,  42, 98, 35,  3386)},
-    "100K": {"tgt": 6000, "dd": 3000,
-             "Conservative": (20, 31, 41, 40, 135, 2138),
-             "Normal":       (21, 14, 48, 78, 74,  3821),
-             "Aggressive":   (23, 7,  44, 98, 32,  4926)},
-    "150K": {"tgt": 9000, "dd": 4500,
-             "Conservative": (19, 32, 43, 40, 129, 3199),
-             "Normal":       (21, 15, 49, 78, 71,  5659),
-             "Aggressive":   (24, 7,  45, 98, 30,  7308)},
-}
-
-
-def _owner_validated_panel() -> str:
-    """Owner-only (khomadima89) read-out of the validated, honest numbers for every account size
-    and mode, plus the funded/live-cash picture. Not shown to clients."""
-    rows = []
-    for size in ("25K", "50K", "100K", "150K"):
-        m = _OWNER_MATRIX[size]
-        for i, mode in enumerate(("Conservative", "Normal", "Aggressive")):
-            ep, ed, fr, fb, fd, cash = m[mode]
-            blow_color = "#16a34a" if fb <= 45 else ("#d97706" if fb <= 80 else "#dc2626")
-            sizecell = (f'<td rowspan="3" style="vertical-align:top;font-weight:600;padding:8px 10px;'
-                        f'border-top:2px solid #0f8f45">{size}<div style="font-weight:400;color:#6b7280;'
-                        f'font-size:11px">+${m["tgt"]:,}/<br>-${m["dd"]:,}</div></td>') if i == 0 else ""
-            topb = "border-top:2px solid #0f8f45" if i == 0 else "border-top:1px solid #eef2f0"
-            rows.append(
-                f'<tr style="{topb}">{sizecell}'
-                f'<td style="padding:6px 10px">{mode}</td>'
-                f'<td style="text-align:center;padding:6px 10px"><b>{ep}%</b></td>'
-                f'<td style="text-align:center;padding:6px 10px;color:#6b7280">~{ed}d</td>'
-                f'<td style="text-align:center;padding:6px 10px"><b>{fr}%</b></td>'
-                f'<td style="text-align:center;padding:6px 10px;color:{blow_color};font-weight:600">{fb}%</td>'
-                f'<td style="text-align:center;padding:6px 10px;color:#6b7280">~{fd}d</td>'
-                f'<td style="text-align:right;padding:6px 10px"><b>${cash:,}</b></td>'
-                f'</tr>')
-    body = "".join(rows)
-    return f"""
-<div style="max-width:1000px;margin:10px auto 18px;padding:14px 16px;border:2px solid #0f8f45;
-     border-radius:12px;background:#f3faf5;color:#111827;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif">
-  <div style="font-weight:700;font-size:16px;color:#086b34">🔒 Validated performance — owner only</div>
-  <div style="color:#6b7280;font-size:12px;margin:4px 0 12px">
-    Real NQ+RTY 2016–2026, net of 5-tick cost (commission + slippage) · 3-way confluence entry
-    (momentum + opening-range breakout + 20-day trend) · trail-to-close · <b>skip FOMC days</b> ·
-    out-of-sample validated · overfit-checked. Not shown to clients.
-  </div>
-  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
-    {_owner_stat("Profit factor","1.11")}{_owner_stat("Win rate","45%")}
-    {_owner_stat("Avg win / loss","+$617 / −$459")}{_owner_stat("Max win / loss","+$2,354 / −$778")}
-    {_owner_stat("Longest losing streak","15")}{_owner_stat("Max drawdown","−$20,511")}
-    {_owner_stat("Green years","2019–2026")}
-  </div>
-  <div style="overflow-x:auto">
-  <table style="border-collapse:collapse;width:100%;font-size:13px;background:#fff;border-radius:8px">
-    <thead><tr style="background:#eaf7ef;color:#086b34;text-align:center">
-      <th style="padding:8px 10px;text-align:left">Account</th>
-      <th style="padding:8px 10px;text-align:left">Mode</th>
-      <th style="padding:8px 10px">Eval pass</th><th style="padding:8px 10px">Time</th>
-      <th style="padding:8px 10px">Funded → payout</th><th style="padding:8px 10px">Blow</th>
-      <th style="padding:8px 10px">1st payout</th><th style="padding:8px 10px;text-align:right">Live cash /yr</th>
-    </tr></thead>
-    <tbody>{body}</tbody>
-  </table>
-  </div>
-  <div style="font-size:12px;color:#444;margin-top:10px;line-height:1.6">
-    <b>Read it right:</b> &nbsp;• <b>Eval</b> = run any mode; aggressive is fastest (same pass odds, resolves in days). &nbsp;
-    • <b>Funded</b> = <b>CONSERVATIVE ONLY</b> — normal blows ~75%, aggressive ~98% (trailing-DD punishes losing streaks). &nbsp;
-    • <b>Live cash /yr</b> = net payouts (Lucid 90% split) for an account that reaches payout and survives the year. &nbsp;
-    • It's a <b>numbers game</b>: ~1 in 3–5 evals funds; run several, staggered.
-  </div>
-</div>
-"""
-
-
-def _owner_stat(label: str, val: str) -> str:
-    return (f'<div style="background:#fff;border:1px solid #cdebd8;border-radius:8px;padding:6px 12px">'
-            f'<div style="font-size:11px;color:#6b7280">{label}</div>'
-            f'<div style="font-size:15px;font-weight:600;color:#086b34">{val}</div></div>')
 
 
 # Validated equity curves + stats (per micro), generated from the 2019-2026 backtest:
@@ -957,8 +863,8 @@ _EQUITY_JSON = r"""{"NQ":{"cum":[745,468,776,544,542,588,532,596,510,500,94,73,1
 
 # --- LEGACY (original, pre-honest-numbers) dashboard numbers — shown ONLY to the owner ---
 _EQUITY_JSON_LEGACY = '{"NQ":{"cum":[961,734,1170,1031,1426,1624,1588,2018,2118,2479,2273,2297,2406,2863,3088,3523,3809,4248,4596,4979,5675,6297,6352,6584,6794,6929,6994,7498,7538,7811,8072,9453,9740,9728,9749,10184,10100,10201,10451,10763,10900,11125,10990,11033,10780,11302,11580,11830,12390,12430,12941,13216,13342,13802,13272,13881,13772,14084,14333,14622,15144,15840,15788,15889,16302,16170,16987,17237,17512,18556,19165,19898,20692,21240,21849,22073,22857,22500,22801,23435,23617,23615,24286,24598,25120,25580,25558,26229,25934,26061,26546,26386,26325],"stats":{"n":1145,"net":26325,"pf":1.67,"win":42,"maxdd":-716,"ret_dd":36.8}},"RTY":{"cum":[119,2,226,245,505,323,595,773,1168,1085,1065,956,1142,1154,1184,1329,1360,1852,1749,1804,1994,2121,2049,2190,2562,3284,3539,3698,3591,3620,4260,4355,4458,4432,4561,4873,4862,5147,5572,5827,5941,6154,6165,6221,6236,6267,6324,6297,6158,6313,6476,6654,6721,6715,6846,6854,6882,6907,7021,6949,7160,7066,7180,7466,7679,7489,7660,7907,8065,8221,8231,8218,8134,8444,8672,8885,8750,8599,8659,8673,8890,9082,8957,8990,8975,9206,9293,9423,9528,9377,9828,9947,10058],"stats":{"n":775,"net":10058,"pf":1.64,"win":47,"maxdd":-429,"ret_dd":23.4}},"PF":{"cum":[1080,736,1396,1276,1931,1948,2183,2791,3286,3563,3339,3252,3548,4017,4272,4852,5169,6100,6345,6782,7669,8418,8401,8774,9356,10213,10532,11197,11129,11430,12332,13808,14197,14160,14310,15057,14962,15348,16024,16590,16842,17279,17156,17254,17016,17569,17904,18128,18548,18743,19417,19870,20063,20518,20118,20736,20654,20990,21354,21571,22304,22906,22968,23355,23982,23659,24647,25144,25577,26778,27396,28116,28827,29684,30521,30959,31606,31099,31460,32108,32507,32698,33243,33588,34095,34786,34851,35652,35463,35437,36374,36334,36382],"stats":{"n":1391,"net":36382,"pf":1.8,"win":48,"maxdd":-784,"ret_dd":46.4}},"months":["2019-01","2019-02","2019-03","2019-04","2019-05","2019-06","2019-07","2019-08","2019-09","2019-10","2019-11","2019-12","2020-01","2020-02","2020-03","2020-04","2020-05","2020-06","2020-07","2020-08","2020-09","2020-10","2020-11","2020-12","2021-01","2021-02","2021-03","2021-04","2021-05","2021-06","2021-07","2021-08","2021-09","2021-10","2021-11","2021-12","2022-01","2022-02","2022-03","2022-04","2022-05","2022-06","2022-07","2022-08","2022-09","2022-10","2022-11","2022-12","2023-01","2023-02","2023-03","2023-04","2023-05","2023-06","2023-07","2023-08","2023-09","2023-10","2023-11","2023-12","2024-01","2024-02","2024-03","2024-04","2024-05","2024-06","2024-07","2024-08","2024-09","2024-10","2024-11","2024-12","2025-01","2025-02","2025-03","2025-04","2025-05","2025-06","2025-07","2025-08","2025-09","2025-10","2025-11","2025-12","2026-01","2026-02","2026-03","2026-04","2026-05","2026-06","2026-07","2026-08","2026-09"]}'
-_EVAL_LEGACY = 'const EVAL={"25K":{cons:[4,35,20],norm:[6,36,9],aggr:[10,38,5]},"50K":{cons:[8,28,24],norm:[12,30,11],aggr:[20,32,6]},"100K":{cons:[12,20,31],norm:[18,21,14],aggr:[30,23,7]},"150K":{cons:[20,19,32],norm:[30,21,15],aggr:[50,24,7]}};'
-_NOTES_LEGACY = 'const NOTES={cons:"Highest odds, patient — small size, slower to pass.",norm:"Balanced — solid odds, about two weeks.",aggr:"Fastest (~1 week) — same ~1-in-3 odds. It is a numbers game."};'
+_EVAL_LEGACY = 'const EVAL={"25K":{cons:[4,86,36],norm:[6,76,21],aggr:[10,64,10]},"50K":{cons:[8,84,45],norm:[12,74,25],aggr:[20,62,11]},"100K":{cons:[12,84,62],norm:[18,72,35],aggr:[30,59,15]},"150K":{cons:[20,81,53],norm:[30,69,29],aggr:[50,57,14]}};'
+_NOTES_LEGACY = 'const NOTES={cons:"Highest odds, patient — small size makes it slower.",norm:"Balanced — solid odds, passes in about three weeks.",aggr:"Fastest, but bust risk climbs. Only if resets don\'t bother you."};'
 _EQNOTE_LEGACY = '<div class="eqnote">Portfolio (NQ + RTY) is the smoothest — PF ${EQ.PF.stats.pf}, ${EQ.PF.stats.ret_dd}× return-to-drawdown vs ${EQ.NQ.stats.ret_dd}× (NQ) and ${EQ.RTY.stats.ret_dd}× (RTY) alone. Their winning days barely overlap, so running both cuts the drawdown. This is the exact engine that trades your account.</div>'
 
 
