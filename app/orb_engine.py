@@ -782,7 +782,7 @@ def install(app) -> None:
             _email = str((user.get("email") if hasattr(user, "get") else user["email"]) or "")
         except Exception:
             _email = ""
-        _legacy = (_email.strip().lower() == "khomadima89@gmail.com")
+        _legacy = False  # honest numbers shown to everyone (owner inflated view disabled)
         body = _render_dashboard(accounts, cfgs, legacy=_legacy)
         try:
             # layout(content, user=None, active="dashboard") — wrap in KhomaAPI chrome + sidebar
