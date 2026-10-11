@@ -9,6 +9,7 @@ Flow (matches Tradovate's official example-api-oauth):
 
 import os
 import re
+import time
 import calendar
 import urllib.parse
 from datetime import datetime, timezone, date, timedelta
@@ -101,15 +102,20 @@ def renew_access_token(env: str, token: str) -> dict:
     """Renew a still-valid Tradovate access token. Must be called BEFORE the
     current token expires — an already-expired token cannot be renewed and the
     user must reconnect. Returns {"ok", "access_token", "expiration"} or error."""
-    try:
-        r = requests.get(
-            f"{_rest_base(env)}/auth/renewAccessToken",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        data = r.json()
-    except Exception as e:
-        return {"ok": False, "error": f"renew failed: {e}"}
+    url = f"{_rest_base(env)}/auth/renewAccessToken"
+    data = None
+    # Renewal is idempotent (renewing twice just yields another fresh token), so a
+    # transient failure is safe to retry rather than falling back to the stale token.
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+            data = r.json()
+            break
+        except Exception as e:
+            if attempt + 1 < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+                continue
+            return {"ok": False, "error": f"renew failed: {e}"}
 
     new_token = data.get("accessToken") or data.get("access_token")
     if not new_token:
@@ -166,30 +172,72 @@ def _rest_base(env: str) -> str:
     return REST_DEMO if env == "demo" else REST_LIVE
 
 
+# Retry policy (env-tunable). Reads retry freely; order POSTs retry ONLY when the
+# request provably never reached the broker (see _post), so a retry can never
+# create a duplicate order.
+_RETRY_ATTEMPTS = max(1, int(os.getenv("TVO_RETRY_ATTEMPTS", "3")))   # total tries
+_RETRY_BACKOFF = float(os.getenv("TVO_RETRY_BACKOFF", "0.4"))         # seconds, linear
+
+
 def _get(env: str, token: str, path: str, params: dict | None = None):
-    try:
-        r = requests.get(
-            f"{_rest_base(env)}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=15,
-        )
-        return r.json()
-    except Exception:
-        return None
+    """Read-only GET. Reads are idempotent, so any transient failure is retried.
+    Returns the parsed JSON, or None once all attempts are exhausted (unchanged
+    contract for callers, which treat None as 'unavailable')."""
+    url = f"{_rest_base(env)}{path}"
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            r = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=15,
+            )
+            return r.json()
+        except Exception:
+            if attempt + 1 < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+                continue
+            return None
 
 
 def _post(env: str, token: str, path: str, body: dict):
-    try:
-        r = requests.post(
-            f"{_rest_base(env)}{path}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-            timeout=15,
-        )
-        return r.json()
-    except Exception:
-        return None
+    """POST used for order placement — NON-idempotent, so retries are dangerous.
+    We retry ONLY connection-phase failures (ConnectTimeout/ConnectionError), where
+    the TCP connection never completed and the order body was never sent to the
+    broker — so a retry cannot create a duplicate order. A ReadTimeout (request sent,
+    no response) or any other post-send error is NEVER retried; it returns a DISTINCT
+    structured error so the caller can surface it / verify, instead of the old opaque
+    None->'request failed'. On an HTTP response we always return the parsed JSON (the
+    caller's _order_ok / _broker_error_text decide success), or an error dict carrying
+    the status code when the body isn't JSON."""
+    url = f"{_rest_base(env)}{path}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    last_err = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=15)
+        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as e:
+            # Connection never established -> body never sent -> SAFE to retry.
+            last_err = {"error": "connect failed", "detail": str(e)[:300]}
+            if attempt + 1 < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+                continue
+            return last_err
+        except requests.exceptions.ReadTimeout:
+            # Request WAS sent but no response -> order status UNKNOWN -> do NOT retry
+            # (duplicate-order risk). Surface a distinct, explicit error.
+            return {"error": "timeout after send",
+                    "detail": "no response from broker; order status unknown — verify before retry"}
+        except Exception as e:
+            # Any other failure after the request was dispatched -> do not retry.
+            return {"error": "request failed", "detail": str(e)[:300]}
+        # Got an HTTP response.
+        try:
+            return r.json()
+        except Exception:
+            return {"error": f"http {getattr(r, 'status_code', '?')}",
+                    "detail": (getattr(r, "text", "") or "")[:300]}
+    return last_err if last_err is not None else {"error": "request failed"}
 
 
 def get_positions(env: str, token: str) -> list:

@@ -2813,8 +2813,9 @@ def ensure_fresh_token(account: dict) -> str:
     if exp_dt is not None:
         if exp_dt.tzinfo is None:
             exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-        # Not near expiry yet -> reuse as-is.
-        if exp_dt - datetime.now(timezone.utc) > timedelta(minutes=10):
+        # Not near expiry yet -> reuse as-is. 20-min buffer (was 10) so renewal fires
+        # with runway to spare — a token must never lapse mid-session and fail an order.
+        if exp_dt - datetime.now(timezone.utc) > timedelta(minutes=20):
             return token
 
     res = tvo.renew_access_token(env, token)
