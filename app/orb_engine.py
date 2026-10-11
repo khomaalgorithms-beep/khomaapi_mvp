@@ -852,7 +852,101 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], leg
         html = _re.sub(r'const EVAL=\{.*?\};', lambda m: _EVAL_LEGACY, html, count=1)
         html = _re.sub(r'const NOTES=\{.*?\};', lambda m: _NOTES_LEGACY, html, count=1)
         html = _re.sub(r'<div class="eqnote">.*?</div>', lambda m: _EQNOTE_LEGACY, html, count=1)
+        html = _owner_validated_panel() + html
     return html
+
+
+# ---- Owner-only validated numbers (khomadima89) ---------------------------------------
+# Source: 2016-2026 real NQ+RTY 1-min backtest, net 5-tick cost (commission+slippage),
+# FOMC days skipped, 3-way confluence entry + trail-to-close, OOS-validated (2016-21 build /
+# 2022-26 confirm), overfitting-checked. Lucid specs. See orb_research/*.
+# cols per account/mode: eval pass%, eval median days, funded reach%, funded blow%,
+# funded median days to first payout, live-cash net $/yr per surviving account.
+_OWNER_MATRIX = {
+    "25K":  {"tgt": 1250, "dd": 1000,
+             "Conservative": (35, 20, 26, 38, 166, 794),
+             "Normal":       (36, 9,  39, 71, 102, 1357),
+             "Aggressive":   (38, 5,  36, 96, 44,  1981)},
+    "50K":  {"tgt": 3000, "dd": 2000,
+             "Conservative": (28, 24, 37, 40, 142, 1470),
+             "Normal":       (30, 11, 44, 76, 83,  2586),
+             "Aggressive":   (32, 6,  42, 98, 35,  3386)},
+    "100K": {"tgt": 6000, "dd": 3000,
+             "Conservative": (20, 31, 41, 40, 135, 2138),
+             "Normal":       (21, 14, 48, 78, 74,  3821),
+             "Aggressive":   (23, 7,  44, 98, 32,  4926)},
+    "150K": {"tgt": 9000, "dd": 4500,
+             "Conservative": (19, 32, 43, 40, 129, 3199),
+             "Normal":       (21, 15, 49, 78, 71,  5659),
+             "Aggressive":   (24, 7,  45, 98, 30,  7308)},
+}
+
+
+def _owner_validated_panel() -> str:
+    """Owner-only (khomadima89) read-out of the validated, honest numbers for every account size
+    and mode, plus the funded/live-cash picture. Not shown to clients."""
+    rows = []
+    for size in ("25K", "50K", "100K", "150K"):
+        m = _OWNER_MATRIX[size]
+        for i, mode in enumerate(("Conservative", "Normal", "Aggressive")):
+            ep, ed, fr, fb, fd, cash = m[mode]
+            blow_color = "#16a34a" if fb <= 45 else ("#d97706" if fb <= 80 else "#dc2626")
+            sizecell = (f'<td rowspan="3" style="vertical-align:top;font-weight:600;padding:8px 10px;'
+                        f'border-top:2px solid #0f8f45">{size}<div style="font-weight:400;color:#6b7280;'
+                        f'font-size:11px">+${m["tgt"]:,}/<br>-${m["dd"]:,}</div></td>') if i == 0 else ""
+            topb = "border-top:2px solid #0f8f45" if i == 0 else "border-top:1px solid #eef2f0"
+            rows.append(
+                f'<tr style="{topb}">{sizecell}'
+                f'<td style="padding:6px 10px">{mode}</td>'
+                f'<td style="text-align:center;padding:6px 10px"><b>{ep}%</b></td>'
+                f'<td style="text-align:center;padding:6px 10px;color:#6b7280">~{ed}d</td>'
+                f'<td style="text-align:center;padding:6px 10px"><b>{fr}%</b></td>'
+                f'<td style="text-align:center;padding:6px 10px;color:{blow_color};font-weight:600">{fb}%</td>'
+                f'<td style="text-align:center;padding:6px 10px;color:#6b7280">~{fd}d</td>'
+                f'<td style="text-align:right;padding:6px 10px"><b>${cash:,}</b></td>'
+                f'</tr>')
+    body = "".join(rows)
+    return f"""
+<div style="max-width:1000px;margin:10px auto 18px;padding:14px 16px;border:2px solid #0f8f45;
+     border-radius:12px;background:#f3faf5;color:#111827;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif">
+  <div style="font-weight:700;font-size:16px;color:#086b34">🔒 Validated performance — owner only</div>
+  <div style="color:#6b7280;font-size:12px;margin:4px 0 12px">
+    Real NQ+RTY 2016–2026, net of 5-tick cost (commission + slippage) · 3-way confluence entry
+    (momentum + opening-range breakout + 20-day trend) · trail-to-close · <b>skip FOMC days</b> ·
+    out-of-sample validated · overfit-checked. Not shown to clients.
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+    {_owner_stat("Profit factor","1.11")}{_owner_stat("Win rate","45%")}
+    {_owner_stat("Avg win / loss","+$617 / −$459")}{_owner_stat("Max win / loss","+$2,354 / −$778")}
+    {_owner_stat("Longest losing streak","15")}{_owner_stat("Max drawdown","−$20,511")}
+    {_owner_stat("Green years","2019–2026")}
+  </div>
+  <div style="overflow-x:auto">
+  <table style="border-collapse:collapse;width:100%;font-size:13px;background:#fff;border-radius:8px">
+    <thead><tr style="background:#eaf7ef;color:#086b34;text-align:center">
+      <th style="padding:8px 10px;text-align:left">Account</th>
+      <th style="padding:8px 10px;text-align:left">Mode</th>
+      <th style="padding:8px 10px">Eval pass</th><th style="padding:8px 10px">Time</th>
+      <th style="padding:8px 10px">Funded → payout</th><th style="padding:8px 10px">Blow</th>
+      <th style="padding:8px 10px">1st payout</th><th style="padding:8px 10px;text-align:right">Live cash /yr</th>
+    </tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+  </div>
+  <div style="font-size:12px;color:#444;margin-top:10px;line-height:1.6">
+    <b>Read it right:</b> &nbsp;• <b>Eval</b> = run any mode; aggressive is fastest (same pass odds, resolves in days). &nbsp;
+    • <b>Funded</b> = <b>CONSERVATIVE ONLY</b> — normal blows ~75%, aggressive ~98% (trailing-DD punishes losing streaks). &nbsp;
+    • <b>Live cash /yr</b> = net payouts (Lucid 90% split) for an account that reaches payout and survives the year. &nbsp;
+    • It's a <b>numbers game</b>: ~1 in 3–5 evals funds; run several, staggered.
+  </div>
+</div>
+"""
+
+
+def _owner_stat(label: str, val: str) -> str:
+    return (f'<div style="background:#fff;border:1px solid #cdebd8;border-radius:8px;padding:6px 12px">'
+            f'<div style="font-size:11px;color:#6b7280">{label}</div>'
+            f'<div style="font-size:15px;font-weight:600;color:#086b34">{val}</div></div>')
 
 
 # Validated equity curves + stats (per micro), generated from the 2019-2026 backtest:
