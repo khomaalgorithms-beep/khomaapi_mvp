@@ -952,7 +952,7 @@ _PAGE = r"""
   <div class="top">
     <div>
       <h1>KhomaVolume ORB</h1>
-      <div class="lead">Automated selective-breakout execution on NQ &amp; RTY, run server-side by KhomaAPI.</div>
+      <div class="lead">Automated selective-breakout execution on NQ, run server-side by KhomaAPI.</div>
     </div>
     <div class="apick" id="apickWrap">
       <span class="ey">Account</span>
@@ -974,7 +974,7 @@ const rnd=x=>Math.floor(x+0.5);
 let state=null;
 
 function splitMicros(t,asset){if(asset==="nq")return[t,0];if(asset==="rty")return[0,t];const q=rnd(t/2);return[q,t-q];}
-function assetAdj(p,asset){return asset==="both"?p:asset==="rty"?Math.round(p*.85):Math.round(p*.75);}
+function assetAdj(p,asset){return p;}
 function totalMicros(){
   if(state.mode==="funded")return FUNDED[state.acct_size][state.preset];
   if(state.mode==="cash"){const mx=Math.max(0,Math.floor((state.bal*state.dd/100)/DD_PER_MICRO));
@@ -996,7 +996,7 @@ function configCard(){
         <div class="f"><div class="rv"><span>Max drawdown</span><b id="ddOut">${state.dd}%</b></div>
           <input id="ddIn" type="range" min="5" max="35" value="${state.dd}"></div></div>
         <div class="pn">KhomaAPI keeps risk inside <b>${money(state.bal*state.dd/100)}</b> of drawdown.</div></div>`:""}
-    <div class="field"><label>Markets</label>${seg("asset",[{v:"both",t:"NQ + RTY"},{v:"nq",t:"NQ only"},{v:"rty",t:"RTY only"}],state.asset)}</div>
+    <div class="field"><label>Markets</label>${seg("asset",[{v:"nq",t:"NQ only"}],state.asset)}</div>
     <div class="field"><label>Risk preset</label>${seg("preset",[{v:"cons",t:"Conservative"},{v:"norm",t:"Normal"},{v:"aggr",t:"Aggressive"}],state.preset)}
       <div class="pn" id="presetNote"></div></div>
    </div></div>`;
@@ -1015,8 +1015,7 @@ function projCard(){
     hero=money(gross)+"/mo";cap="<b>estimated monthly</b> at this size, before variance";
     tiles=[["Drawdown budget",money(budget),state.dd+"% of "+money(state.bal)],["Per-trade risk","~"+money(nq*60+rty*40),"stop distance × $/pt"]];}
   const legs=`<div class="sz"><div class="t">Contracts the engine will trade</div><div class="legs">
-     <div class="leg"><div class="m"><span class="tk">MNQ</span> Micro Nasdaq</div><div class="n">${nq}<small> micro</small></div></div>
-     <div class="leg r"><div class="m"><span class="tk">M2K</span> Micro Russell</div><div class="n">${rty}<small> micro</small></div></div></div></div>`;
+     <div class="leg"><div class="m"><span class="tk">MNQ</span> Micro Nasdaq</div><div class="n">${nq}<small> micro</small></div></div></div></div>`;
   return `<div class="card proj"><div class="hd"><h2>Projection</h2><p>Honest, from the 2019–2026 validation.</p></div>
    <div class="bd"><div class="hero"><div class="big">${hero}</div><div class="cap">${cap}</div></div>
    ${meter!=null?`<div class="meter"><i style="width:${meter}%"></i></div>`:""}
@@ -1029,7 +1028,7 @@ function runCard(){
   const on=state.enabled;
   return `<div class="run"><div class="runrow">
      <button class="startbtn ${on?'on':''}" id="startBtn">${on?'Stop automation':'Start automation'}</button>
-     <div class="rstat ${on?'live':''}" id="rstat"><span class="dot"></span>${on?'<b>Scanning</b> — watching NQ &amp; RTY for the opening-range breakout. Trades place automatically when your rules trigger.':'Idle. Press Start and the engine begins scanning at the 9:30 ET open and executes by the rules.'}</div>
+     <div class="rstat ${on?'live':''}" id="rstat"><span class="dot"></span>${on?'<b>Scanning</b> — watching NQ for the opening-range breakout. Trades place automatically when your rules trigger.':'Idle. Press Start and the engine begins scanning at the 9:30 ET open and executes by the rules.'}</div>
    </div><div class="acts" id="acts" hidden></div></div>
    <div class="note"><div><b>Demo first.</b> Arm a demo account to watch real order placement with simulated money before any real capital. The strategy logic runs server-side inside KhomaAPI and never leaves it. What you see under “Contracts” is exactly what gets sent to Tradovate.</div></div>`;
 }
@@ -1065,7 +1064,7 @@ async function toggleRun(){
 }
 
 function loadAcct(id){
-  state=Object.assign({acct:id,mode:"eval",acct_size:"50K",preset:"norm",asset:"both",bal:25000,dd:15,enabled:false},CONFIGS[id]||{});
+  state=Object.assign({acct:id,mode:"eval",acct_size:"50K",preset:"norm",asset:"nq",bal:25000,dd:15,enabled:false},CONFIGS[id]||{});state.asset="nq";
   state.acct=id;render();
 }
 
@@ -1083,7 +1082,7 @@ const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});
 sel.onchange=()=>loadAcct(sel.value);
 // ---- validated equity curves (NQ / RTY / Portfolio), from the 2019-2026 backtest ----
-let eqTab="PF";
+let eqTab="NQ";
 function eqPath(cum,W,H,L,R,T,B){
   const n=cum.length,mx=Math.max(...cum),mn=Math.min(...cum,0);
   const x=i=>L+i/(n-1)*(W-L-R),y=v=>T+(1-(v-mn)/(mx-mn||1))*(H-T-B);
@@ -1100,7 +1099,7 @@ function renderEquity(){
   const p=eqPath(c,W,H,L,R,T,B);
   const yr=EQ.months.map((m,i)=>[i,m]).filter(([i,m])=>m.endsWith("-01")).map(([i,m])=>
     `<text x="${(L+i/(c.length-1)*(W-L-R)).toFixed(1)}" y="${H-5}" text-anchor="middle" font-size="10" font-weight="700" fill="#9ca3af">${m.slice(0,4)}</text>`).join("");
-  const tabs=[["PF","Portfolio · NQ+RTY"],["NQ","NQ only"],["RTY","RTY only"]].map(([k,t])=>
+  const tabs=[["NQ","NQ only"]].map(([k,t])=>
     `<button class="eqtab ${k===eqTab?'on':''}" data-k="${k}">${t}</button>`).join("");
   const tiles=[["Net / micro","$"+s.net.toLocaleString()],["Profit factor",s.pf],["Win rate",s.win+"%"],
     ["Max drawdown","$"+s.maxdd.toLocaleString()],["Return / DD",s.ret_dd+"×"],["Trades",s.n.toLocaleString()]];
@@ -1112,7 +1111,7 @@ function renderEquity(){
       ${p.g}<path d="${p.ar}" fill="url(#eqg)"/><path d="${p.ln}" fill="none" stroke="#0f8f45" stroke-width="2.4" stroke-linejoin="round"/>
       <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yr}</svg></div>
     <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
-    <div class="eqnote">Running NQ + RTY together (PF ${EQ.PF.stats.pf}, ${EQ.PF.stats.ret_dd}× return-to-drawdown) is steadier than NQ alone (${EQ.NQ.stats.ret_dd}×) — their winning days barely overlap, so the combination softens the deepest drawdowns. These figures are NET of realistic fills — the exact engine that trades your account.</div>`;
+    <div class="eqnote">NQ only — PF ${EQ.NQ.stats.pf}, ${EQ.NQ.stats.ret_dd}× return-to-drawdown, net of realistic fills (slippage + commissions). This is the exact engine that trades your account. We retired RTY: it carried no reliable edge.</div>`;
   document.querySelectorAll(".eqtab").forEach(b=>b.onclick=()=>{eqTab=b.dataset.k;renderEquity();});
 }
 renderEquity();
