@@ -552,6 +552,9 @@ def _plan_configs() -> List[dict]:
         cfg = build_account_config(row, token)
         if cfg is None:
             continue
+        # KhomaAPI Risk Engine: a locked account (daily loss / drawdown breach) must never get a new entry
+        cfg.risk_check = (lambda pk=pk, uid=row.get("user_id"):
+                          _main()._orb_account_risk_locked({"id": pk, "user_id": uid}, fail_closed=True))
         roots = _ASSET_ROOTS[row["asset"]]
         contracts = dict(cfg.instruments)
         qty = {r: cfg.qty.get(r, 0) for r in roots}

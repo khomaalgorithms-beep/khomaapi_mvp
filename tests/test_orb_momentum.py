@@ -300,3 +300,30 @@ def test_trade_email_shows_momentum_plan():
     _, _, html2 = E._trade_email("LFE1", {"root": "MNQ", "side": "short", "qty": 4, "entry": 20000,
                                           "plan": {"sl": 20060, "tp": 19820, "qty": 4, "side": "short"}})
     assert "19,820" in html2 and "20,060" in html2
+
+
+def test_risk_engine_lock_blocks_new_entry():
+    fb = Broker(balance=50000)
+    c = cfg(); c.risk_check = lambda: "Daily loss limit hit"
+    ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    acts = run_day(ap, session(20000, 20040))
+    assert fb.place_calls == [] and acts[-1]["reason"] == "risk_locked"
+
+
+def test_risk_check_error_fails_closed():
+    fb = Broker(balance=50000)
+    c = cfg()
+    def boom():
+        raise RuntimeError("db down")
+    c.risk_check = boom
+    ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    assert fb.place_calls == []
+
+
+def test_risk_check_ok_trades():
+    fb = Broker(balance=50000)
+    c = cfg(); c.risk_check = lambda: ""
+    ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    assert len(fb.place_calls) == 1

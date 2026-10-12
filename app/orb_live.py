@@ -221,6 +221,7 @@ class AccountConfig:
     acct_start: float = 0.0          # eval/funded starting balance (for the eval pass take-profit)
     acct_target: float = 0.0         # eval profit target
     day_tp_usd: Optional[float] = None   # eval daily take-profit cap (48% of target); None = hold to close
+    risk_check: Optional[Callable[[], str]] = None   # -> lock reason ('' = OK); KhomaAPI Risk Engine lock
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +412,14 @@ class Autopilot:
         if qty <= 0:
             st.status = _DONE
             return {**info, "action": "skip", "reason": "qty<=0"}
+        if self.cfg.risk_check is not None:            # Risk Engine lock (daily loss / drawdown) blocks new entries
+            try:
+                lock = self.cfg.risk_check() or ""
+            except Exception:
+                lock = "Risk state unavailable - entry blocked (fail-closed)."
+            if lock:
+                st.status = _DONE
+                return {**info, "action": "skip", "reason": "risk_locked", "detail": lock}
         token = self._get_token()
         if not token:
             st.status = _DONE
