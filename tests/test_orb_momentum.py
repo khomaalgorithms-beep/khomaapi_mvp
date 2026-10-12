@@ -289,3 +289,14 @@ def test_save_config_roundtrip_sqlite(tmp_path, monkeypatch):
     monkeypatch.setattr(E, "_db", mk2)
     E.save_config(1, 5, "88", enabled=True, mode="eval", acct_size="50K", preset="norm", asset="nq", dd_type="eod")
     assert E.get_config(1, "88")["enabled"] == 1
+
+
+def test_trade_email_shows_momentum_plan():
+    from app import orb_engine as E
+    subj, head, html = E._trade_email("LFE1", {"root": "MNQ", "side": "long", "qty": 5, "entry": 20040.25,
+                                              "plan": {"sl": 19978.75, "tp": None, "qty": 5, "side": "long"}})
+    assert "19,978.75" in html and "Held to the close" in html and "None" not in html
+    assert "LONG MNQ" in subj
+    _, _, html2 = E._trade_email("LFE1", {"root": "MNQ", "side": "short", "qty": 4, "entry": 20000,
+                                          "plan": {"sl": 20060, "tp": 19820, "qty": 4, "side": "short"}})
+    assert "19,820" in html2 and "20,060" in html2

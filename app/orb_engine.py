@@ -655,9 +655,12 @@ def _trade_email(account_name: str, ev: dict):
     root = ev.get("root", ""); side = str(ev.get("side", "")).upper(); qty = ev.get("qty", "")
     plan = ev.get("plan")
     entry = ev.get("entry")                              # actual fill price when known
-    if entry is None:
-        entry = getattr(plan, "entry_limit", None) or getattr(plan, "entry_stop", None)
-    sl, tp = getattr(plan, "sl_price", None), getattr(plan, "tp_price", None)
+    if isinstance(plan, dict):                           # validated momentum engine: {"sl","tp","qty","side"}
+        sl, tp = plan.get("sl"), plan.get("tp")
+    else:                                                # legacy selective EntryPlan object
+        if entry is None:
+            entry = getattr(plan, "entry_limit", None) or getattr(plan, "entry_stop", None)
+        sl, tp = getattr(plan, "sl_price", None), getattr(plan, "tp_price", None)
     name = _ROOT_NAME.get(root, root)
     color = "#0f8f45" if side == "LONG" else "#dc2626"
     when = (_now_et().strftime("%I:%M %p ET").lstrip("0") + " &middot; "
@@ -668,14 +671,16 @@ def _trade_email(account_name: str, ev: dict):
                 f'<td style="padding:9px 2px;color:#111827;font-size:14px;font-weight:700;text-align:right;'
                 f'font-family:Arial;">{v}</td></tr>')
     msg = (
-        f'<p style="margin:0 0 4px;">Your <b>KhomaVolume ORB</b> engine just filled a trade on '
-        f'<b>{account_name}</b> &mdash; a decisive breakout fired and your position is now live at the broker.</p>'
+        f'<p style="margin:0 0 4px;">Your <b>KhomaVolume</b> engine just filled today&rsquo;s 10:30 trade on '
+        f'<b>{account_name}</b>. The protective stop is already working at the broker, and the position '
+        f'closes by 3:59 PM ET at the latest. About 2 trades in 3 end at the stop; that is normal.</p>'
         f'<div style="margin:20px 0;border:1px solid #e8eae9;border-radius:14px;overflow:hidden;">'
         f'<div style="background:{color};padding:13px 18px;color:#fff;font-weight:800;font-size:15px;'
         f'letter-spacing:.3px;">{side} &nbsp;&middot;&nbsp; {name}</div>'
         f'<table width="100%" cellpadding="0" cellspacing="0" style="padding:4px 18px 12px;">'
         f'{r("Contracts", f"{qty} {root}")}{r("Entry", _fmt(entry))}'
-        f'{r("Stop-loss", _fmt(sl))}{r("Take-profit", _fmt(tp))}{r("Triggered", when)}'
+        f'{r("Stop-loss", _fmt(sl) if sl is not None else "-")}'
+        f'{r("Take-profit", _fmt(tp) if tp is not None else "Held to the close")}{r("Triggered", when)}'
         f'</table></div>'
         f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.6;">You only receive this email '
         f'when a trade fires — <b>no email means the engine took no trade.</b></p>')
