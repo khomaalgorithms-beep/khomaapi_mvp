@@ -743,7 +743,7 @@ class Autopilot:
             st.status = _DONE; st.eod_done = True
             return {"action": "eod", "flattened": net}
         st.status = _DONE; st.eod_done = True
-        return None
+        return {"action": "eod", "flattened": 0}            # verified flat (logged once per day)
 
     def _utcnow(self) -> datetime:
         return datetime.utcnow()
