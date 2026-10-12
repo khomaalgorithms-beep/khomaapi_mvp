@@ -392,3 +392,16 @@ def test_dashboard_renders_funded_safe():
                                {"43": {"enabled": 1, "mode": "funded", "acct_size": "50K", "preset": "safe",
                                        "dd_type": "eod", "cash_bal": 25000, "cash_dd": 15}})
     assert '"safe": {' in html and "Safe (recommended)" in html and "First payout" in html
+
+
+def test_manager_logs_every_decision(capsys):
+    from app import orb_engine as E
+
+    class AP:
+        def on_bar(self, root, bar):
+            return {"root": root, "action": "skip", "reason": "against_trend"}
+    m = E.EngineManager()
+    m._active = {7: {"autopilot": AP()}}
+    m.on_bar("MNQ", type("B", (), {"dt": __import__("datetime").datetime(2026, 10, 13, 10, 29), "c": 1.0})())
+    assert m.decisions and m.decisions[-1]["reason"] == "against_trend" and m.decisions[-1]["account_id"] == 7
+    assert "ORB DECISION:" in capsys.readouterr().out

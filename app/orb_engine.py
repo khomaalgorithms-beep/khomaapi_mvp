@@ -416,6 +416,7 @@ class EngineManager:
         self.bars_seen = 0                       # observability: bars dispatched to the engine
         self.last_bar = None                     # e.g. "MNQ 09:47" — proves data reaches the engine
         self.events: List[dict] = []             # trade events pending an email notification
+        self.decisions: List[dict] = []          # rolling audit trail of 10:30 decisions (also printed to the log)
         self._feed = None
         self._feed_task = None
         self._feed_roots: tuple = ()             # exec roots the feed is currently subscribed to
@@ -499,7 +500,14 @@ class EngineManager:
                 if r:
                     out.append({"account_id": acct_id, **r})
             except Exception as e:
-                out.append({"account_id": acct_id, "error": str(e)})
+                out.append({"account_id": acct_id, "action": "error", "error": str(e)})
+        for d in out:                                   # audit trail: every decision is logged (trade / skip / reject / error)
+            if d.get("action") in (None, "wait", "backfill_ready"):
+                continue
+            d = {k: v for k, v in d.items() if k != "resp" or d.get("action") == "reject"}
+            self.decisions.append({"ts": datetime.now(timezone.utc).isoformat(), **d})
+            del self.decisions[:-200]
+            print("ORB DECISION:", d)
         return out
 
     def poll(self) -> List[dict]:
@@ -507,7 +515,7 @@ class EngineManager:
         for acct_id, st in list(self._active.items()):
             try:
                 res = st["autopilot"].poll()
-                out.extend(res)
+                out.extend({"account_id": acct_id, **r} for r in res)
                 for r in res:
                     # email ONLY when a real position actually FILLS on the account — never on mere
                     # order submission, so a rejected order sends no "Trade Triggered" email.
@@ -582,6 +590,9 @@ def _ctx_status() -> dict:
             "stop_pts": round(MOM.STOP_ATR * c.atr, 2) if c.atr else None}
 
 
+_LOGGED: set = set()
+
+
 async def engine_loop() -> None:
     """Leader-only reconcile loop. Each tick: rebuild the enabled config set, sync the manager
     (start/stop feeds), and poll every account against broker truth. Never raises out."""
@@ -611,11 +622,19 @@ async def engine_loop() -> None:
                     if a.get("action") in ("backfill_ready", "backfill_missed"):
                         print("ORB backfill:", a)
                 actions = _MANAGER.poll()
+                for a in actions:                           # fills, exits, flattens, errors -> log (once per kind/day)
+                    if a.get("action") not in (None, "wait") or a.get("error"):
+                        key = (_now_et().date().isoformat(), a.get("account_id"), a.get("root"), a.get("action"), a.get("reason"))
+                        if key not in _LOGGED:
+                            _LOGGED.add(key)
+                            if len(_LOGGED) > 5000:
+                                _LOGGED.clear()
+                            print("ORB EVENT:", a)
                 _LAST_STATUS.update(running=True, accounts=len(_MANAGER.active_ids()),
                                     data_key=bool(_massive_key()),
                                     feed_instruments=list(_MANAGER.feed_roots()),
                                     bars_seen=_MANAGER.bars_seen, last_bar=_MANAGER.last_bar,
-                                    context=_ctx_status(),
+                                    context=_ctx_status(), decisions=_MANAGER.decisions[-20:],
                                     actions=[a for a in actions if a.get("action") not in (None,)][-20:],
                                     ts=datetime.now(timezone.utc).isoformat())
                 # email the account owner for each trade that just fired (off the loop thread)
@@ -995,7 +1014,7 @@ def install(app) -> None:
 
 def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], legacy: bool = False) -> str:
     """KhomaVolume NQ control room: pick a connected account, configure mode / account size / drawdown
-    type / preset, see the validated odds + live sizing + 10-year equity curve, and Start/Stop automation.
+    type / preset, see the validated odds + live sizing + full-history (2008-26) equity curve, and Start/Stop automation.
     All numbers come from app.orb_validated (generated from the research harness); arming persists via
     /prop-engine/save and the background loop picks it up within seconds."""
     accts = [{"id": a["account_id"], "name": a.get("account_name", ""),
@@ -1131,7 +1150,7 @@ _PAGE = r"""
   <div id="app"></div>
   <section id="eqSection" class="eqwrap"></section>
   <section class="eqwrap">
-    <div class="eqhead"><h2>How your account is traded</h2><p>The exact rules the engine runs. Validated on 18 years of 1-minute NQ data with realistic fills.</p></div>
+    <div class="eqhead"><h2>How your account is traded</h2><p>The exact rules the engine runs. Tested on 18 years of 1-minute NQ data (2008 to 2026) with realistic fills.</p></div>
     <div class="steps" style="margin-top:14px">
       <div class="step"><span class="sn">1</span><div><b>One market, one decision.</b> At 10:30 ET the engine checks the move from the 9:30 open. It trades that direction only when it agrees with the 20-day trend. On the other days it sits out and risks nothing.</div></div>
       <div class="step"><span class="sn">2</span><div><b>Risk-sized hard stop.</b> The stop is 0.2&times; the average daily range. Contracts are sized so a stop-out costs about your risk per trade. The stop rests at the exchange the moment the entry fills.</div></div>
@@ -1139,7 +1158,8 @@ _PAGE = r"""
       <div class="step"><span class="sn">4</span><div><b>Flat by 15:59 ET, never overnight.</b> News days are traded: CPI, jobs and PPI days have tested better than average.</div></div>
     </div>
     <ul class="truths">
-      <li><b>A real but thin edge.</b> Profit factor about 1.28 with a 36% win rate. A few strong trend days pay for many small losses.</li>
+      <li><b>A real but thin edge.</b> Profit factor about 1.16 since 2008 (1.30 over the last 10 years) with a 34% win rate. A few strong trend days pay for many small losses: without the best 5% of trades it would lose money.</li>
+      <li><b>Long flat periods.</b> From 2009 to 2019 it made no new high for almost 10 years. Losing streaks of up to 19 trades have happened.</li>
       <li><b>Most evaluations fail.</b> Over the long run about 1 in 3 evaluations pass, and about 1 in 5 to 1 in 7 evaluations ends in a payout, and about half of funded accounts blow before their first payout. Budget for several evaluations, not one.</li>
       <li><b>Flat stretches happen.</b> From mid-2025 to today results have been close to breakeven, and the current-market figures above reflect that.</li>
       <li><b>Stagger accounts.</b> Accounts that start on the same day take the same trades and win or lose together. Start them a week or more apart.</li>
@@ -1202,7 +1222,8 @@ function projCard(){
     const pf=(fd.p1_full!=null?fd.p1_full:fd.p1),pn=(fd.p1_now||pf);
     const lo=epp(Math.max(pf,pn)),hi=epp(Math.min(pf,pn));
     hero=full+"%";cap=`<b>chance to pass</b> the ${state.acct_size} evaluation (${DDN[state.dd_type].toLowerCase()}): long-run average, 2008–26, including the weak years. About ${Math.max(1,Math.round(100/Math.max(1,full)))} tries per pass.`;meter=full;
-    tiles=[["Time to pass",p.days.toFixed(0)+" trading days","median; 3 in 4 within "+p.p75.toFixed(0)],
+    const dd_=(p.days_full!=null?p.days_full:p.days),p75_=(p.p75_full!=null?p.p75_full:p.p75);
+    tiles=[["Time to pass",dd_.toFixed(0)+" trading days","median when it passes; 3 in 4 within "+p75_.toFixed(0)],
            ["Good markets",p.pass_+"%","2020–26 starts; not a promise",""],
            ["Current market",p.pass_now+"%","starts since Jul 2025","warn"],
            ["Evaluations per payout",(lo===hi?lo:lo+"–"+hi),"from first evaluation to first cash","warn"]];
@@ -1222,8 +1243,8 @@ function projCard(){
   }else{const eq=DATA.equity;
     hero=money(r);cap="<b>risked per trade</b>: a stop-out costs about this much";
     tiles=[["Drawdown budget",money(state.cash_bal*state.cash_dd/100),state.cash_dd+"% of "+money(state.cash_bal)],
-           ["10-year result",money(eq.totalR*r),"at this risk per trade"],
-           ["Worst drawdown",money(eq.maxddR*r),"10-year history"],
+           ["18-year result",money(eq.totalR*r),"at this risk per trade, since 2008"],
+           ["Worst drawdown",money(eq.maxddR*r),"since 2008 (2009–2019 made no new high)"],
            ["Profit factor",eq.pf,"win rate "+eq.win+"%"]];}
   return `<div class="card"><div class="hd"><h2>${state.mode==="eval"?"Evaluation odds":state.mode==="funded"?"Funded outcome":"Live cash sizing"}</h2><p>Real 1-minute NQ data with Lucid commissions and slippage.</p></div>
    <div class="bd"><div class="hero"><div class="big">${hero}</div><div class="cap">${cap}</div></div>
@@ -1306,16 +1327,16 @@ function renderEquity(){
   const ar=ln+" L"+x(n-1).toFixed(1)+" "+y(0).toFixed(1)+" L"+x(0).toFixed(1)+" "+y(0).toFixed(1)+" Z";
   const yt=eq.months.map((m,i)=>[i,m]).filter(([i,m])=>m.endsWith("-01")).map(([i,m])=>`<text x="${x(i).toFixed(1)}" y="${H-6}" text-anchor="middle" font-size="10" font-weight="700" fill="#9ca3af">${m.slice(0,4)}</text>`).join("");
   const grid=`<line x1="${L}" x2="${W-R}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="#e5e7eb"/><text x="${L-6}" y="${(y(0)+3).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">$0</text><text x="${L-6}" y="${(y(mx)+9).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">${money(mx/1000)}k</text>`;
-  const tiles=[["Net, 10 years",money(eq.totalR*r)],["Profit factor",eq.pf],["Win rate",eq.win+"%"],["Worst drawdown",money(eq.maxddR*r)],["Trades",eq.n.toLocaleString("en-US")],["Risk per trade",money(r)]];
+  const tiles=[["Net, 18 years",money(eq.totalR*r)],["Profit factor",eq.pf],["Win rate",eq.win+"%"],["Worst drawdown",money(eq.maxddR*r)],["Trades",eq.n.toLocaleString("en-US")],["Risk per trade",money(r)]];
   const yrs=Object.entries(eq.years).map(([y2,v])=>`<div class="yr"><div class="y">${y2}${y2==="2026"?" YTD":""}</div><div class="r ${v.r>=0?"pos":"neg"}">${money(v.r*r)}</div></div>`).join("");
-  $("#eqSection").innerHTML=`<div class="eqhead"><h2>10-year equity curve</h2><p>Oct 2016 to Oct 2026 · real 1-minute NQ data · Lucid commissions and slippage · scaled to your risk of ${money(r)} per trade</p></div>
+  $("#eqSection").innerHTML=`<div class="eqhead"><h2>Full-history equity curve</h2><p>2008 to Oct 2026 · the exact rule the engine trades today · real 1-minute NQ data · Lucid commissions and slippage · scaled to your risk of ${money(r)} per trade</p></div>
     <div class="eqchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Equity curve">
       <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16a34a" stop-opacity=".16"/><stop offset="1" stop-color="#16a34a" stop-opacity="0"/></linearGradient></defs>
       ${grid}<path d="${ar}" fill="url(#eqg)"/><path d="${ln}" fill="none" stroke="#0f8f45" stroke-width="2.2" stroke-linejoin="round"/>
       <circle cx="${x(n-1).toFixed(1)}" cy="${y(c[n-1]).toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yt}</svg></div>
     <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
     <div class="yrs">${yrs}</div>
-    <div class="eqnote">This is the raw strategy at a constant ${money(r)} risk per trade for ten years, not an account balance. A prop account stops at its target, its drawdown limit or its payout cap long before this, so use the odds above for what an account can do. Past results do not guarantee future results; 2026 so far is close to breakeven.</div>`;
+    <div class="eqnote">This is the raw strategy at a constant ${money(r)} risk per trade since 2008, not an account balance. <b>Look at 2009 to 2019: the strategy made no new high for almost 10 years</b>, and its worst drawdown was about ${Math.round(-eq.maxddR)} times the risk per trade. Most of the profit came in strong trend years (2008, 2018, 2022 to 2025). Flat stretches that long can happen again. A prop account stops at its target, its drawdown limit or its payout cap long before this, so use the odds above for what an account can do. Past results do not guarantee future results; 2026 so far is close to breakeven.</div>`;
 }
 const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});
