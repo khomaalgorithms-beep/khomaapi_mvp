@@ -237,3 +237,31 @@ def test_risk_lock_blocks_the_orb_entry():
     ap = MultiAutopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: ctx())
     acts = run(ap, opening())
     assert acts[-1]["reason"] == "risk_locked" and fb.stop_entries == []
+
+
+def test_risk_plan_uses_the_validated_tables_for_each_strategy():
+    from app import orb_engine as E
+    from app.orb_validated import DATA
+    for size in ("25K", "50K", "100K", "150K"):
+        for dd in ("eod", "intraday", "static"):
+            for strat, key in (("orb", "orb"), ("both", "both")):
+                for pr in ("cons", "norm", "aggr"):
+                    assert E.risk_plan("eval", size, pr, dd, strat=strat)["risk_usd"] == DATA["setups"][key]["presets"][size][dd][pr]["risk"]
+                f = DATA["setups"][key]["funded"][size][dd]
+                assert E.risk_plan("funded", size, "safe", dd, strat=strat)["tp_r"] == 2.0
+                assert E.risk_plan("funded", size, "safe2", dd, strat=strat)["risk_usd"] == f["risk_after"]
+                assert E.risk_plan("funded", size, "norm", dd, strat=strat)["tp_r"] is None
+    # live cash on ORB: drawdown budget / ORB's worst drawdown since 2008
+    assert E.risk_plan("cash", "50K", "cons", "eod", 50000, 25, strat="orb")["risk_usd"] == round(12500 / DATA["setups"]["orb"]["cash"]["full"]["ddR"], 2)
+
+
+def test_strategy_mapping_and_autopilot_class():
+    from app import orb_engine as E
+    from app.orb_live import Autopilot
+    assert E.strategy_of("nq") == "momentum" and E.strategy_of("both") == "momentum"   # legacy NQ+RTY value
+    assert E.strategy_of("orb") == "orb" and E.strategy_of("combo") == "both"
+    c = cfg("both")
+    assert isinstance(E._make_autopilot(c, lambda: "tok"), MultiAutopilot)
+    c.strategy = "momentum"
+    ap = E._make_autopilot(c, lambda: "tok")
+    assert type(ap) is Autopilot

@@ -1173,6 +1173,8 @@ def install(app) -> None:
         asset = str(form.get("asset") or "nq")
         if asset not in ("nq", "orb", "combo"):
             asset = "nq"
+        if mode == "cash":
+            asset = "orb"                     # live cash runs ORB only (smallest drawdown per $ since 2008)
         if mode != "funded" and preset in ("safe", "safe2"):
             preset = "norm"
         try:
@@ -1375,6 +1377,11 @@ function recommend(mode,size,dd){let c=[];
   else{for(const s of STRATS){const d=cashD(s.v).full;c.push({a:s.v,preset:"cons",score:d.perMonthR/d.ddR,speed:0});}}
   const best=Math.max(...c.map(x=>x.score));const tie=mode==="cash"?c.filter(x=>x.score===best):c.filter(x=>x.score>=best-3);
   tie.sort((x,y)=>x.speed-y.speed||y.score-x.score);return tie[0];}
+function applyRec(){        // auto-preset: the recommended strategy (and preset) for this mode / size / drawdown type
+  if(state.mode==="cash"){state.asset="orb";if(!["cons","norm"].includes(state.preset))state.preset="cons";return;}
+  const r=recommend(state.mode,state.acct_size,state.dd_type);if(!r)return;
+  state.asset=r.a;state.preset=r.preset;
+}
 function riskUsd(){
   if(state.mode==="eval")return evalP(state.asset,state.acct_size,state.dd_type,state.preset).risk;
   if(state.mode==="funded"){const f=fundP(state.asset,state.acct_size,state.dd_type,isSafe());
@@ -1403,7 +1410,8 @@ function configCard(){
   return `<div class="card"><div class="hd"><h2>Configure</h2><p>Every number on this page comes from the validated backtest for these exact settings.</p></div>
    <div class="bd">
     <div class="field"><label>Mode</label>${seg("mode",[{v:"eval",t:"Evaluation"},{v:"funded",t:"Funded"},{v:"cash",t:"Live cash"}],state.mode)}</div>
-    <div class="field"><label>Strategy</label>${seg("asset",STRATS,state.asset)}
+    <div class="field"><label>Strategy</label>${state.mode==="cash"?seg("asset",STRATS.filter(x=>x.v==="orb"),"orb"):seg("asset",STRATS,state.asset)}
+      ${state.mode==="cash"?'<div class="pn" style="margin-top:6px">Live cash runs <b>ORB only</b>: since 2008 its worst drawdown was about a quarter of the other settings, so it earned the most for the same safety.</div>':""}
       <div class="pn">${{nq:"One decision at 10:30 ET: the move since the 9:30 open, only with the 20-day trend.",orb:"Resting stop order at 9:35 ET just beyond the 9:30–9:35 range, only if that price is also beyond yesterday's high (long) or low (short). Stop to breakeven at +1R. <b>New in the live engine (October 2026): backtested only, no live track record yet.</b>",combo:"Both strategies on the same account, each with its own order, stop and target. Risk per trade is per strategy. <b>New in the live engine (October 2026): backtested only, no live track record yet.</b>"}[state.asset]}</div>
       ${recBox()}</div>
     ${cash?`<div class="field"><label>Account balance &amp; max drawdown</label><div class="cashrow">
@@ -1486,7 +1494,7 @@ function render(){
   $("#envBadge").style.color=acc.env==="demo"?"#0f8f45":"#dc2626";$("#envBadge").style.borderColor=acc.env==="demo"?"#0f8f45":"#dc2626";
   document.querySelectorAll("[data-seg]").forEach(sg=>sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{const k=sg.dataset.seg,v=b.dataset.v;
     if(k==="fmode")state.preset=v==="safe"?"safe":"norm";else state[k]=v;
-    if(k==="mode"&&v==="cash")state.preset="cons";
+    if(k==="mode"||k==="acct_size"||k==="dd_type")applyRec();          // auto-preset; strategy/preset clicks stay manual
     if(k==="mode"&&v==="funded"&&!isSafe())state.preset="safe";   // Safe is the recommended funded default
     if(state.mode!=="funded"&&(state.preset==="safe"||state.preset==="safe2"))state.preset="norm";
     lastErr="";render();}));
@@ -1515,6 +1523,8 @@ function loadAcct(id){
   const c=CONFIGS[id]||{};
   state={acct:id,mode:c.mode||"eval",acct_size:c.acct_size||"50K",preset:c.preset||"norm",dd_type:c.dd_type||"eod",asset:(["orb","combo"].includes(c.asset)?c.asset:"nq"),
     cash_bal:+c.cash_bal||25000,cash_dd:+c.cash_dd||15,enabled:!!c.enabled};
+  if(!c.mode||(!c.enabled&&!["orb","combo"].includes(c.asset)))applyRec();   // new / never-armed-on-the-new-engine accounts start on the recommendation
+  if(state.mode==="cash")state.asset="orb";
   render();
 }
 function poll(){
