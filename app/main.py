@@ -8101,6 +8101,15 @@ def webhook_trade(payload: WebhookTrade):
         if event == "place_orb":
             if payload.auth != user["webhook_secret"]:
                 raise Exception("Invalid webhook secret.")
+            # RETIRED (2026-10-12): KhomaVolume now runs fully server-side (app/orb_engine.py, validated
+            # 10:30 rule). The old TradingView ORB alert must not trade alongside it (double positions).
+            # Set ORB_LEGACY_WEBHOOK=on to re-enable this legacy path.
+            if os.getenv("ORB_LEGACY_WEBHOOK", "off").lower() != "on":
+                latency = round((time.perf_counter() - start_time) * 1000, 3)
+                msg = ("Retired: KhomaVolume now trades server-side from the KhomaVolume page. "
+                       "Remove this TradingView ORB alert; no order was placed.")
+                log_trade(user["id"], request_id, str(payload.symbol or "*"), event, 0, "rejected", "REJECTED", latency, msg, {})
+                return JSONResponse(status_code=200, content={"ok": False, "status": "REJECTED", "error": msg})
             sym = (str(payload.symbol).upper() if payload.symbol else None)
             if not sym:
                 latency = round((time.perf_counter() - start_time) * 1000, 3)

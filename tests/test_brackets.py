@@ -509,6 +509,28 @@ def test_replace_stops_falls_back_to_bare_stop_when_oco_rejected(monkeypatch):
 
 
 # ---- resting stop-limit ORB entries (place_orb / cancel_pending_entries) ----
+# The legacy TradingView place_orb path is RETIRED by default (server-side engine replaced it); the tests below
+# exercise the legacy behaviour, so they opt back in with ORB_LEGACY_WEBHOOK=on.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _legacy_orb_on(monkeypatch, request):
+    if "place_orb" in request.node.name and "retired" not in request.node.name:
+        monkeypatch.setenv("ORB_LEGACY_WEBHOOK", "on")
+
+
+def test_handler_place_orb_retired_by_default(monkeypatch):
+    uid, email, secret = _mk_user()
+    monkeypatch.delenv("ORB_LEGACY_WEBHOOK", raising=False)
+    placed = []
+    monkeypatch.setattr(appmod, "webhook_subscription_ok", lambda u: True)
+    monkeypatch.setattr(appmod, "execute_orb_to_accounts", lambda *a, **k: placed.append(1) or {"placed": 1, "total": 1})
+    r = _client.post("/webhook/trade", json={"client_id": email, "auth": secret, "event": "place_orb", "symbol": "MNQ1!",
+        "qty": 2, "long": {"entryStop": 30000, "entryLimit": 30002, "sl": 29995, "tp": 30020}})
+    b = r.json()
+    assert r.status_code == 200 and b.get("status") == "REJECTED" and "Retired" in b.get("error", "") and placed == []
+
 
 def test_place_stoplimit_bracket_body(monkeypatch):
     cap = {}
