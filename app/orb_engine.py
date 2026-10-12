@@ -210,7 +210,8 @@ def save_config(user_id: int, account_pk: int, account_id: str, *, enabled: bool
     never reach the sizing tables."""
     assert mode in ("eval", "funded", "cash")
     assert acct_size in ("25K", "50K", "100K", "150K")
-    assert preset in ("cons", "norm", "aggr")
+    assert preset in ("cons", "norm", "aggr", "safe", "safe2")
+    assert preset not in ("safe", "safe2") or mode == "funded"
     assert asset in ("nq", "rty", "both")
     assert dd_type in ("eod", "intraday", "static")
     cash_bal = float(cash_bal); cash_dd = float(cash_dd)
@@ -337,12 +338,18 @@ def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
     if mode == "eval":
         risk = float(VALIDATED["presets"][acct_size][dd][preset]["risk"])
         return dict(risk_usd=risk, max_micros=a["eval_micros"], day_tp_usd=round(0.48 * a["target"]),
-                    start=a["start"], target=a["target"])
+                    start=a["start"], target=a["target"], tp_r=None, min_micros=0)
     if mode == "funded":
-        return dict(risk_usd=float(VALIDATED["funded"][acct_size][dd]["risk"]), max_micros=a["funded_micros"],
-                    day_tp_usd=None, start=a["start"], target=0)
+        f = VALIDATED["funded"][acct_size][dd]
+        if preset in ("safe", "safe2") and f.get("safe"):
+            # Funded SAFE (validated): take-profit at 2x the stop; risk halves after the first payout ("safe2")
+            sf = f["safe"]
+            return dict(risk_usd=float(sf["risk_after"] if preset == "safe2" else sf["risk"]), max_micros=a["funded_micros"],
+                        day_tp_usd=None, start=a["start"], target=0, tp_r=float(sf["tp_r"]), min_micros=1)
+        return dict(risk_usd=float(f["risk"]), max_micros=a["funded_micros"],
+                    day_tp_usd=None, start=a["start"], target=0, tp_r=None, min_micros=1)
     return dict(risk_usd=round(float(cash_bal) * float(cash_dd) / 100.0 * _CASH_FRAC.get(preset, 0.25)),
-                max_micros=40, day_tp_usd=None, start=0, target=0)
+                max_micros=40, day_tp_usd=None, start=0, target=0, tp_r=None, min_micros=0)
 
 
 def qty_for(mode: str, acct_size: str, preset: str, asset: str, dd_type: str = "eod",
@@ -350,7 +357,10 @@ def qty_for(mode: str, acct_size: str, preset: str, asset: str, dd_type: str = "
     """ESTIMATED micros at today's volatility (the engine sizes exactly at 10:30 from the live stop)."""
     plan = risk_plan(mode, acct_size, preset, dd_type, cash_bal, cash_dd)
     a = atr or (get_context("MNQ", _now_et().strftime("%Y-%m-%d")) or MOM.DayContext("", None, 0)).atr or 300.0
-    return {"MNQ": MOM.micros_for_risk(plan["risk_usd"], MOM.STOP_ATR * a, 2.0, plan["max_micros"])}
+    q = MOM.micros_for_risk(plan["risk_usd"], MOM.STOP_ATR * a, 2.0, plan["max_micros"])
+    if q <= 0 and plan.get("min_micros"):
+        q = min(int(plan["min_micros"]), int(plan["max_micros"]))
+    return {"MNQ": q}
 
 
 def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) -> str:
@@ -383,7 +393,8 @@ def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
                         account_name=row["account_name"], instruments=contracts, qty=qty,
                         params=dict(DEFAULT_PARAMS), observe=observe, strategy="momentum",
                         mode=row["mode"], risk_usd=plan["risk_usd"], max_micros=plan["max_micros"],
-                        acct_start=plan["start"], acct_target=plan["target"], day_tp_usd=plan["day_tp_usd"])
+                        acct_start=plan["start"], acct_target=plan["target"], day_tp_usd=plan["day_tp_usd"],
+                        tp_r=plan.get("tp_r"), min_micros=int(plan.get("min_micros") or 0))
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +966,8 @@ def install(app) -> None:
         enabling = form.get("enabled") in ("1", "true", "on", True)
         mode = str(form.get("mode") or "eval"); size = str(form.get("acct_size") or "50K")
         preset = str(form.get("preset") or "norm"); dd = str(form.get("dd_type") or "eod")
+        if mode != "funded" and preset in ("safe", "safe2"):
+            preset = "norm"
         try:
             cb = float(str(form.get("cash_bal") or "25000").replace(",", ""))
             cd = float(form.get("cash_dd") or 15)
@@ -1138,21 +1151,27 @@ _PAGE = r"""
 const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__;
 const SIZES=["25K","50K","100K","150K"],DDN={eod:"End-of-day trailing",intraday:"Intraday trailing",static:"Static"};
 const TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
+const QUAL={"25K":100,"50K":150,"100K":200,"150K":250};
 const EVALMAX={"25K":20,"50K":40,"100K":60,"150K":100},FUNDMAX={"25K":10,"50K":20,"100K":30,"150K":40},CASHF={cons:.25,norm:.35,aggr:.5};
 const $=s=>document.querySelector(s),money=n=>(n<0?"-":"")+"$"+Math.abs(Math.round(n)).toLocaleString("en-US");
 let state=null,CTX={ready:false},lastErr="";
 
 function riskUsd(){
   if(state.mode==="eval")return DATA.presets[state.acct_size][state.dd_type][state.preset].risk;
-  if(state.mode==="funded")return DATA.funded[state.acct_size][state.dd_type].risk;
+  if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
+    if(isSafe()&&f.safe)return state.preset==="safe2"?f.safe.risk_after:f.safe.risk;return f.risk;}
   return Math.round(state.cash_bal*state.cash_dd/100*CASHF[state.preset]);
 }
+function isSafe(){return state.mode==="funded"&&(state.preset==="safe"||state.preset==="safe2");}
 function stopPts(){return CTX.ready&&CTX.stop_pts?CTX.stop_pts:null;}
 function micros(){const sp=stopPts()||60,per=sp*2,r=riskUsd(),cap=state.mode==="eval"?EVALMAX[state.acct_size]:state.mode==="funded"?FUNDMAX[state.acct_size]:40;
-  let q=Math.floor(r/per);if(q===0&&per<=1.5*r)q=1;return Math.max(0,Math.min(q,cap));}
+  let q=Math.floor(r/per);if(q===0&&(per<=1.5*r||state.mode==="funded"))q=1;return Math.max(0,Math.min(q,cap));}
 function seg(id,opts,val){return `<div class="seg${opts.length===4?' four':''}" data-seg="${id}" role="group">`+
   opts.map(o=>`<button type="button" data-v="${o.v}" aria-pressed="${o.v===val}">${o.t}</button>`).join("")+`</div>`;}
 
+function safePlan(){const f=DATA.funded[state.acct_size][state.dd_type].safe;if(!f)return "";
+  return state.preset==="safe"?`<b>Payout plan.</b> Request <b>$500</b> as soon as your firm allows it (LucidFlex: profit of at least $1,000 and 5 winning days of ${money(QUAL[state.acct_size])}+). Then set <b>First payout</b> to <b>Taken</b>: the engine halves its risk to protect the account.`:
+  `<b>After your first payout</b> the engine risks ${money(f.risk_after)} per trade. Request <b>$1,000</b> payouts only when your balance is at least <b>${money(f.cushion)}</b> above your account floor, so one bad week cannot end the account.`;}
 function configCard(){
   const cash=state.mode==="cash";
   return `<div class="card"><div class="hd"><h2>Configure</h2><p>Every number on this page comes from the validated backtest for these exact settings.</p></div>
@@ -1165,7 +1184,10 @@ function configCard(){
       `<div class="field"><label>Account size</label>${seg("acct_size",SIZES.map(s=>({v:s,t:"$"+s})),state.acct_size)}</div>
        <div class="field"><label>Drawdown type</label>${seg("dd_type",[{v:"eod",t:"End-of-day trailing"},{v:"intraday",t:"Intraday trailing"},{v:"static",t:"Static"}],state.dd_type)}
         <div class="pn">${state.dd_type==="eod"?"LucidFlex and most EOD plans: the floor trails your end-of-day balance and locks at start + $100.":state.dd_type==="intraday"?"The floor trails your highest open profit during the day. Harder: size is reduced to match.":"The floor never moves. Easiest drawdown: size is increased to match."}</div></div>`}
-    ${state.mode==="funded"?`<div class="field"><label>Risk</label><div class="pn" style="margin-top:0">Funded mode uses one validated setting: about 12% of the max loss per trade, held to the close. Request $1,000 payouts once profit passes ${money(MLL[state.acct_size]+300)}; skip the early $500 minimum.</div></div>`:
+    ${state.mode==="funded"?`<div class="field"><label>Funded mode</label>${seg("fmode",[{v:"std",t:"Standard"},{v:"safe",t:"Safe (recommended)"}],isSafe()?"safe":"std")}
+      <div class="pn" style="margin-top:6px">${isSafe()?`<b>Safe</b> is built to get you paid and keep the account: the same 10:30 trade, but each winner is closed at <b>2&times; the stop</b> instead of held to the close, and you take a <b>small first payout early</b>.`:`<b>Standard</b> risks about 12% of the max loss per trade and holds every trade to the close. Bigger potential payouts, but about half of funded accounts blow before their first payout over the long run.`}</div></div>
+      ${isSafe()?`<div class="field"><label>First payout</label>${seg("preset",[{v:"safe",t:"Not yet taken"},{v:"safe2",t:"Taken"}],state.preset)}
+      <div class="pn">${safePlan()}</div></div>`:""}`:
       `<div class="field"><label>Risk preset</label>${seg("preset",[{v:"cons",t:"Conservative"},{v:"norm",t:"Normal"},{v:"aggr",t:"Aggressive"}],state.preset)}
       <div class="pn">${{cons:"Best odds. Passes in about 3–5 weeks.",norm:"Balanced. Passes in about 2–3 weeks.",aggr:"Fastest, about 2 weeks, but fails more often."}[state.preset]}</div></div>`}
    </div></div>`;
@@ -1184,6 +1206,12 @@ function projCard(){
            ["Good markets",p.pass_+"%","2020–26 starts; not a promise",""],
            ["Current market",p.pass_now+"%","starts since Jul 2025","warn"],
            ["Evaluations per payout",(lo===hi?lo:lo+"–"+hi),"from first evaluation to first cash","warn"]];
+  }else if(isSafe()&&DATA.funded[state.acct_size][state.dd_type].safe){const f=DATA.funded[state.acct_size][state.dd_type].safe;
+    hero=f.paid_full+"%";cap="<b>reach at least one payout</b> within a year of being funded, Safe mode: long-run average, 2008–25 starts, including the weak years";meter=f.paid_full;
+    tiles=[["First payout",(f.med_full||0).toFixed(0)+" trading days","median, when paid; "+f.p120_full+"% are paid within 6 months"],
+           ["Blown before payout",f.bb_full+"%","long run (Standard: "+DATA.funded[state.acct_size][state.dd_type].bb_full+"%)","warn"],
+           ["Year-1 payouts",money(f.cash_full),"average per funded account, after the 90/10 split"],
+           ["Good / current market",f.paid_good+"% / "+f.paid_now+"%","reach a payout: 2020–25 starts / 2025 starts",""]];
   }else if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
     const full=f.p1_full!=null;
     hero=(full?f.p1_full:f.p1)+"%";cap="<b>reach at least one payout</b> within a year of being funded: long-run average, 2008–25 starts, including the weak years";meter=full?f.p1_full:f.p1;
@@ -1229,7 +1257,11 @@ function render(){
   const acc=ACCOUNTS.find(a=>a.id===state.acct);
   $("#envBadge").textContent=(acc.env||"live").toUpperCase();
   $("#envBadge").style.color=acc.env==="demo"?"#0f8f45":"#dc2626";$("#envBadge").style.borderColor=acc.env==="demo"?"#0f8f45":"#dc2626";
-  document.querySelectorAll("[data-seg]").forEach(sg=>sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{state[sg.dataset.seg]=b.dataset.v;lastErr="";render();}));
+  document.querySelectorAll("[data-seg]").forEach(sg=>sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{const k=sg.dataset.seg,v=b.dataset.v;
+    if(k==="fmode")state.preset=v==="safe"?"safe":"norm";else state[k]=v;
+    if(k==="mode"&&v==="funded"&&!isSafe())state.preset="safe";   // Safe is the recommended funded default
+    if(state.mode!=="funded"&&(state.preset==="safe"||state.preset==="safe2"))state.preset="norm";
+    lastErr="";render();}));
   const bi=$("#balIn");if(bi)bi.onchange=e=>{state.cash_bal=Math.max(1000,+e.target.value.replace(/[^0-9]/g,"")||25000);render();};
   const di=$("#ddIn");if(di)di.oninput=e=>{state.cash_dd=+e.target.value;$("#ddOut").textContent=state.cash_dd+"%";};
   if(di)di.onchange=()=>render();

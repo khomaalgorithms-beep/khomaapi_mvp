@@ -221,6 +221,8 @@ class AccountConfig:
     acct_start: float = 0.0          # eval/funded starting balance (for the eval pass take-profit)
     acct_target: float = 0.0         # eval profit target
     day_tp_usd: Optional[float] = None   # eval daily take-profit cap (48% of target); None = hold to close
+    tp_r: Optional[float] = None         # funded Safe: take-profit at tp_r x the stop distance (None = hold to close)
+    min_micros: int = 0                  # funded: trade at least this many micros (validated sizing floor)
     risk_check: Optional[Callable[[], str]] = None   # -> lock reason ('' = OK); KhomaAPI Risk Engine lock
 
 
@@ -404,6 +406,8 @@ class Autopilot:
     def _place_momentum(self, root: str, st: _DayState, sig, ctx) -> dict:
         spec = INSTRUMENTS[root]
         qty = MOM.micros_for_risk(self.cfg.risk_usd, sig.stop_points, spec.dollars_per_point, self.cfg.max_micros)
+        if qty <= 0 and self.cfg.min_micros > 0 and self.cfg.risk_usd > 0:
+            qty = min(int(self.cfg.min_micros), int(self.cfg.max_micros))
         info = {"root": root, "side": sig.side, "qty": qty, "stop_pts": sig.stop_points,
                 "ref": sig.ref_price, "move": sig.move, "trend": ctx.trend, "atr": round(ctx.atr, 2)}
         if self.cfg.observe.get(root):
@@ -430,6 +434,9 @@ class Autopilot:
         tp = None
         if tp_usd:
             pts = tp_usd / (qty * spec.dollars_per_point)
+            tp = round_tick(sig.ref_price + pts if long_ else sig.ref_price - pts, spec.tick)
+        elif self.cfg.tp_r:
+            pts = float(self.cfg.tp_r) * sig.stop_points
             tp = round_tick(sig.ref_price + pts if long_ else sig.ref_price - pts, spec.tick)
         resp = self._broker.place_bracket_order(
             self.cfg.env, token, self.cfg.account_spec, self.cfg.account_id,

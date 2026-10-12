@@ -339,3 +339,56 @@ def test_backfill_merges_when_a_live_bar_arrived_first():
     assert res["action"] == "backfill_ready" and res["has_open"] is True
     run_day(ap, [b for b in session(20000, 20040) if b.minute_of_day >= 10 * 60 + 4])
     assert len(fb.place_calls) == 1 and fb.place_calls[0]["action"] == "buy"
+
+
+# ---- Funded SAFE mode ---------------------------------------------------------------------------
+def test_funded_safe_places_take_profit_at_two_times_the_stop():
+    fb = Broker()
+    c = cfg(mode="funded", risk=240); c.tp_r = 2.0; c.min_micros = 1
+    ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    call = fb.place_calls[0]
+    assert call["qty"] == 2 and call["sl"] == 19980.0 and call["tp"] == pytest.approx(20040 + 120, abs=0.25)
+
+
+def test_funded_min_micros_floor_trades_one_micro_when_risk_is_below_one_stop():
+    fb = Broker()
+    c = cfg(mode="funded", risk=60); c.tp_r = 2.0; c.min_micros = 1      # 25K Safe after first payout
+    ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    assert fb.place_calls[0]["qty"] == 1
+
+
+def test_risk_plan_funded_safe_and_after_first_payout():
+    from app import orb_engine as E
+    from app.orb_validated import DATA
+    for size, mll in (("25K", 1000), ("50K", 2000), ("100K", 3000), ("150K", 4500)):
+        for dd in ("eod", "intraday", "static"):
+            s1 = E.risk_plan("funded", size, "safe", dd); s2 = E.risk_plan("funded", size, "safe2", dd)
+            assert s1["risk_usd"] == round(0.12 * mll) and s2["risk_usd"] == round(0.06 * mll)
+            assert s1["tp_r"] == 2.0 == s2["tp_r"] and s1["day_tp_usd"] is None
+            assert E.risk_plan("funded", size, "norm", dd)["tp_r"] is None             # Standard still holds to close
+            assert DATA["funded"][size][dd]["safe"]["paid_full"] > DATA["funded"][size][dd]["p1_full"]
+
+
+def test_build_account_config_funded_safe(monkeypatch):
+    from app import orb_engine as E
+    monkeypatch.setattr(E.tvo, "resolve_contract", lambda env, tok, root: "MNQZ6")
+    row = {"env": "demo", "asset": "nq", "mode": "funded", "acct_size": "50K", "preset": "safe2",
+           "dd_type": "eod", "account_name": "LFF1", "account_id": "43"}
+    c = E.build_account_config(row, "tok")
+    assert c.mode == "funded" and c.risk_usd == 120 and c.tp_r == 2.0 and c.min_micros == 1 and c.day_tp_usd is None
+
+
+def test_safe_presets_only_valid_in_funded_mode():
+    from app import orb_engine as E
+    with pytest.raises(AssertionError):
+        E.save_config(1, 1, "1", enabled=True, mode="eval", acct_size="50K", preset="safe", asset="nq", dd_type="eod")
+
+
+def test_dashboard_renders_funded_safe():
+    from app import orb_engine as E
+    html = E._render_dashboard([{"account_id": "43", "account_name": "LFF1", "env": "demo"}],
+                               {"43": {"enabled": 1, "mode": "funded", "acct_size": "50K", "preset": "safe",
+                                       "dd_type": "eod", "cash_bal": 25000, "cash_dd": 15}})
+    assert '"safe": {' in html and "Safe (recommended)" in html and "First payout" in html
