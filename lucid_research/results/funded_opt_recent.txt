@@ -1,0 +1,28 @@
+=== 50K funded, year-1, recent ===  (sorted by avg trader cash)
+sizing                             day TP payout@ | avg cash >=1 pay payouts  blow
+cushion 20%                           600    4000 | $   1876     38%    1.04   90%
+2-phase: 1 MNQ then 15% cushion       600    4000 | $   1872     38%    1.04   88%
+2-phase: 1 MNQ then 25% cushion       600    4000 | $   1782     38%    0.99   92%
+cushion 10%                           600    4000 | $   1766     39%    0.98   88%
+fixed 1 MNQ                           600    4000 | $   1757     39%    0.98   88%
+fixed ~3 MNQ                         None    4000 | $   1728     34%    0.96   91%
+2-phase: 1 MNQ then 25% cushion       600    3000 | $   1702     44%    1.14   92%
+fixed ~2 MNQ                          300    3000 | $   1663     48%    1.18   84%
+cushion 20%                           600    3000 | $   1642     42%    1.11   92%
+fixed ~3 MNQ                          600    4000 | $   1640     34%    0.91   92%
+fixed ~2 MNQ                          600    4000 | $   1629     36%    0.91   89%
+2-phase: 1 MNQ then 15% cushion       600    3000 | $   1622     43%    1.11   92%
+fixed 1 MNQ                           600    3000 | $   1621     43%    1.12   92%
+cushion 10%                           600    3000 | $   1621     43%    1.12   92%
+fixed ~2 MNQ                          300    4000 | $   1598     42%    0.89   73%
+2-phase: 1 MNQ then 25% cushion       300    3000 | $   1572     46%    1.12   89%
+cushion 20%                           300    4000 | $   1562     40%    0.87   79%
+2-phase: 1 MNQ then 15% cushion      None    4000 | $   1555     34%    0.86   89%
+cushion 10%                           300    3000 | $   1551     46%    1.10   87%
+fixed 1 MNQ                           300    3000 | $   1551     46%    1.10   87%
+2-phase: 1 MNQ then 15% cushion       300    3000 | $   1551     46%    1.10   87%
+cushion 10%                          None    4000 | $   1550     34%    0.86   89%
+fixed 1 MNQ                          None    4000 | $   1541     34%    0.86   88%
+2-phase: 1 MNQ then 15% cushion       300    4000 | $   1534     40%    0.85   76%
+fixed ~2 MNQ                          600    3000 | $   1521     42%    1.05   93%
+fixed 1 MNQ                          None    3000 | $   1399     39%    0.92   95%

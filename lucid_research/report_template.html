@@ -1,0 +1,146 @@
+<title>KhomaVolume NQ Validation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single reading column (max 1040px) of report sections; charts span the column, tables scroll inside their own box. */
+:root{
+  --bg:#f5f7fa; --surface:#ffffff; --ink:#14202e; --muted:#5d6b7c; --line:#d9e0e8;
+  --accent:#1f5fbf; --accent-soft:rgba(31,95,191,.12); --neg:#c0392b; --neg-soft:rgba(192,57,43,.14);
+  --good:#1d7a4a; --warn:#a86400; --chip:#eef2f7;
+  --display:"Archivo","Helvetica Neue",Arial,sans-serif; --body:"IBM Plex Sans","Segoe UI",Arial,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0e141c; --surface:#151d28; --ink:#e6edf5; --muted:#93a2b4; --line:#26323f;
+  --accent:#6aa6ff; --accent-soft:rgba(106,166,255,.14); --neg:#ff7a6b; --neg-soft:rgba(255,122,107,.16);
+  --good:#5fd19a; --warn:#f0b35a; --chip:#1d2733; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0e141c; --surface:#151d28; --ink:#e6edf5; --muted:#93a2b4; --line:#26323f;
+  --accent:#6aa6ff; --accent-soft:rgba(106,166,255,.14); --neg:#ff7a6b; --neg-soft:rgba(255,122,107,.16);
+  --good:#5fd19a; --warn:#f0b35a; --chip:#1d2733; color-scheme:dark}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.55}
+.wrap{max-width:1040px;margin:0 auto;padding-inline:20px;padding-block:28px 64px;display:flex;flex-direction:column;gap:40px}
+h1,h2{font-family:var(--display);letter-spacing:-.01em;text-wrap:balance;margin:0}
+h1{font-size:clamp(28px,4vw,40px);font-weight:800}
+h2{font-size:22px;font-weight:700}
+p{margin:0;max-width:68ch}
+.eyebrow{font:500 12px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header{display:flex;flex-direction:column;gap:10px}
+.muted{color:var(--muted);font-size:13px}
+section{display:flex;flex-direction:column;gap:14px;min-width:0}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi b{display:block;font:700 22px var(--display);font-variant-numeric:tabular-nums}
+.kpi span{font-size:12px;color:var(--muted)}
+.chart{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 8px 4px}
+.chart svg{width:100%;height:auto;display:block}
+.grid{stroke:var(--line);stroke-width:1}
+.zero{stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.axis{fill:var(--muted);font:11px var(--mono)}
+.lbl{fill:var(--accent);font:600 13px var(--mono)}
+.area{fill:var(--accent-soft)} .line{fill:none;stroke:var(--accent);stroke-width:1.6} .dot{fill:var(--accent)}
+.ddarea{fill:var(--neg-soft)} .ddline{fill:none;stroke:var(--neg);stroke-width:1.2}
+.tbl{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:14px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:500 11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.sz{font:700 15px var(--display)}
+.pos{color:var(--good)} .neg{color:var(--neg)} .warn{color:var(--warn)}
+.chip{font:500 12px var(--mono);padding:2px 8px;border-radius:99px;background:var(--chip);white-space:nowrap}
+.chip.conservative{color:var(--good)} .chip.normal{color:var(--accent)} .chip.aggressive{color:var(--warn)}
+.state{font:600 11px var(--mono);letter-spacing:.05em;text-transform:uppercase;padding:3px 8px;border-radius:6px;white-space:nowrap}
+.state.pass{color:var(--good);background:var(--chip)} .state.fixed{color:var(--accent);background:var(--chip)} .state.flag{color:var(--warn);background:var(--chip)}
+.callout{border-left:3px solid var(--warn);background:var(--surface);padding:14px 16px;border-radius:0 10px 10px 0;display:flex;flex-direction:column;gap:6px}
+.callout.blue{border-left-color:var(--accent)}
+.rules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.rule{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.rule b{font-family:var(--display)}
+@media (max-width:760px){.rules{grid-template-columns:1fr}}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">KhomaAlgorithms · Research report · October 11, 2026</div>
+  <h1>KhomaVolume NQ Validation</h1>
+  <p>One rule survived 26,883 strategy tests across 25 Lucid-tradable futures: at 10:30 ET, trade MNQ in the direction of the 9:30→10:30 move when it agrees with the 20-day trend, stop at 0.3× the daily range, exit at 16:00. This page shows its 10-year record, the stress tests it went through, the Lucid presets and a simulated forward test.</p>
+</header>
+
+<section>
+  <div class="callout blue">
+    <b>Read this first</b>
+    <p>The max-level audit found a look-ahead bias in the earlier multi-signal "trade every day" version: it made money on a pure random walk. That version is retired. Every number on this page uses the single 10:30 rule, which loses only its costs on random data. Honest pass speed is about two weeks, not six days.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">10-year record · Oct 10 2016 – Oct 9 2026 · $500 risk per trade · Lucid commission + 1 tick slippage</div>
+  <h2>Equity curve</h2>
+  <div class="kpis">
+    <div class="kpi"><b>{{NET}}</b><span>Net profit</span></div>
+    <div class="kpi"><b>{{PF}}</b><span>Profit factor</span></div>
+    <div class="kpi"><b>{{WIN}}</b><span>Win rate</span></div>
+    <div class="kpi"><b>{{MAXDD}}</b><span>Max drawdown</span></div>
+    <div class="kpi"><b>{{TRADES}}</b><span>Trades</span></div>
+  </div>
+  <div class="chart">{{EQ}}</div>
+  <div class="eyebrow">Drawdown from the running peak</div>
+  <div class="chart">{{DD}}</div>
+  <p class="muted">Fixed $500 risk per trade means about 3–4 MNQ at the median stop. Profit scales linearly with risk; the shape does not change.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Year</th><th>Trades</th><th>Win</th><th>PF</th><th>Net</th><th>Max DD</th></tr></thead>
+    <tbody>{{YEARS}}</tbody></table></div>
+</section>
+
+<section>
+  <div class="eyebrow">Max-level stress battery</div>
+  <h2>Stress tests</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Test</th><th>Result</th><th>Status</th></tr></thead>
+    <tbody>{{TESTS}}</tbody></table></div>
+</section>
+
+<section>
+  <div class="eyebrow">LucidFlex evaluation · rules read from Lucid on Oct 11 2026 · EOD trailing drawdown</div>
+  <h2>Eval presets</h2>
+  <p class="muted">Pass rate and median trading days to pass (75th percentile in brackets), rolling starts 2020–26, real costs. Each preset also uses a take-profit at the dollars still needed to pass and a daily cap at 48% of the target.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Account</th><th>Preset</th><th>Risk / trade</th><th>Pass</th><th>Days</th><th>2024–26</th><th>Bad execution</th></tr></thead>
+    <tbody>{{PRESETS}}</tbody></table></div>
+</section>
+
+<section>
+  <div class="eyebrow">Funded mode · same signal · hold to close · let the drawdown lock, then request $1,000 payouts</div>
+  <h2>Funded mode</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Account</th><th>Mode</th><th>1st payout, median trading days</th><th>≥ 1 payout</th><th>Blown before 1st payout</th><th>Year-1 cash</th><th>≥ 1 payout, last 12 months</th></tr></thead>
+    <tbody>{{FUNDED}}</tbody></table></div>
+  <p class="muted">Ranges span 2020–23 and 2024–25 starts. Do not take the $500 minimum payout early: it leaves about $400 above the floor and most accounts blow.</p>
+</section>
+
+<section>
+  <div class="eyebrow">Forward-test simulator · rules frozen · 21 clients per launch spread over 3 months · followed 12 months</div>
+  <h2>Simulated client launches</h2>
+  <p class="muted">Each client buys a LucidFlex 50K ($90), runs the Normal preset, buys another eval after a breach (max 5), and switches to Funded mode on passing. Clients who start within days of each other take the same trades, so a launch tends to win or lose together. Average across launches: {{AVGNET}} net per client per year.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Launch</th><th>Funded</th><th>Days to funded</th><th>Paid within 12m</th><th>Avg payouts</th><th>Avg eval fees</th><th>Avg net</th><th>Net positive</th></tr></thead>
+    <tbody>{{COHORTS}}</tbody></table></div>
+</section>
+
+<section>
+  <div class="eyebrow">Forward projection · block bootstrap · $500 risk per trade</div>
+  <h2>Next 3, 6 and 12 months</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>If the market behaves like</th><th>Horizon</th><th>Chance of profit</th><th>Bad case (5th pct)</th><th>Median</th><th>Good case (95th pct)</th></tr></thead>
+    <tbody>{{PROJ}}</tbody></table></div>
+</section>
+
+<section>
+  <h2>What this proves and what it doesn't</h2>
+  <div class="rules">
+    <div class="rule"><b>Proven</b><p>Positive expectancy 2017–2025, unbiased simulator, robust to costs, noise, latency, missed trades and parameter changes, and profitable when re-fitted blind each year.</p></div>
+    <div class="rule"><b>Not proven</b><p>That it is working right now. The last 12 months are flat (PF about 1.0). If this regime continues, expect results near the luck baseline.</p></div>
+    <div class="rule"><b>What clients should hear</b><p>About 2 in 5 evaluations pass, typically in 2–3 weeks. Funded payouts take about 3–5 months. Run accounts one after another or staggered, never as simultaneous copies.</p></div>
+    <div class="rule"><b>What to do first</b><p>Make order execution reliable within a minute of 10:30, and track live results against this page every month.</p></div>
+  </div>
+</section>
+</div>
