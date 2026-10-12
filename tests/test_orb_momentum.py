@@ -611,3 +611,17 @@ def test_fill_and_close_between_polls_is_still_reported():
     st.verify_until = datetime.utcnow() - timedelta(seconds=1)
     acts = [a["action"] for a in ap.poll()]
     assert acts == ["filled", "closed"] and st.status == "DONE"
+
+
+def test_rest_catch_up_also_covers_the_orb_range_bar():
+    from app import orb_engine as E
+
+    class AP:
+        def __init__(self): self.seen = []; self.cfg = type("C", (), {"instruments": {"MNQ": "MNQZ6"}})()
+        def on_bar(self, root, b): self.seen.append(b.minute_of_day); return None
+    m = E.EngineManager(start_feed=False)
+    ap = AP(); m._active = {1: {"autopilot": ap}}; m._feed_roots = ("MNQ",)
+    m.on_bar("MNQ", bar(9, 32, 1, 1, 1, 1))
+    rest = [bar(9, mm, 1, 1, 1, 1) for mm in range(30, 35)]
+    m.catch_up(lambda r: rest, datetime(2026, 10, 13, 9, 35, 20))
+    assert ap.seen == [572, 573, 574]

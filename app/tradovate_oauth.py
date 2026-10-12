@@ -435,6 +435,24 @@ def place_stoplimit_bracket(env: str, token: str, account_spec, account_id, acti
     return resp if resp is not None else {"error": "request failed"}
 
 
+def place_stop_entry_bracket(env: str, token: str, account_spec, account_id, action: str, symbol: str, qty: int,
+                             entry_stop, stop_price, limit_price=None):
+    """RESTING stop-MARKET entry (fills once price trades through entry_stop) with an OSO bracket: protective
+    stop-market at stop_price and, if given, a take-profit limit. The bracket only becomes working when the entry
+    fills, so there is never a naked position. Used by the ORB opening-range entry."""
+    contract = resolve_contract(env, token, symbol)
+    entry_action = "Buy" if str(action).lower() == "buy" else "Sell"
+    exit_action = "Sell" if entry_action == "Buy" else "Buy"
+    body = {"accountSpec": str(account_spec), "accountId": int(account_id), "action": entry_action,
+            "symbol": str(contract).upper(), "orderQty": int(qty), "orderType": "Stop", "stopPrice": float(entry_stop),
+            "isAutomated": True, "timeInForce": "Day",
+            "bracket1": {"action": exit_action, "orderType": "Stop", "stopPrice": float(stop_price)}}
+    if limit_price is not None:
+        body["bracket2"] = {"action": exit_action, "orderType": "Limit", "price": float(limit_price)}
+    resp = _post(env, token, "/order/placeOSO", body)
+    return resp if resp is not None else {"error": "request failed"}
+
+
 def working_orders_for(orders: list, versions: list, account_id, contract_id=None,
                        order_type: str = None) -> list:
     """Join order/list with orderVersion/list to return WORKING orders for an account

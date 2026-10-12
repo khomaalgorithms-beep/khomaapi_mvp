@@ -39,7 +39,14 @@ from app.orb_validated import DATA as VALIDATED
 POLL_INTERVAL = float(__import__("os").getenv("ORB_LIVE_POLL_INTERVAL", "3"))
 # instrument root -> the asset key the sizing/split uses
 # RTY is retired (no reliable edge, malfunctioned live): every stored asset value now trades MNQ only.
-_ASSET_ROOTS = {"nq": ["MNQ"], "rty": ["MNQ"], "both": ["MNQ"]}
+_ASSET_ROOTS = {"nq": ["MNQ"], "rty": ["MNQ"], "both": ["MNQ"], "orb": ["MNQ"], "combo": ["MNQ"]}
+# the orb_autopilot.asset column carries the STRATEGY: legacy values (nq/rty/both) = the 10:30 momentum rule,
+# "orb" = ORB + prior-day break, "combo" = both strategies on one account
+_STRATEGY = {"orb": "orb", "combo": "both"}
+
+
+def strategy_of(asset: str) -> str:
+    return _STRATEGY.get(asset or "nq", "momentum")
 
 
 def _now_et() -> datetime:
@@ -51,7 +58,11 @@ def _massive_key() -> Optional[str]:
 
 
 def _make_autopilot(cfg: AccountConfig, token_provider) -> Autopilot:
-    """One Autopilot per account, executing to that account's Tradovate connection."""
+    """One Autopilot per account, executing to that account's Tradovate connection. ORB / both use the
+    multi-leg autopilot (each strategy tracked by its own order ids); the 10:30 rule alone keeps the original one."""
+    if cfg.strategy in ("orb", "both"):
+        from app.orb_multi import MultiAutopilot
+        return MultiAutopilot(cfg, get_token=token_provider, now_et=_now_et, get_context=get_context)
     return Autopilot(cfg, get_token=token_provider, now_et=_now_et, get_context=get_context)
 
 
@@ -87,10 +98,10 @@ def refresh_context(roots, now=None, retry_sec: float = 600.0) -> List[dict]:
             out.append({"root": root, "context": "no MASSIVE_API_KEY"})
             continue
         try:
-            ranges, closes = fetch_daily_context(key, root, now)
-            ctx = MOM.context_from(ranges, closes, date)
+            ranges, closes, levels = fetch_daily_context(key, root, now, with_levels=True)
+            ctx = MOM.context_from(ranges, closes, date, levels)
             _CTX[k] = ctx
-            out.append({"root": root, "date": date, "atr": ctx.atr, "trend": ctx.trend,
+            out.append({"root": root, "date": date, "atr": ctx.atr, "trend": ctx.trend, "pdh": ctx.pdh, "pdl": ctx.pdl,
                         "ranges": len(ranges), "closes": len(closes), "ok": ctx.ok})
         except Exception as e:
             out.append({"root": root, "context_error": str(e)})
@@ -215,7 +226,7 @@ def save_config(user_id: int, account_pk: int, account_id: str, *, enabled: bool
     assert acct_size in ("25K", "50K", "100K", "150K")
     assert preset in ("cons", "norm", "aggr", "safe", "safe2")
     assert preset not in ("safe", "safe2") or mode == "funded"
-    assert asset in ("nq", "rty", "both")
+    assert asset in ("nq", "rty", "both", "orb", "combo")
     assert dd_type in ("eod", "intraday", "static")
     cash_bal = float(cash_bal); cash_dd = float(cash_dd)
     assert 1000 <= cash_bal <= 10_000_000 and 1 <= cash_dd <= 50
@@ -332,14 +343,20 @@ def cash_basis(preset: str) -> str:
     return "full" if preset == "cons" else "ten"
 
 
-def cash_risk_usd(cash_bal: float, cash_dd: float, preset: str) -> float:
-    """$ risk per trade so that the strategy's worst historical drawdown (in R) equals the client's drawdown budget."""
-    dd_r = float(VALIDATED["cash"][cash_basis(preset)]["ddR"])
+def _setup(strat: str) -> Optional[dict]:
+    return VALIDATED.get("setups", {}).get(strat) if strat in ("orb", "both") else None
+
+
+def cash_risk_usd(cash_bal: float, cash_dd: float, preset: str, strat: str = "momentum") -> float:
+    """$ risk per trade (per strategy) so that the setup's worst historical drawdown (in R) equals the client's
+    drawdown budget."""
+    su = _setup(strat)
+    dd_r = float((su["cash"] if su else VALIDATED["cash"])[cash_basis(preset)]["ddR"])
     return round(float(cash_bal) * float(cash_dd) / 100.0 / dd_r, 2)
 
 
 def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
-              cash_bal: float = 25000.0, cash_dd: float = 15.0) -> dict:
+              cash_bal: float = 25000.0, cash_dd: float = 15.0, strat: str = "momentum") -> dict:
     """Validated sizing for a configuration: $ risked per trade, max micros, eval take-profit cap.
     eval   -> the preset's validated risk for this account size AND drawdown type (orb_validated)
     funded -> 12% of the max-loss limit, hold to close (validated funded mode)
@@ -347,6 +364,19 @@ def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
               (full 2008-26 history on 'cons', last 10 years otherwise); 0 micros if one micro is too big."""
     a = ACCT[acct_size]
     dd = dd_type if dd_type in ("eod", "intraday", "static") else "eod"
+    su = _setup(strat)
+    if su is not None:                      # ORB / both: validated per-strategy risk from DATA['setups']
+        if mode == "eval":
+            p = su["presets"][acct_size][dd][preset if preset in ("cons", "norm", "aggr") else "norm"]
+            return dict(risk_usd=float(p["risk"]), max_micros=a["eval_micros"], day_tp_usd=round(0.48 * a["target"]),
+                        start=a["start"], target=a["target"], tp_r=None, min_micros=0)
+        if mode == "funded":
+            f = su["funded"][acct_size][dd]
+            safe = preset in ("safe", "safe2")
+            return dict(risk_usd=float(f["risk_after"] if preset == "safe2" else f["risk"]), max_micros=a["funded_micros"],
+                        day_tp_usd=None, start=a["start"], target=0, tp_r=(2.0 if safe else None), min_micros=1)
+        return dict(risk_usd=cash_risk_usd(cash_bal, cash_dd, preset, strat),
+                    max_micros=40, day_tp_usd=None, start=0, target=0, tp_r=None, min_micros=0)
     if mode == "eval":
         risk = float(VALIDATED["presets"][acct_size][dd][preset]["risk"])
         return dict(risk_usd=risk, max_micros=a["eval_micros"], day_tp_usd=round(0.48 * a["target"]),
@@ -367,7 +397,7 @@ def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
 def qty_for(mode: str, acct_size: str, preset: str, asset: str, dd_type: str = "eod",
             cash_bal: float = 25000.0, cash_dd: float = 15.0, atr: Optional[float] = None) -> Dict[str, int]:
     """ESTIMATED micros at today's volatility (the engine sizes exactly at 10:30 from the live stop)."""
-    plan = risk_plan(mode, acct_size, preset, dd_type, cash_bal, cash_dd)
+    plan = risk_plan(mode, acct_size, preset, dd_type, cash_bal, cash_dd, strategy_of(asset))
     a = atr or (get_context("MNQ", _now_et().strftime("%Y-%m-%d")) or MOM.DayContext("", None, 0)).atr or 300.0
     q = MOM.micros_for_risk(plan["risk_usd"], MOM.STOP_ATR * a, 2.0, plan["max_micros"])
     if q <= 0 and plan.get("min_micros"):
@@ -397,13 +427,14 @@ def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
             return None
     dd = row.get("dd_type") or "eod"
     cb, cd = row.get("cash_bal") or 25000, row.get("cash_dd") or 15
-    plan = risk_plan(row["mode"], row["acct_size"], row["preset"], dd, cb, cd)
+    strat = strategy_of(row["asset"])
+    plan = risk_plan(row["mode"], row["acct_size"], row["preset"], dd, cb, cd, strat)
     qty = qty_for(row["mode"], row["acct_size"], row["preset"], row["asset"], dd, cb, cd)
     observe_env = set(x.strip() for x in __import__("os").getenv("ORB_OBSERVE", "").split(",") if x.strip())
     observe = {r: (r in observe_env) for r in roots}
     return AccountConfig(env=env, account_spec=row["account_name"], account_id=int(row["account_id"]),
                         account_name=row["account_name"], instruments=contracts, qty=qty,
-                        params=dict(DEFAULT_PARAMS), observe=observe, strategy="momentum",
+                        params=dict(DEFAULT_PARAMS), observe=observe, strategy=strat,
                         mode=row["mode"], risk_usd=plan["risk_usd"], max_micros=plan["max_micros"],
                         acct_start=plan["start"], acct_target=plan["target"], day_tp_usd=plan["day_tp_usd"],
                         tp_r=plan.get("tp_r"), min_micros=int(plan.get("min_micros") or 0))
@@ -543,10 +574,16 @@ class EngineManager:
         return out
 
     def catch_up(self, fetch_bars, now_et: datetime) -> List[dict]:
-        """Backup data path: between 10:30:15 and 10:39 ET, if the live feed has not delivered the 10:29
-        decision bar, pull today's bars from REST and dispatch the missing ones (deduped)."""
+        """Backup data path: if the live feed has not delivered a decision bar — the 09:34 bar that completes
+        the ORB range (checked 09:35:15-09:37) or the 10:29 momentum bar (10:30:15-10:39) — pull today's bars
+        from REST and dispatch the missing ones (deduped)."""
         m = now_et.hour * 60 + now_et.minute
-        if not (MOM.DECIDE_MIN + 1 <= m < MOM.LAST_DECIDE_MIN) or (m == MOM.DECIDE_MIN + 1 and now_et.second < 15):
+        windows = ((MOM.ORB_END_MIN - 1, MOM.ORB_END_MIN, MOM.ORB_END_MIN + 3), (MOM.DECIDE_MIN, MOM.DECIDE_MIN + 1, MOM.LAST_DECIDE_MIN))
+        need = None
+        for bar_min, lo, hi in windows:
+            if lo <= m < hi and not (m == lo and now_et.second < 15):
+                need = bar_min
+        if need is None:
             return []
         today = now_et.strftime("%Y-%m-%d")
         ts = now_et.timestamp()
@@ -556,7 +593,7 @@ class EngineManager:
         out = []
         for root in self.feed_roots():
             last = self._last_key.get(root)
-            if last and last[0] == today and last[1] >= MOM.DECIDE_MIN:
+            if last and last[0] == today and last[1] >= need:
                 continue                                # the feed already delivered the decision bar
             try:
                 bars = [b for b in (fetch_bars(root) or []) if b.dt.strftime("%Y-%m-%d") == today and b.minute_of_day < m]
@@ -646,7 +683,7 @@ def _ctx_status() -> dict:
     if not c:
         return {"ready": False}
     return {"ready": c.ok, "date": c.date, "atr": round(c.atr, 1) if c.atr else None, "trend": c.trend,
-            "stop_pts": round(MOM.STOP_ATR * c.atr, 2) if c.atr else None}
+            "stop_pts": round(MOM.STOP_ATR * c.atr, 2) if c.atr else None, "pdh": c.pdh, "pdl": c.pdl}
 
 
 _LOGGED: set = set()
@@ -699,8 +736,8 @@ def _alert_if_needed(d: dict) -> None:
 
 
 def preflight(now: datetime) -> List[dict]:
-    """10:15 ET, once a day: every armed account must have a working broker token and today's context
-    must be loaded, so a problem is fixed BEFORE the 10:30 decision instead of discovered after it."""
+    """09:15 ET, once a day: every armed account must have a working broker token and today's context
+    must be loaded, so a problem is fixed BEFORE the 9:35 / 10:30 entries instead of discovered after them."""
     day = now.date().isoformat()
     if day in _PREFLIGHT_DONE or _MANAGER is None:
         return []
@@ -718,14 +755,14 @@ def preflight(now: datetime) -> List[dict]:
             issues.append({"account_id": aid, "reason": "broker not connected (no valid token)"})
             em = _owner_email(aid)
             if em:
-                _send_alert("Action needed before 10:30 ET: reconnect your broker",
+                _send_alert("Action needed before 9:35 ET: reconnect your broker",
                             f"<p>Your Tradovate account <b>{aid}</b> is armed on KhomaVolume, but its broker connection "
-                            "is not working. Open KhomaAPI &rarr; Broker Connect and reconnect it before 10:30 ET, or "
+                            "is not working. Open KhomaAPI &rarr; Broker Connect and reconnect it before 9:35 ET, or "
                             "today's trade will be missed.</p>", to=em)
     print(f"ORB PREFLIGHT {day}: {len(_MANAGER._active)} armed accounts, {len(issues)} issue(s)", issues)
     if issues:
         rows = "".join(f"<li>{i['account_id']}: {i['reason']}</li>" for i in issues)
-        _send_alert("KhomaVolume 10:15 pre-flight: problems found", f"<ul>{rows}</ul>")
+        _send_alert("KhomaVolume 9:15 pre-flight: problems found", f"<ul>{rows}</ul>")
     return issues
 
 
@@ -763,7 +800,7 @@ async def engine_loop() -> None:
                     _alert_if_needed(d)
                 for d in _MANAGER.decisions[-50:]:
                     _alert_if_needed(d)
-                if now.hour == 10 and 15 <= now.minute < 25:
+                if now.hour == 9 and 15 <= now.minute < 25:         # before the 9:35 ORB entry and the 10:30 decision
                     await asyncio.get_event_loop().run_in_executor(None, preflight, now)
                 actions = _MANAGER.poll()
                 for a in actions:
@@ -1133,20 +1170,23 @@ def install(app) -> None:
         enabling = form.get("enabled") in ("1", "true", "on", True)
         mode = str(form.get("mode") or "eval"); size = str(form.get("acct_size") or "50K")
         preset = str(form.get("preset") or "norm"); dd = str(form.get("dd_type") or "eod")
+        asset = str(form.get("asset") or "nq")
+        if asset not in ("nq", "orb", "combo"):
+            asset = "nq"
         if mode != "funded" and preset in ("safe", "safe2"):
             preset = "norm"
         try:
             cb = float(str(form.get("cash_bal") or "25000").replace(",", ""))
             cd = float(form.get("cash_dd") or 15)
             save_config(user["id"], acct["id"], account_id, enabled=enabling, mode=mode, acct_size=size,
-                        preset=preset, asset="nq", dd_type=dd, cash_bal=cb, cash_dd=cd)
+                        preset=preset, asset=asset, dd_type=dd, cash_bal=cb, cash_dd=cd)
         except (AssertionError, ValueError):
             return JSONResponse({"ok": False, "error": "invalid settings"}, status_code=400)
         if enabling:
             set_master_running(user["id"])   # Start here = allow execution (Dashboard Pause still stops it)
-        plan = risk_plan(mode, size, preset, dd, cb, cd)
+        plan = risk_plan(mode, size, preset, dd, cb, cd, strategy_of(asset))
         return JSONResponse({"ok": True, "enabled": enabling, "master_running": master_running(user["id"]),
-                            "risk_usd": plan["risk_usd"], "qty": qty_for(mode, size, preset, "nq", dd, cb, cd)})
+                            "risk_usd": plan["risk_usd"], "qty": qty_for(mode, size, preset, asset, dd, cb, cd)})
 
     @app.get("/prop-engine/status")
     def prop_engine_status(request: Request):
@@ -1173,7 +1213,7 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], leg
         conf[a["account_id"]] = {"enabled": bool(c.get("enabled")), "mode": c.get("mode", "eval"),
                                  "acct_size": c.get("acct_size", "50K"), "preset": c.get("preset", "norm"),
                                  "dd_type": c.get("dd_type") or "eod", "cash_bal": c.get("cash_bal") or 25000,
-                                 "cash_dd": c.get("cash_dd") or 15}
+                                 "cash_dd": c.get("cash_dd") or 15, "asset": c.get("asset") or "nq"}
     return (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
                  .replace("__CONFIGS__", json.dumps(conf))
                  .replace("__DATA__", json.dumps(VALIDATED)))
@@ -1287,7 +1327,7 @@ _PAGE = r"""
   <div class="top">
     <div>
       <h1>KhomaVolume NQ</h1>
-      <div class="lead">One decision a day at 10:30 ET on micro Nasdaq (MNQ), executed server-side by KhomaAPI.</div>
+      <div class="lead">Automated micro Nasdaq (MNQ) strategies — the 9:35 ORB and the 10:30 momentum rule — executed server-side by KhomaAPI.</div>
     </div>
     <div class="apick" id="apickWrap">
       <span class="ey">Account</span>
@@ -1297,23 +1337,7 @@ _PAGE = r"""
   </div>
   <div id="app"></div>
   <section id="eqSection" class="eqwrap"></section>
-  <section class="eqwrap">
-    <div class="eqhead"><h2>How your account is traded</h2><p>The exact rules the engine runs. Tested on 18 years of 1-minute NQ data (2008 to 2026) with realistic fills.</p></div>
-    <div class="steps" style="margin-top:14px">
-      <div class="step"><span class="sn">1</span><div><b>One market, one decision.</b> At 10:30 ET the engine checks the move from the 9:30 open. It trades that direction only when it agrees with the 20-day trend. On the other days it sits out and risks nothing.</div></div>
-      <div class="step"><span class="sn">2</span><div><b>Risk-sized hard stop.</b> The stop is 0.2&times; the average daily range. Contracts are sized so a stop-out costs about your risk per trade. The stop rests at the exchange the moment the entry fills.</div></div>
-      <div class="step"><span class="sn">3</span><div><b>Evaluation take-profit.</b> In an evaluation the trade closes at whichever comes first: the dollars still needed to pass, or the daily cap that keeps you inside the 50% consistency rule. Funded accounts hold to the close.</div></div>
-      <div class="step"><span class="sn">4</span><div><b>Flat by 15:59 ET, never overnight.</b> News days are traded: CPI, jobs and PPI days have tested better than average.</div></div>
-    </div>
-    <ul class="truths">
-      <li><b>A real but thin edge.</b> Profit factor about 1.16 since 2008 (1.30 over the last 10 years) with a 34% win rate. A few strong trend days pay for many small losses: without the best 5% of trades it would lose money.</li>
-      <li><b>Long flat periods.</b> From 2009 to 2019 it made no new high for almost 10 years. Losing streaks of up to 19 trades have happened.</li>
-      <li><b>Most evaluations fail.</b> Over the long run about 1 in 3 evaluations pass, and about 1 in 5 to 1 in 7 evaluations ends in a payout, and about half of funded accounts blow before their first payout. Budget for several evaluations, not one.</li>
-      <li><b>Flat stretches happen.</b> From mid-2025 to today results have been close to breakeven, and the current-market figures above reflect that.</li>
-      <li><b>Stagger accounts.</b> Accounts that start on the same day take the same trades and win or lose together. Start them a week or more apart.</li>
-      <li><b>No guarantees.</b> Some evaluations fail and some funded accounts blow. The edge shows up across many accounts and months, not on any single one.</li>
-    </ul>
-  </section>
+  <section class="eqwrap" id="rulesSection"></section>
 </div>
 <script>
 const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__;
@@ -1324,11 +1348,38 @@ const EVALMAX={"25K":20,"50K":40,"100K":60,"150K":100},FUNDMAX={"25K":10,"50K":2
 const $=s=>document.querySelector(s),money=n=>(n<0?"-":"")+"$"+Math.abs(Math.round(n)).toLocaleString("en-US");
 let state=null,CTX={ready:false},lastErr="";
 
+// ---- one data layer for the three strategies (10:30 momentum / ORB / both) ----
+const STRATS=[{v:"nq",t:"10:30 Momentum"},{v:"orb",t:"ORB + prior-day break"},{v:"combo",t:"Both together"}];
+const SNAME={nq:"10:30 Momentum",orb:"ORB + prior-day break",combo:"Both together"};
+function sk(a){return a==="orb"?"orb":a==="combo"?"both":null;}          // key into DATA.setups (null = 10:30 tables)
+function evalP(a,size,dd,pr){const k=sk(a);
+  if(!k){const p=DATA.presets[size][dd][pr];return {risk:p.risk,full:(p.pass_full!=null?p.pass_full:p.pass_),good:p.pass_,now:p.pass_now,
+    days:(p.days_full!=null?p.days_full:p.days),p75:(p.p75_full!=null?p.p75_full:p.p75)};}
+  const p=DATA.setups[k].presets[size][dd][pr];return {risk:p.risk,full:p.pass_full,good:p.pass_good,now:p.pass_now,days:p.days_full,p75:p.p75_full};}
+function fundP(a,size,dd,safe){const k=sk(a);
+  if(!k){const f=DATA.funded[size][dd];
+    if(safe&&f.safe){const x=f.safe;return {risk:x.risk,risk_after:x.risk_after,paid:x.paid_full,bb:x.bb_full,cash:x.cash_full,first:x.med_full,good:x.paid_good,cushion:x.cushion};}
+    return {risk:f.risk,paid:(f.p1_full!=null?f.p1_full:f.p1),bb:(f.bb_full!=null?f.bb_full:f.bb),cash:(f.cash_full!=null?f.cash_full:f.cash),first:(f.first_full!=null?f.first_full:f.first),good:f.p1};}
+  const f=DATA.setups[k].funded[size][dd],x=safe?"safe":"std";
+  return {risk:f.risk,risk_after:f.risk_after,paid:f[x+"_paid_full"],bb:f[x+"_bb"],cash:f[x+"_cash"],first:f[x+"_first"],good:f[x+"_paid_good"],cushion:Math.round(1300+4*f.risk_after)};}
+function cashD(a){const k=sk(a);return k?DATA.setups[k].cash:DATA.cash;}
+function eqD(a){const k=sk(a);return k?DATA.setups[k].equity:DATA.equity;}
+function legs(){return state.asset==="combo"?2:1;}
+// Recommendation (pre-declared rule): evaluation = highest long-run pass rate across every strategy and preset; any
+// option within 3 points of the best counts as a tie and the faster one wins. Funded = highest long-run payout rate
+// across strategies x Standard/Safe; ties within 3 points -> faster first payout. Live cash = best return per unit
+// of worst drawdown since 2008.
+function recommend(mode,size,dd){let c=[];
+  if(mode==="eval"){for(const s of STRATS)for(const pr of ["cons","norm","aggr"]){const p=evalP(s.v,size,dd,pr);c.push({a:s.v,preset:pr,score:p.full,speed:p.days||999,p});}}
+  else if(mode==="funded"){for(const s of STRATS)for(const sf of [true,false]){const p=fundP(s.v,size,dd,sf);c.push({a:s.v,preset:sf?"safe":"norm",score:p.paid,speed:p.first||999,p});}}
+  else{for(const s of STRATS){const d=cashD(s.v).full;c.push({a:s.v,preset:"cons",score:d.perMonthR/d.ddR,speed:0});}}
+  const best=Math.max(...c.map(x=>x.score));const tie=mode==="cash"?c.filter(x=>x.score===best):c.filter(x=>x.score>=best-3);
+  tie.sort((x,y)=>x.speed-y.speed||y.score-x.score);return tie[0];}
 function riskUsd(){
-  if(state.mode==="eval")return DATA.presets[state.acct_size][state.dd_type][state.preset].risk;
-  if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
-    if(isSafe()&&f.safe)return state.preset==="safe2"?f.safe.risk_after:f.safe.risk;return f.risk;}
-  return state.cash_bal*state.cash_dd/100/DATA.cash[cashBasis()].ddR;
+  if(state.mode==="eval")return evalP(state.asset,state.acct_size,state.dd_type,state.preset).risk;
+  if(state.mode==="funded"){const f=fundP(state.asset,state.acct_size,state.dd_type,isSafe());
+    return (isSafe()&&state.preset==="safe2"&&f.risk_after)?f.risk_after:f.risk;}
+  return state.cash_bal*state.cash_dd/100/cashD(state.asset)[cashBasis()].ddR;
 }
 function cashBasis(){return state.preset==="cons"?"full":"ten";}
 function isSafe(){return state.mode==="funded"&&(state.preset==="safe"||state.preset==="safe2");}
@@ -1338,14 +1389,23 @@ function micros(){const sp=stopPts()||60,per=sp*2,r=riskUsd(),cap=state.mode==="
 function seg(id,opts,val){return `<div class="seg${opts.length===4?' four':''}" data-seg="${id}" role="group">`+
   opts.map(o=>`<button type="button" data-v="${o.v}" aria-pressed="${o.v===val}">${o.t}</button>`).join("")+`</div>`;}
 
-function safePlan(){const f=DATA.funded[state.acct_size][state.dd_type].safe;if(!f)return "";
+function safePlan(){const f=fundP(state.asset,state.acct_size,state.dd_type,true);if(!f)return "";
   return state.preset==="safe"?`<b>Payout plan.</b> Request <b>$500</b> as soon as your firm allows it (LucidFlex: profit of at least $1,000 and 5 winning days of ${money(QUAL[state.acct_size])}+). Then set <b>First payout</b> to <b>Taken</b>: the engine halves its risk to protect the account.`:
   `<b>After your first payout</b> the engine risks ${money(f.risk_after)} per trade. Request <b>$1,000</b> payouts only when your balance is at least <b>${money(f.cushion)}</b> above your account floor, so one bad week cannot end the account.`;}
+function recBox(){const r=recommend(state.mode,state.acct_size,state.dd_type);if(!r)return "";
+  const same=r.a===state.asset&&(state.mode==="cash"||r.preset===state.preset||(r.preset==="safe"&&isSafe()));
+  const what=state.mode==="eval"?`${SNAME[r.a]} · ${{cons:"Conservative",norm:"Normal",aggr:"Aggressive"}[r.preset]}: ${r.p.full}% long-run pass, ~${Math.round(r.p.days)} trading days`:
+    state.mode==="funded"?`${SNAME[r.a]} · ${r.preset==="safe"?"Safe":"Standard"}: ${r.p.paid}% reach a payout, ${r.p.bb}% blow first`:`${SNAME[r.a]}: smallest worst-case drawdown per $ earned since 2008`;
+  return `<div class="pn" style="margin-top:8px;padding:8px 10px;border-radius:10px;background:var(--gs,#eaf7ef)"><b>${same?"✓ Recommended":"Recommended for this account"}:</b> ${what}.
+    ${same?"":`<a href="#" id="useRec" style="font-weight:800">Use it</a>`}<br><span style="opacity:.75">Picked by a fixed rule from the full 2008–2026 backtest (highest long-run odds; near-ties go to the faster option). Not a promise.</span></div>`;}
 function configCard(){
   const cash=state.mode==="cash";
   return `<div class="card"><div class="hd"><h2>Configure</h2><p>Every number on this page comes from the validated backtest for these exact settings.</p></div>
    <div class="bd">
     <div class="field"><label>Mode</label>${seg("mode",[{v:"eval",t:"Evaluation"},{v:"funded",t:"Funded"},{v:"cash",t:"Live cash"}],state.mode)}</div>
+    <div class="field"><label>Strategy</label>${seg("asset",STRATS,state.asset)}
+      <div class="pn">${{nq:"One decision at 10:30 ET: the move since the 9:30 open, only with the 20-day trend.",orb:"Resting stop order at 9:35 ET just beyond the 9:30–9:35 range, only if that price is also beyond yesterday's high (long) or low (short). Stop to breakeven at +1R. <b>New in the live engine (October 2026): backtested only, no live track record yet.</b>",combo:"Both strategies on the same account, each with its own order, stop and target. Risk per trade is per strategy. <b>New in the live engine (October 2026): backtested only, no live track record yet.</b>"}[state.asset]}</div>
+      ${recBox()}</div>
     ${cash?`<div class="field"><label>Account balance &amp; max drawdown</label><div class="cashrow">
         <div class="f"><div class="inl"><span>$</span><input id="balIn" inputmode="numeric" aria-label="Account balance" value="${Math.round(state.cash_bal).toLocaleString("en-US")}"></div></div>
         <div class="f"><div class="rv"><span>Max drawdown</span><b id="ddOut">${state.cash_dd}%</b></div>
@@ -1354,57 +1414,47 @@ function configCard(){
        <div class="field"><label>Drawdown type</label>${seg("dd_type",[{v:"eod",t:"End-of-day trailing"},{v:"intraday",t:"Intraday trailing"},{v:"static",t:"Static"}],state.dd_type)}
         <div class="pn">${state.dd_type==="eod"?"LucidFlex and most EOD plans: the floor trails your end-of-day balance and locks at start + $100.":state.dd_type==="intraday"?"The floor trails your highest open profit during the day. Harder: size is reduced to match.":"The floor never moves. Easiest drawdown: size is increased to match."}</div></div>`}
     ${cash?`<div class="field"><label>Plan your drawdown against</label>${seg("preset",[{v:"cons",t:"Full history (2008–26)"},{v:"norm",t:"Last 10 years"}],state.preset==="cons"?"cons":"norm")}
-      <div class="pn">${state.preset==="cons"?"Sized so the worst drawdown since 2008 (about "+Math.round(DATA.cash.full.ddR)+" times the risk per trade, 2009–2011) fits inside your max drawdown. Much smaller size; survives a repeat of the worst years.":"Sized so the worst drawdown of the last 10 years (about "+Math.round(DATA.cash.ten.ddR)+" times the risk per trade) fits inside your max drawdown. A repeat of 2009–2011 would take you about "+Math.round(DATA.cash.full.ddR/DATA.cash.ten.ddR*state.cash_dd)+"% down."}</div></div>`:
+      <div class="pn">${(()=>{const C=cashD(state.asset);return state.preset==="cons"?"Sized so the worst drawdown since 2008 (about "+Math.round(C.full.ddR)+" times the risk per trade) fits inside your max drawdown. Survives a repeat of the worst years in the test.":"Sized so the worst drawdown of the last 10 years (about "+Math.round(C.ten.ddR)+" times the risk per trade) fits inside your max drawdown. A repeat of the worst years since 2008 would take you about "+Math.round(C.full.ddR/C.ten.ddR*state.cash_dd)+"% down.";})()}</div></div>`:
     state.mode==="funded"?`<div class="field"><label>Funded mode</label>${seg("fmode",[{v:"std",t:"Standard"},{v:"safe",t:"Safe (recommended)"}],isSafe()?"safe":"std")}
-      <div class="pn" style="margin-top:6px">${isSafe()?`<b>Safe</b> is built to get you paid and keep the account: the same 10:30 trade, but each winner is closed at <b>2&times; the stop</b> instead of held to the close, and you take a <b>small first payout early</b>.`:`<b>Standard</b> risks about 12% of the max loss per trade and holds every trade to the close. Bigger potential payouts, but about half of funded accounts blow before their first payout over the long run.`}</div></div>
+      <div class="pn" style="margin-top:6px">${isSafe()?`<b>Safe</b> is built to get you paid and keep the account: the same trades, but each winner is closed at <b>2&times; the stop</b> instead of held to the close, and you take a <b>small first payout early</b>.`:`<b>Standard</b> risks ${money(fundP(state.asset,state.acct_size,state.dd_type,false).risk)}${legs()>1?" per strategy":""} per trade and holds every trade to the close. Bigger potential payouts; ${fundP(state.asset,state.acct_size,state.dd_type,false).bb}% of funded accounts blow before their first payout over the long run.`}</div></div>
       ${isSafe()?`<div class="field"><label>First payout</label>${seg("preset",[{v:"safe",t:"Not yet taken"},{v:"safe2",t:"Taken"}],state.preset)}
       <div class="pn">${safePlan()}</div></div>`:""}`:
       `<div class="field"><label>Risk preset</label>${seg("preset",[{v:"cons",t:"Conservative"},{v:"norm",t:"Normal"},{v:"aggr",t:"Aggressive"}],state.preset)}
-      <div class="pn">${{cons:"Best odds. Passes in about 3–5 weeks.",norm:"Balanced. Passes in about 2–3 weeks.",aggr:"Fastest, about 2 weeks, but fails more often."}[state.preset]}</div></div>`}
+      <div class="pn">${["cons","norm","aggr"].map(pr=>{const p=evalP(state.asset,state.acct_size,state.dd_type,pr);return `<b>${{cons:"Conservative",norm:"Normal",aggr:"Aggressive"}[pr]}</b> ${money(p.risk)}${legs()>1?" per strategy":""}: ${p.full}% pass, ~${Math.round(p.days)} days`;}).join(" · ")}</div></div>`}
    </div></div>`;
 }
 
 function projCard(){
   const r=riskUsd(),q=micros(),sp=stopPts();
   let hero,cap,meter=null,tiles=[];
-  if(state.mode==="eval"){const p=DATA.presets[state.acct_size][state.dd_type][state.preset];
-    const full=(p.pass_full!=null?p.pass_full:p.pass_),fd=DATA.funded[state.acct_size][state.dd_type];
-    const epp=x=>Math.max(1,Math.round(100*100/Math.max(1,full*x)));
-    const pf=(fd.p1_full!=null?fd.p1_full:fd.p1),pn=(fd.p1_now||pf);
-    const lo=epp(Math.max(pf,pn)),hi=epp(Math.min(pf,pn));
+  if(state.mode==="eval"){const p=evalP(state.asset,state.acct_size,state.dd_type,state.preset),full=p.full;
+    const fr=recommend("funded",state.acct_size,state.dd_type),fpay=fr.p.paid;
+    const lo=Math.max(1,Math.round(100*100/Math.max(1,full*fpay))),hi=Math.max(1,Math.round(100*100/Math.max(1,full*Math.max(1,fpay-15))));
     hero=full+"%";cap=`<b>chance to pass</b> the ${state.acct_size} evaluation (${DDN[state.dd_type].toLowerCase()}): long-run average, 2008–26, including the weak years. About ${Math.max(1,Math.round(100/Math.max(1,full)))} tries per pass.`;meter=full;
-    const dd_=(p.days_full!=null?p.days_full:p.days),p75_=(p.p75_full!=null?p.p75_full:p.p75);
-    tiles=[["Time to pass",dd_.toFixed(0)+" trading days","median when it passes; 3 in 4 within "+p75_.toFixed(0)],
-           ["Good markets",p.pass_+"%","2020–26 starts; not a promise",""],
-           ["Current market",p.pass_now+"%","starts since Jul 2025","warn"],
-           ["Evaluations per payout",(lo===hi?lo:lo+"–"+hi),"from first evaluation to first cash","warn"]];
-  }else if(isSafe()&&DATA.funded[state.acct_size][state.dd_type].safe){const f=DATA.funded[state.acct_size][state.dd_type].safe;
-    hero=f.paid_full+"%";cap="<b>reach at least one payout</b> within a year of being funded, Safe mode: long-run average, 2008–25 starts, including the weak years";meter=f.paid_full;
-    tiles=[["First payout",(f.med_full||0).toFixed(0)+" trading days","median, when paid; "+f.p120_full+"% are paid within 6 months"],
-           ["Blown before payout",f.bb_full+"%","long run (Standard: "+DATA.funded[state.acct_size][state.dd_type].bb_full+"%)","warn"],
-           ["Year-1 payouts",money(f.cash_full),"average per funded account, after the 90/10 split"],
-           ["Good / current market",f.paid_good+"% / "+f.paid_now+"%","reach a payout: 2020–25 starts / 2025 starts",""]];
-  }else if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
-    const full=f.p1_full!=null;
-    hero=(full?f.p1_full:f.p1)+"%";cap="<b>reach at least one payout</b> within a year of being funded: long-run average, 2008–25 starts, including the weak years";meter=full?f.p1_full:f.p1;
-    tiles=[["Blown before payout",(full?f.bb_full:f.bb)+"%","within the first year, long run","warn"],
-           ["First payout",((full?f.first_full:f.first)||0).toFixed(0)+" trading days","median, when paid"],
-           ["Year-1 payouts",money(full?f.cash_full:f.cash),"average per funded account, after the 90/10 split"],
-           ["Good / current market",f.p1+"% / "+f.p1_now+"%","reach a payout: 2020–25 starts / since Oct 2025",""]];
-  }else{const c=DATA.cash[cashBasis()],cf=DATA.cash.full,sp_=(stopPts()||61)*2,ar=q>0?q*sp_:0;
+    tiles=[["Time to pass",(p.days||0).toFixed(0)+" trading days","median when it passes; 3 in 4 within "+(p.p75||0).toFixed(0)],
+           ["Good markets",p.good+"%","2020–26 starts; not a promise",""],
+           ["Current market",p.now+"%","starts since Jul 2025","warn"],
+           ["Evaluations per payout",(lo===hi?lo:lo+"–"+hi),"if you then use the recommended funded mode","warn"]];
+  }else if(state.mode==="funded"){const f=fundP(state.asset,state.acct_size,state.dd_type,isSafe()),o=fundP(state.asset,state.acct_size,state.dd_type,!isSafe());
+    hero=f.paid+"%";cap=`<b>reach at least one payout</b> within a year of being funded, ${isSafe()?"Safe":"Standard"} mode: long-run average, 2008–25 starts, including the weak years`;meter=f.paid;
+    tiles=[["Blown before payout",f.bb+"%","long run ("+(isSafe()?"Standard":"Safe")+": "+o.bb+"%)","warn"],
+           ["First payout",(f.first||0).toFixed(0)+" trading days","median, when paid"],
+           ["Year-1 payouts",money(f.cash),"average per funded account, after the 90/10 split"],
+           ["Good markets",f.good+"%","reach a payout, 2020–25 starts; not a promise",""]];
+  }else{const C=cashD(state.asset),c=C[cashBasis()],cf=C.full,sp_=(stopPts()||61)*2,ar=q>0?q*sp_:0;
     const need=Math.ceil((sp_/1.5)*c.ddR/(state.cash_dd/100)/1000)*1000;
     if(q<=0){hero="Too small";cap=`<b>one MNQ micro risks about ${money(sp_)}</b>, more than this drawdown plan allows. The engine will not trade. You need about <b>${money(need)}</b> at ${state.cash_dd}% max drawdown, or a larger max drawdown.`;
       tiles=[["Drawdown budget",money(state.cash_bal*state.cash_dd/100),state.cash_dd+"% of "+money(state.cash_bal)],["Minimum balance",money(need),"for 1 micro on this plan","warn"]];}
-    else{hero=money(c.perMonthR*ar);cap=`<b>average per month</b> at ${q} micro (about ${money(ar)} risk per trade), based on ${cashBasis()==="full"?"2008–2026, including the flat decade":"the last 10 years"}. It is an average, not a monthly income: about ${c.loseM}% of months lose money.`;
+    else{hero=money(c.perMonthR*ar);cap=`<b>average per month</b> at ${q} micro (about ${money(ar)} risk per trade), based on ${cashBasis()==="full"?"2008–2026, including the weak years":"the last 10 years"}. It is an average, not a monthly income: about ${c.loseM}% of months lose money.`;
       tiles=[["Typical month",money(c.p50*ar),"range "+money(c.p10*ar)+" to "+money(c.p90*ar)+" (8 in 10 months)"],
              ["Worst drawdown",money(-c.ddR*ar),Math.round(c.ddR*ar/state.cash_bal*100)+"% of the account, "+(cashBasis()==="full"?"since 2008":"last 10 years"),"warn"],
              ["Worst 12 months",money(c.worst12R*ar),"last 12 months: "+money(c.last12R*ar),"warn"],
-             ["If 2009–2011 repeats",money(-cf.ddR*ar),Math.round(cf.ddR*ar/state.cash_bal*100)+"% of the account; almost 10 years with no new high","warn"]];}}
+             ["Worst since 2008",money(-cf.ddR*ar),Math.round(cf.ddR*ar/state.cash_bal*100)+"% of the account if the worst stretch since 2008 repeats","warn"]];}}
   return `<div class="card"><div class="hd"><h2>${state.mode==="eval"?"Evaluation odds":state.mode==="funded"?"Funded outcome":"Live cash: what to expect"}</h2><p>Real 1-minute NQ data with Lucid commissions and slippage.</p></div>
    <div class="bd"><div class="hero"><div class="big">${hero}</div><div class="cap">${cap}</div></div>
    ${meter!=null?`<div class="meter"><i style="width:${meter}%"></i></div>`:""}
    <div class="sz"><div class="t">What the engine will trade</div><div class="row">
-     <div class="leg"><div class="m">Risk per trade</div><div class="n">${money(r)}</div></div>
+     <div class="leg"><div class="m">Risk per trade${legs()>1?" (each strategy)":""}</div><div class="n">${money(r)}</div></div>
      <div class="leg"><div class="m">MNQ contracts ${sp?"today":"(typical day)"}</div><div class="n">${q}<small> micro</small></div></div>
      <div class="leg"><div class="m">Stop distance</div><div class="n">${sp?sp.toFixed(0):"~60"}<small> pts</small></div></div></div></div>
    <div class="tiles">${tiles.map(t=>`<div class="t ${t[3]||""}"><div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="s">${t[2]}</div></div>`).join("")}</div>
@@ -1412,54 +1462,58 @@ function projCard(){
 }
 
 function todayLine(){
-  if(!CTX.ready)return "Today's market context (20-day trend and volatility) loads from the data feed before 10:30 ET.";
+  if(!CTX.ready)return "Today's market context (prior-day levels, 20-day trend and volatility) loads from the data feed before the open.";
   const dir=CTX.trend>0?"up":"down",side=CTX.trend>0?"long":"short",cmp=CTX.trend>0?"above":"below";
-  return `<b>Today:</b> the 20-day trend is <b>${dir}</b>. At 10:30 ET the engine takes a <b>${side}</b> only if NQ is ${cmp} its 9:30 open; otherwise it sits out. Stop ≈ <b>${CTX.stop_pts} pts</b>.`;
+  const mom=`At 10:30 ET: a <b>${side}</b> only if NQ is ${cmp} its 9:30 open (20-day trend <b>${dir}</b>).`;
+  const orb=CTX.pdh!=null?`At 9:35 ET: a buy stop just above the 9:30–9:35 high only if it is above yesterday's high <b>${CTX.pdh}</b>; a sell stop just below the low only if it is below yesterday's low <b>${CTX.pdl}</b>.`:"At 9:35 ET: resting stop orders beyond the 9:30–9:35 range where they are beyond yesterday's high/low.";
+  return `<b>Today:</b> ${state.asset==="nq"?mom:state.asset==="orb"?orb:orb+" "+mom} Stop ≈ <b>${CTX.stop_pts} pts</b>.`;
 }
 function runCard(){
   const on=state.enabled;
   return `<div class="run"><div class="runrow">
      <button type="button" class="startbtn ${on?'on':''}" id="startBtn">${on?'Stop automation':'Start automation'}</button>
-     <div class="rstat ${on?'live':''}"><span class="dot"></span>${on?'<b>Armed</b>: the engine will trade this account at 10:30 ET on qualifying days and flatten by 15:59 ET.':'Not armed. Press Start and the engine trades this account by the rules above from the next 10:30 ET decision.'}</div>
+     <div class="rstat ${on?'live':''}"><span class="dot"></span>${on?'<b>Armed</b>: the engine will trade this account by the rules above on qualifying days and flatten by 15:59 ET.':'Not armed. Press Start and the engine trades this account by the rules above from the next trading session.'}</div>
    </div><div class="today" id="today">${todayLine()}</div>${lastErr?`<div class="err">${lastErr}</div>`:""}<div class="acts" id="acts" hidden></div></div>
    <div class="note"><div><b>Start on a demo or a single evaluation first.</b> The strategy runs server-side inside KhomaAPI and never leaves it. Copy Trading boxes use this account's settings for every account in the box.</div></div>`;
 }
 
 function render(){
   if(!ACCOUNTS.length){$("#apickWrap").style.display="none";
-    $("#app").innerHTML='<div class="empty">No connected Tradovate account yet. Connect one under <a href="/broker">Broker</a>, then come back here.</div>';renderEquity();return;}
+    $("#app").innerHTML='<div class="empty">No connected Tradovate account yet. Connect one under <a href="/broker">Broker</a>, then come back here.</div>';renderEquity();rulesHTML();return;}
   $("#app").innerHTML=`<div class="grid">${configCard()}${projCard()}</div>${runCard()}`;
   const acc=ACCOUNTS.find(a=>a.id===state.acct);
   $("#envBadge").textContent=(acc.env||"live").toUpperCase();
   $("#envBadge").style.color=acc.env==="demo"?"#0f8f45":"#dc2626";$("#envBadge").style.borderColor=acc.env==="demo"?"#0f8f45":"#dc2626";
   document.querySelectorAll("[data-seg]").forEach(sg=>sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{const k=sg.dataset.seg,v=b.dataset.v;
     if(k==="fmode")state.preset=v==="safe"?"safe":"norm";else state[k]=v;
+    if(k==="mode"&&v==="cash")state.preset="cons";
     if(k==="mode"&&v==="funded"&&!isSafe())state.preset="safe";   // Safe is the recommended funded default
     if(state.mode!=="funded"&&(state.preset==="safe"||state.preset==="safe2"))state.preset="norm";
     lastErr="";render();}));
+  const ur=$("#useRec");if(ur)ur.onclick=e=>{e.preventDefault();const r=recommend(state.mode,state.acct_size,state.dd_type);state.asset=r.a;if(state.mode!=="cash")state.preset=r.preset;render();};
   const bi=$("#balIn");if(bi)bi.onchange=e=>{state.cash_bal=Math.max(1000,+e.target.value.replace(/[^0-9]/g,"")||25000);render();};
   const di=$("#ddIn");if(di)di.oninput=e=>{state.cash_dd=+e.target.value;$("#ddOut").textContent=state.cash_dd+"%";};
   if(di)di.onchange=()=>render();
   $("#startBtn").onclick=toggleRun;
-  renderEquity();
+  renderEquity();rulesHTML();
 }
 
 async function save(enabled){
   const b=new URLSearchParams({account_id:state.acct,enabled:enabled?"1":"0",mode:state.mode,acct_size:state.acct_size,
-    preset:state.preset,asset:"nq",dd_type:state.dd_type,cash_bal:String(Math.round(state.cash_bal)),cash_dd:String(state.cash_dd)});
+    preset:state.preset,asset:state.asset,dd_type:state.dd_type,cash_bal:String(Math.round(state.cash_bal)),cash_dd:String(state.cash_dd)});
   try{const r=await fetch("/prop-engine/save",{method:"POST",body:b});const j=await r.json().catch(()=>null);return j||{ok:false,error:"HTTP "+r.status};}
   catch(e){return {ok:false,error:"network error"};}
 }
 async function toggleRun(){
   const btn=$("#startBtn");btn.disabled=true;btn.textContent=state.enabled?"Stopping…":"Starting…";
   const want=!state.enabled;const j=await save(want);
-  if(j&&j.ok){state.enabled=want;lastErr="";CONFIGS[state.acct]=Object.assign(CONFIGS[state.acct]||{},{enabled:want,mode:state.mode,acct_size:state.acct_size,preset:state.preset,dd_type:state.dd_type,cash_bal:state.cash_bal,cash_dd:state.cash_dd});}
+  if(j&&j.ok){state.enabled=want;lastErr="";CONFIGS[state.acct]=Object.assign(CONFIGS[state.acct]||{},{enabled:want,mode:state.mode,acct_size:state.acct_size,preset:state.preset,asset:state.asset,dd_type:state.dd_type,cash_bal:state.cash_bal,cash_dd:state.cash_dd});}
   else lastErr="Could not update automation: "+((j&&j.error)||"unknown error")+". Check the account is still connected under Broker.";
   render();
 }
 function loadAcct(id){
   const c=CONFIGS[id]||{};
-  state={acct:id,mode:c.mode||"eval",acct_size:c.acct_size||"50K",preset:c.preset||"norm",dd_type:c.dd_type||"eod",
+  state={acct:id,mode:c.mode||"eval",acct_size:c.acct_size||"50K",preset:c.preset||"norm",dd_type:c.dd_type||"eod",asset:(["orb","combo"].includes(c.asset)?c.asset:"nq"),
     cash_bal:+c.cash_bal||25000,cash_dd:+c.cash_dd||15,enabled:!!c.enabled};
   render();
 }
@@ -1474,8 +1528,31 @@ function poll(){
     else acts.hidden=true;
   }).catch(()=>{});
 }
+function rulesHTML(){
+  const a=state?state.asset:"nq",E=eqD(a),O=DATA.setups.orb.equity,M=DATA.equity;
+  const mom=[["One decision at 10:30 ET.","The engine checks the move from the 9:30 open and trades that direction only when it agrees with the 20-day trend. On other days it sits out."],
+             ["Risk-sized hard stop.","0.2&times; the average daily range, resting at the exchange the moment the entry fills."],
+             ["Exits.","Evaluation: take-profit at the dollars still needed or the daily consistency cap. Funded Safe: take-profit at 2&times; the stop. Otherwise held to 15:59."]];
+  const orb=[["Resting entry at 9:35 ET.","The engine marks the 9:30–9:35 high and low. It places a buy stop 1 tick above the high only if that price is above yesterday's high, and a sell stop 1 tick below the low only if it is below yesterday's low. The first break of either side decides the day; unfilled orders are cancelled at 10:35."],
+             ["Risk-sized stop, then breakeven.","Stop 0.2&times; the average daily range. Once a completed 1-minute bar has reached +1R, the stop moves to the entry price."],
+             ["Exits.","Evaluation: take-profit at the dollars still needed or the daily cap. Funded Safe: 2&times; the stop. Otherwise held to 15:59."]];
+  const steps=(a==="nq"?mom:a==="orb"?orb:orb.concat([["Second strategy: 10:30 momentum.","The 10:30 rule trades as its own order on the same account, with its own stop and target. On some days both are in a trade; risk per trade applies to each."]]))
+    .concat([["Flat by 15:59 ET, never overnight.","US market holidays and half-days are skipped (the test excludes them)."]]);
+  const truths=[];
+  if(a!=="nq")truths.push(`<b>ORB, 2008–2026 backtest:</b> profit factor ${O.pf}, win rate ${O.win}% (many small losses and breakevens, a few large winners), worst drawdown about ${Math.round(-O.maxddR)}&times; the risk per trade, losing years 2010, 2013 and 2025. Without its best 5% of trades it would lose money.`,
+    `<b>ORB needs a fast fill.</b> In testing, a fill 5 minutes late removed the edge; the resting stop order exists for that reason. A broker outage at 9:35 means no ORB trade that day.`,
+    `<b>ORB is new in the live engine (October 2026).</b> The numbers on this page are backtested; there is no live track record yet.`);
+  if(a!=="orb")truths.push(`<b>10:30 momentum, 2008–2026:</b> profit factor ${M.pf}, win rate ${M.win}%, worst drawdown about ${Math.round(-M.maxddR)}&times; the risk per trade; no new high from 2009 to 2019.`);
+  if(a==="combo")truths.push(`<b>Both together:</b> profit factor ${E.pf}, worst drawdown about ${Math.round(-E.maxddR)}&times; the risk per strategy. Running both doubles the trades and the swings; it does not make losing streaks shorter.`);
+  truths.push(`<b>Most evaluations fail.</b> Even the best setting on this page passes about half of evaluations over the long run. Budget for several.`,
+    `<b>Stagger accounts.</b> Accounts started on the same day take the same trades and win or lose together.`,
+    `<b>No guarantees.</b> All figures are hypothetical results from historical data with commissions and slippage. Past results do not guarantee future results.`);
+  $("#rulesSection").innerHTML=`<div class="eqhead"><h2>How your account is traded · ${SNAME[a]}</h2><p>The exact rules the engine runs, tested on 18 years of 1-minute NQ data (2008–2026) with realistic fills.</p></div>
+    <div class="steps" style="margin-top:14px">${steps.map((x,i)=>`<div class="step"><span class="sn">${i+1}</span><div><b>${x[0]}</b> ${x[1]}</div></div>`).join("")}</div>
+    <ul class="truths">${truths.map(t=>`<li>${t}</li>`).join("")}</ul>`;
+}
 function renderEquity(){
-  const eq=DATA.equity,r=state?riskUsd():500,c=eq.cumR.map(x=>x*r),W=780,H=210,L=52,R=12,T=14,B=22,n=c.length;
+  const eq=eqD(state?state.asset:"nq"),r=state?riskUsd():500,c=eq.cumR.map(x=>x*r),W=780,H=210,L=52,R=12,T=14,B=22,n=c.length;
   const mx=Math.max(...c,0),mn=Math.min(...c,0),x=i=>L+i/(n-1)*(W-L-R),y=v=>T+(1-(v-mn)/((mx-mn)||1))*(H-T-B);
   let ln="M"+x(0).toFixed(1)+" "+y(c[0]).toFixed(1);c.forEach((v,i)=>{if(i)ln+=" L"+x(i).toFixed(1)+" "+y(v).toFixed(1);});
   const ar=ln+" L"+x(n-1).toFixed(1)+" "+y(0).toFixed(1)+" L"+x(0).toFixed(1)+" "+y(0).toFixed(1)+" Z";
@@ -1483,14 +1560,14 @@ function renderEquity(){
   const grid=`<line x1="${L}" x2="${W-R}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="#e5e7eb"/><text x="${L-6}" y="${(y(0)+3).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">$0</text><text x="${L-6}" y="${(y(mx)+9).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">${money(mx/1000)}k</text>`;
   const tiles=[["Net, 18 years",money(eq.totalR*r)],["Profit factor",eq.pf],["Win rate",eq.win+"%"],["Worst drawdown",money(eq.maxddR*r)],["Trades",eq.n.toLocaleString("en-US")],["Risk per trade",money(r)]];
   const yrs=Object.entries(eq.years).map(([y2,v])=>`<div class="yr"><div class="y">${y2}${y2==="2026"?" YTD":""}</div><div class="r ${v.r>=0?"pos":"neg"}">${money(v.r*r)}</div></div>`).join("");
-  $("#eqSection").innerHTML=`<div class="eqhead"><h2>Full-history equity curve</h2><p>2008 to Oct 2026 · the exact rule the engine trades today · real 1-minute NQ data · Lucid commissions and slippage · scaled to your risk of ${money(r)} per trade</p></div>
+  $("#eqSection").innerHTML=`<div class="eqhead"><h2>Full-history equity curve · ${SNAME[state?state.asset:"nq"]}</h2><p>2008 to Oct 2026 · the exact rule the engine trades${state&&state.asset==="combo"?" (both strategies, your risk on each)":""} · real 1-minute NQ data · Lucid commissions and slippage · scaled to your risk of ${money(r)} per trade</p></div>
     <div class="eqchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Equity curve">
       <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16a34a" stop-opacity=".16"/><stop offset="1" stop-color="#16a34a" stop-opacity="0"/></linearGradient></defs>
       ${grid}<path d="${ar}" fill="url(#eqg)"/><path d="${ln}" fill="none" stroke="#0f8f45" stroke-width="2.2" stroke-linejoin="round"/>
       <circle cx="${x(n-1).toFixed(1)}" cy="${y(c[n-1]).toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yt}</svg></div>
     <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
     <div class="yrs">${yrs}</div>
-    <div class="eqnote">This is the raw strategy at a constant ${money(r)} risk per trade since 2008, not an account balance. <b>Look at 2009 to 2019: the strategy made no new high for almost 10 years</b>, and its worst drawdown was about ${Math.round(-eq.maxddR)} times the risk per trade. Most of the profit came in strong trend years (2008, 2018, 2022 to 2025). Flat stretches that long can happen again. A prop account stops at its target, its drawdown limit or its payout cap long before this, so use the odds above for what an account can do. Past results do not guarantee future results; 2026 so far is close to breakeven.</div>`;
+    <div class="eqnote">This is the raw strategy at a constant ${money(r)} risk per trade since 2008, not an account balance. Its worst drawdown was about <b>${Math.round(-eq.maxddR)} times the risk per trade</b>, profit factor ${eq.pf}, win rate ${eq.win}%. ${(!state||state.asset!=="orb")?"<b>The 10:30 rule made no new high from 2009 to 2019</b>; flat stretches that long can happen again. ":"Losing years in the test: 2010, 2013 and 2025. "}A prop account stops at its target, its drawdown limit or its payout cap long before this, so use the odds above for what an account can do. All figures are backtested on 2008–2026 data with commissions and slippage; past results do not guarantee future results.</div>`;
 }
 const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});

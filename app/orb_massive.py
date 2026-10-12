@@ -127,7 +127,16 @@ def rth_range_of(bars: List[Bar], day: str) -> Optional[float]:
     return round(max(b.h for b in win) - min(b.l for b in win), 2)
 
 
-def fetch_daily_context(api_key: str, exec_root: str, now=None, atr_days: int = 14, trend_days: int = 20):
+def rth_hl_of(bars: List[Bar], day: str):
+    """(high, low) of one session's regular hours (same window as rth_range_of), or None."""
+    win = [b for b in bars if b.dt.strftime("%Y-%m-%d") == day and 570 <= b.dt.hour * 60 + b.dt.minute < 960]
+    if len(win) < 200:
+        return None
+    return max(b.h for b in win), min(b.l for b in win)
+
+
+def fetch_daily_context(api_key: str, exec_root: str, now=None, atr_days: int = 14, trend_days: int = 20,
+                        with_levels: bool = False):
     """Prior sessions' inputs for the validated momentum rule, from Massive REST:
     (rth_ranges oldest-first [last atr_days RTH high-low], closes oldest-first [last trend_days session closes]).
     Uses ONE contract (the current front month) so there is no roll gap inside the window. Never raises;
@@ -151,6 +160,7 @@ def fetch_daily_context(api_key: str, exec_root: str, now=None, atr_days: int = 
     except Exception as e:
         print("ORB MASSIVE daily-close error:", e)
     ranges: List[float] = []
+    levels = None
     d = now.date()
     probes = 0
     while len(ranges) < atr_days and probes < atr_days * 2 + 10:
@@ -174,10 +184,14 @@ def fetch_daily_context(api_key: str, exec_root: str, now=None, atr_days: int = 
                 bars.append(Bar(dt, float(a["open"]), float(a["high"]), float(a["low"]), float(a["close"]), 0.0))
             rg = rth_range_of(bars, day)
             if rg:
+                if not ranges:                       # most recent complete prior session -> prior-day high/low
+                    levels = rth_hl_of(bars, day)
                 ranges.append(rg)
         except Exception as e:
             print("ORB MASSIVE rth-range error:", day, e)
     ranges.reverse()
+    if with_levels:
+        return ranges, closes[-trend_days:], levels
     return ranges, closes[-trend_days:]
 
 
