@@ -853,7 +853,8 @@ async def engine_loop() -> None:
                     _alert_if_needed(a)
                 for a in actions:                           # fills, exits, flattens, errors -> log (once per kind/day)
                     if a.get("action") not in (None, "wait") or a.get("error"):
-                        key = (_now_et().date().isoformat(), a.get("account_id"), a.get("root"), a.get("action"), a.get("reason"))
+                        key = (_now_et().date().isoformat(), a.get("account_id"), a.get("root"), a.get("action"), a.get("reason"),
+                               a.get("strategy"), a.get("exit"), a.get("entry"))
                         if key not in _LOGGED:
                             _LOGGED.add(key)
                             if len(_LOGGED) > 5000:
