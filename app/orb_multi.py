@@ -81,9 +81,17 @@ class MultiAutopilot(Autopilot):
             return "Risk state unavailable - entry blocked (fail-closed)."
 
     # ---- feed callback -----------------------------------------------------------------------------
+    def _shift(self, bar):
+        off = getattr(self, "test_offset_min", None)
+        if not off:
+            return bar
+        from app.orb_selective import Bar
+        return Bar(bar.dt - timedelta(minutes=off), bar.o, bar.h, bar.l, bar.c, bar.v)
+
     def on_bar(self, root, bar):
         if root not in self.cfg.instruments:
             return None
+        bar = self._shift(bar)
         st = self._day(root, bar)
         st.bars.append(bar)
         legs = self._today_legs(root, st)
@@ -188,7 +196,13 @@ class MultiAutopilot(Autopilot):
         td = st.trading_date
         if self._mom_done.get(root) == td or bar.minute_of_day < MOM.DECIDE_MIN:
             return None
-        status, res = MOM.decision(st.bars, self._context(root, td))
+        ctx = self._context(root, td)
+        if getattr(self, "test_offset_min", None) and ctx is not None:      # live test: always agree with the move
+            op = next((b for b in st.bars if MOM.OPEN_MIN <= b.minute_of_day < MOM.OPEN_MIN + 10), None)
+            dc = next((b for b in st.bars if MOM.DECIDE_MIN <= b.minute_of_day < MOM.LAST_DECIDE_MIN), None)
+            if op and dc and dc.c != op.o:
+                ctx = MOM.DayContext(ctx.date, ctx.atr, 1 if dc.c > op.o else -1, ctx.pdh, ctx.pdl)
+        status, res = MOM.decision(st.bars, ctx)
         if status == "wait":
             return None
         if status == "skip":
@@ -373,6 +387,10 @@ class MultiAutopilot(Autopilot):
 
     # ---- restart safety ----------------------------------------------------------------------------
     def backfill(self, root, bars):
+        bars = [self._shift(b) for b in (bars or [])]
+        return self._backfill(root, bars)
+
+    def _backfill(self, root, bars):
         """Restart mid-session: rebuild today's bars; never place a late entry. If the ORB entry window has started,
         resting entries placed before the restart are unknown to this process -> cancel this instrument's working
         orders when FLAT (stale entries); when a position exists its bracket protects it and 15:59 flattens it."""
