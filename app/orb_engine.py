@@ -30,10 +30,13 @@ from app.orb_live import (Autopilot, AccountConfig, DEFAULT_PARAMS, INSTRUMENTS,
                          plan_total_micros, split_micros)
 from app.orb_massive import MassiveFeed, subscriptions_for, _ET
 from app.orb_selective import Bar
+from app import orb_momentum as MOM
+from app.orb_validated import DATA as VALIDATED
 
 POLL_INTERVAL = float(__import__("os").getenv("ORB_LIVE_POLL_INTERVAL", "3"))
 # instrument root -> the asset key the sizing/split uses
-_ASSET_ROOTS = {"nq": ["MNQ"], "rty": ["M2K"], "both": ["MNQ", "M2K"]}
+# RTY is retired (no reliable edge, malfunctioned live): every stored asset value now trades MNQ only.
+_ASSET_ROOTS = {"nq": ["MNQ"], "rty": ["MNQ"], "both": ["MNQ"]}
 
 
 def _now_et() -> datetime:
@@ -46,7 +49,49 @@ def _massive_key() -> Optional[str]:
 
 def _make_autopilot(cfg: AccountConfig, token_provider) -> Autopilot:
     """One Autopilot per account, executing to that account's Tradovate connection."""
-    return Autopilot(cfg, get_token=token_provider, now_et=_now_et)
+    return Autopilot(cfg, get_token=token_provider, now_et=_now_et, get_context=get_context)
+
+
+# ---------------------------------------------------------------------------
+# daily context (prior-session ATR14 + 20-day trend) — fetched OFF the event loop, cached per date
+# ---------------------------------------------------------------------------
+_CTX: Dict[tuple, "MOM.DayContext"] = {}
+_CTX_TRIED: Dict[tuple, float] = {}
+
+
+def get_context(root: str, date: str):
+    """Cached context for (root, ET date); None if not fetched yet (the engine then sits the day out)."""
+    return _CTX.get((root, date))
+
+
+def refresh_context(roots, now=None, retry_sec: float = 600.0) -> List[dict]:
+    """Fetch today's context for each root once (retry every 10 min on failure). Blocking network —
+    call from an executor. Never raises."""
+    import time
+    from app.orb_massive import fetch_daily_context
+    now = now or _now_et()
+    date = now.strftime("%Y-%m-%d")
+    out = []
+    key = _massive_key()
+    for root in roots:
+        k = (root, date)
+        if k in _CTX and _CTX[k].ok:
+            continue
+        if time.time() - _CTX_TRIED.get(k, 0) < retry_sec:
+            continue
+        _CTX_TRIED[k] = time.time()
+        if not key:
+            out.append({"root": root, "context": "no MASSIVE_API_KEY"})
+            continue
+        try:
+            ranges, closes = fetch_daily_context(key, root, now)
+            ctx = MOM.context_from(ranges, closes, date)
+            _CTX[k] = ctx
+            out.append({"root": root, "date": date, "atr": ctx.atr, "trend": ctx.trend,
+                        "ranges": len(ranges), "closes": len(closes), "ok": ctx.ok})
+        except Exception as e:
+            out.append({"root": root, "context_error": str(e)})
+    return out
 
 
 def _make_massive_feed(subscriptions, on_bar):
@@ -122,6 +167,17 @@ def ensure_table() -> None:
         )""")
     con.commit()
     con.close()
+    for col, decl in (("dd_type", "TEXT DEFAULT 'eod'"), ("cash_bal", "REAL DEFAULT 25000"), ("cash_dd", "REAL DEFAULT 15")):
+        try:                                  # additive, one statement per connection (Postgres-safe)
+            c2 = _db()
+            c2.execute(f"ALTER TABLE orb_autopilot ADD COLUMN {col} {decl}")
+            c2.commit()
+            c2.close()
+        except Exception:
+            try:
+                c2.close()
+            except Exception:
+                pass
 
 
 def get_config(user_id: int, account_id: str) -> Optional[dict]:
@@ -133,23 +189,28 @@ def get_config(user_id: int, account_id: str) -> Optional[dict]:
 
 
 def save_config(user_id: int, account_pk: int, account_id: str, *, enabled: bool,
-                mode: str, acct_size: str, preset: str, asset: str) -> None:
+                mode: str, acct_size: str, preset: str, asset: str, dd_type: str = "eod",
+                cash_bal: float = 25000.0, cash_dd: float = 15.0) -> None:
     """Upsert one account's autopilot settings. Validates the enum values so a bad payload can
     never reach the sizing tables."""
     assert mode in ("eval", "funded", "cash")
     assert acct_size in ("25K", "50K", "100K", "150K")
     assert preset in ("cons", "norm", "aggr")
     assert asset in ("nq", "rty", "both")
+    assert dd_type in ("eod", "intraday", "static")
+    cash_bal = float(cash_bal); cash_dd = float(cash_dd)
+    assert 1000 <= cash_bal <= 10_000_000 and 1 <= cash_dd <= 50
     con = _db()
     con.execute("""
-        INSERT INTO orb_autopilot(user_id,account_pk,account_id,enabled,mode,acct_size,preset,asset,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO orb_autopilot(user_id,account_pk,account_id,enabled,mode,acct_size,preset,asset,dd_type,cash_bal,cash_dd,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(user_id,account_id) DO UPDATE SET
           account_pk=excluded.account_pk, enabled=excluded.enabled, mode=excluded.mode,
           acct_size=excluded.acct_size, preset=excluded.preset, asset=excluded.asset,
+          dd_type=excluded.dd_type, cash_bal=excluded.cash_bal, cash_dd=excluded.cash_dd,
           updated_at=excluded.updated_at
     """, (user_id, account_pk, str(account_id), 1 if enabled else 0, mode, acct_size, preset,
-          asset, datetime.now(timezone.utc).isoformat()))
+          asset, dd_type, cash_bal, cash_dd, datetime.now(timezone.utc).isoformat()))
     con.commit()
     con.close()
 
@@ -185,7 +246,9 @@ def _copy_config_rows(copy_accounts: List[dict], templates: Dict[int, dict]) -> 
                     "account_name": a["account_name"], "env": a["env"],
                     "status": a.get("status", "connected"), "account_id": a["account_id"],
                     "enabled": 1, "mode": t["mode"], "acct_size": t["acct_size"],
-                    "preset": t["preset"], "asset": t["asset"], "source": "copy"})
+                    "preset": t["preset"], "asset": t["asset"], "dd_type": t.get("dd_type") or "eod",
+                    "cash_bal": t.get("cash_bal") or 25000, "cash_dd": t.get("cash_dd") or 15,
+                    "source": "copy"})
     return out
 
 
@@ -227,20 +290,46 @@ def set_master_running(user_id: int) -> None:
 # ---------------------------------------------------------------------------
 # sizing + config building
 # ---------------------------------------------------------------------------
-def qty_for(mode: str, acct_size: str, preset: str, asset: str) -> Dict[str, int]:
-    """Micro contracts per instrument for a config, EXACTLY as the Prop Engine dashboard sizes
-    (plan_total_micros -> split_micros). Instruments not in the chosen asset get 0."""
-    total = plan_total_micros(mode, acct_size, preset, asset=asset)
-    split = split_micros(total, asset)   # {"MNQ": x, "M2K": y}
-    roots = _ASSET_ROOTS[asset]
-    return {r: split.get(r, 0) for r in roots}
+ACCT = {"25K": dict(start=25000, target=1250, mll=1000, eval_micros=20, funded_micros=10),
+        "50K": dict(start=50000, target=3000, mll=2000, eval_micros=40, funded_micros=20),
+        "100K": dict(start=100000, target=6000, mll=3000, eval_micros=60, funded_micros=30),
+        "150K": dict(start=150000, target=9000, mll=4500, eval_micros=100, funded_micros=40)}
+_CASH_FRAC = {"cons": 0.25, "norm": 0.35, "aggr": 0.5}
+
+
+def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
+              cash_bal: float = 25000.0, cash_dd: float = 15.0) -> dict:
+    """Validated sizing for a configuration: $ risked per trade, max micros, eval take-profit cap.
+    eval   -> the preset's validated risk for this account size AND drawdown type (orb_validated)
+    funded -> 12% of the max-loss limit, hold to close (validated funded mode)
+    cash   -> preset fraction of the user's drawdown budget (balance x dd%)."""
+    a = ACCT[acct_size]
+    dd = dd_type if dd_type in ("eod", "intraday", "static") else "eod"
+    if mode == "eval":
+        risk = float(VALIDATED["presets"][acct_size][dd][preset]["risk"])
+        return dict(risk_usd=risk, max_micros=a["eval_micros"], day_tp_usd=round(0.48 * a["target"]),
+                    start=a["start"], target=a["target"])
+    if mode == "funded":
+        return dict(risk_usd=float(VALIDATED["funded"][acct_size][dd]["risk"]), max_micros=a["funded_micros"],
+                    day_tp_usd=None, start=a["start"], target=0)
+    return dict(risk_usd=round(float(cash_bal) * float(cash_dd) / 100.0 * _CASH_FRAC.get(preset, 0.25)),
+                max_micros=40, day_tp_usd=None, start=0, target=0)
+
+
+def qty_for(mode: str, acct_size: str, preset: str, asset: str, dd_type: str = "eod",
+            cash_bal: float = 25000.0, cash_dd: float = 15.0, atr: Optional[float] = None) -> Dict[str, int]:
+    """ESTIMATED micros at today's volatility (the engine sizes exactly at 10:30 from the live stop)."""
+    plan = risk_plan(mode, acct_size, preset, dd_type, cash_bal, cash_dd)
+    a = atr or (get_context("MNQ", _now_et().strftime("%Y-%m-%d")) or MOM.DayContext("", None, 0)).atr or 300.0
+    return {"MNQ": MOM.micros_for_risk(plan["risk_usd"], MOM.STOP_ATR * a, 2.0, plan["max_micros"])}
 
 
 def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) -> str:
     """Stable hash of everything that, if changed, should rebuild the account's feed+autopilot."""
     return json.dumps({"env": row.get("env"), "mode": row["mode"], "size": row["acct_size"],
-                       "preset": row["preset"], "asset": row["asset"],
-                       "contracts": contracts, "qty": qty}, sort_keys=True)
+                       "preset": row["preset"], "asset": row["asset"], "dd": row.get("dd_type") or "eod",
+                       "cash": [row.get("cash_bal"), row.get("cash_dd")],
+                       "contracts": contracts, "strategy": "momentum-v1"}, sort_keys=True)
 
 
 def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
@@ -255,12 +344,17 @@ def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
             contracts[r] = tvo.resolve_contract(env, token, INSTRUMENTS[r].root)
         except Exception:
             return None
-    qty = qty_for(row["mode"], row["acct_size"], row["preset"], row["asset"])
+    dd = row.get("dd_type") or "eod"
+    cb, cd = row.get("cash_bal") or 25000, row.get("cash_dd") or 15
+    plan = risk_plan(row["mode"], row["acct_size"], row["preset"], dd, cb, cd)
+    qty = qty_for(row["mode"], row["acct_size"], row["preset"], row["asset"], dd, cb, cd)
     observe_env = set(x.strip() for x in __import__("os").getenv("ORB_OBSERVE", "").split(",") if x.strip())
     observe = {r: (r in observe_env) for r in roots}
     return AccountConfig(env=env, account_spec=row["account_name"], account_id=int(row["account_id"]),
                         account_name=row["account_name"], instruments=contracts, qty=qty,
-                        params=dict(DEFAULT_PARAMS), observe=observe)
+                        params=dict(DEFAULT_PARAMS), observe=observe, strategy="momentum",
+                        mode=row["mode"], risk_usd=plan["risk_usd"], max_micros=plan["max_micros"],
+                        acct_start=plan["start"], acct_target=plan["target"], day_tp_usd=plan["day_tp_usd"])
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +531,14 @@ def _plan_configs() -> List[dict]:
     return out
 
 
+def _ctx_status() -> dict:
+    c = get_context("MNQ", _now_et().strftime("%Y-%m-%d"))
+    if not c:
+        return {"ready": False}
+    return {"ready": c.ok, "date": c.date, "atr": round(c.atr, 1) if c.atr else None, "trend": c.trend,
+            "stop_pts": round(MOM.STOP_ATR * c.atr, 2) if c.atr else None}
+
+
 async def engine_loop() -> None:
     """Leader-only reconcile loop. Each tick: rebuild the enabled config set, sync the manager
     (start/stop feeds), and poll every account against broker truth. Never raises out."""
@@ -451,6 +553,12 @@ async def engine_loop() -> None:
             if is_leader:
                 configs = await asyncio.get_event_loop().run_in_executor(None, _plan_configs)
                 _MANAGER.sync(configs)
+                # today's prior-session context (ATR14 + 20d trend) for the 10:30 decision — fetched off-loop,
+                # once per day (retried every 10 min on failure). Without it the engine sits the day out.
+                if _MANAGER.active_ids():
+                    ctx_out = await asyncio.get_event_loop().run_in_executor(None, refresh_context, ["MNQ"])
+                    for c in ctx_out:
+                        print("ORB context:", c)
                 # seed ATR + backfill today's opening range for any newly-armed account (restart-proof)
                 bf = await asyncio.get_event_loop().run_in_executor(
                     None, _MANAGER.run_backfills, _fetch_today_bars, _fetch_daily_ranges)
@@ -462,6 +570,7 @@ async def engine_loop() -> None:
                                     data_key=bool(_massive_key()),
                                     feed_instruments=list(_MANAGER.feed_roots()),
                                     bars_seen=_MANAGER.bars_seen, last_bar=_MANAGER.last_bar,
+                                    context=_ctx_status(),
                                     actions=[a for a in actions if a.get("action") not in (None,)][-20:],
                                     ts=datetime.now(timezone.utc).isoformat())
                 # email the account owner for each trade that just fired (off the loop thread)
@@ -805,17 +914,20 @@ def install(app) -> None:
         if not acct:
             return JSONResponse({"ok": False, "error": "account not connected"}, status_code=400)
         enabling = form.get("enabled") in ("1", "true", "on", True)
+        mode = str(form.get("mode") or "eval"); size = str(form.get("acct_size") or "50K")
+        preset = str(form.get("preset") or "norm"); dd = str(form.get("dd_type") or "eod")
         try:
-            save_config(user["id"], acct["id"], account_id, enabled=enabling,
-                        mode=str(form.get("mode") or "eval"), acct_size=str(form.get("acct_size") or "50K"),
-                        preset=str(form.get("preset") or "norm"), asset=str(form.get("asset") or "both"))
-        except AssertionError:
+            cb = float(str(form.get("cash_bal") or "25000").replace(",", ""))
+            cd = float(form.get("cash_dd") or 15)
+            save_config(user["id"], acct["id"], account_id, enabled=enabling, mode=mode, acct_size=size,
+                        preset=preset, asset="nq", dd_type=dd, cash_bal=cb, cash_dd=cd)
+        except (AssertionError, ValueError):
             return JSONResponse({"ok": False, "error": "invalid settings"}, status_code=400)
         if enabling:
             set_master_running(user["id"])   # Start here = allow execution (Dashboard Pause still stops it)
+        plan = risk_plan(mode, size, preset, dd, cb, cd)
         return JSONResponse({"ok": True, "enabled": enabling, "master_running": master_running(user["id"]),
-                            "qty": qty_for(str(form.get("mode") or "eval"), str(form.get("acct_size") or "50K"),
-                            str(form.get("preset") or "norm"), str(form.get("asset") or "both"))})
+                            "risk_usd": plan["risk_usd"], "qty": qty_for(mode, size, preset, "nq", dd, cb, cd)})
 
     @app.get("/prop-engine/status")
     def prop_engine_status(request: Request):
@@ -825,15 +937,14 @@ def install(app) -> None:
             return JSONResponse({"engine": _LAST_STATUS, "accounts": {}, "master_running": False})
         mine = {a["account_id"]: get_config(user["id"], a["account_id"])
                 for a in _connected_accounts(user["id"])}
-        return JSONResponse({"engine": _LAST_STATUS, "accounts": mine,
+        return JSONResponse({"engine": _LAST_STATUS, "accounts": mine, "context": _ctx_status(),
                             "master_running": master_running(user["id"])})
 
 
 def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], legacy: bool = False) -> str:
-    """Full KhomaVolume ORB control room: pick a connected account, configure mode / account
-    size / drawdown / preset / markets, see the live contract sizing + projection, and Start
-    Automation — which arms the server-side engine to scan the market and execute by our rules.
-    All projection math is client-side from the validated (honest) tables; arming persists via
+    """KhomaVolume NQ control room: pick a connected account, configure mode / account size / drawdown
+    type / preset, see the validated odds + live sizing + 10-year equity curve, and Start/Stop automation.
+    All numbers come from app.orb_validated (generated from the research harness); arming persists via
     /prop-engine/save and the background loop picks it up within seconds."""
     accts = [{"id": a["account_id"], "name": a.get("account_name", ""),
               "env": (a.get("env") or "live")} for a in accounts]
@@ -842,17 +953,11 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], leg
         c = cfgs.get(a["account_id"]) or {}
         conf[a["account_id"]] = {"enabled": bool(c.get("enabled")), "mode": c.get("mode", "eval"),
                                  "acct_size": c.get("acct_size", "50K"), "preset": c.get("preset", "norm"),
-                                 "asset": c.get("asset", "both"), "bal": c.get("bal", 25000),
-                                 "dd": c.get("dd", 15)}
-    html = (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
+                                 "dd_type": c.get("dd_type") or "eod", "cash_bal": c.get("cash_bal") or 25000,
+                                 "cash_dd": c.get("cash_dd") or 15}
+    return (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
                  .replace("__CONFIGS__", json.dumps(conf))
-                 .replace("__EQUITY__", _EQUITY_JSON_LEGACY if legacy else _EQUITY_JSON))
-    if legacy:
-        import re as _re
-        html = _re.sub(r'const EVAL=\{.*?\};', lambda m: _EVAL_LEGACY, html, count=1)
-        html = _re.sub(r'const NOTES=\{.*?\};', lambda m: _NOTES_LEGACY, html, count=1)
-        html = _re.sub(r'<div class="eqnote">.*?</div>', lambda m: _EQNOTE_LEGACY, html, count=1)
-    return html
+                 .replace("__DATA__", json.dumps(VALIDATED)))
 
 
 # Validated equity curves + stats (per micro), generated from the 2019-2026 backtest:
@@ -871,30 +976,29 @@ _EQNOTE_LEGACY = '<div class="eqnote">Portfolio (NQ + RTY) is the smoothest — 
 _PAGE = r"""
 <style>
   .kv{--g:#0f8f45;--gd:#086b34;--gs:#eaf7ef;--gl:#cdebd8;--btn:linear-gradient(135deg,#12a150,#087135);
-      --tx:#111827;--mu:#6b7280;--fa:#9ca3af;--ln:#e5e7eb;--bg:#f8faf9;--card:#fff;--dg:#dc2626;
+      --tx:#111827;--mu:#6b7280;--fa:#9ca3af;--ln:#e5e7eb;--bg:#f8faf9;--card:#fff;--dg:#dc2626;--am:#b45309;
       max-width:1000px;margin:0 auto;padding:8px 6px 60px;color:var(--tx);
       font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
   .kv h1{font-size:24px;font-weight:900;letter-spacing:-.8px;margin:0}
   .kv .lead{color:var(--mu);font-size:13.5px;margin:4px 0 20px}
   .kv .ey{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--fa)}
   .kv .top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
-  .kv .apick{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--ln);
-      border-radius:14px;padding:9px 12px;box-shadow:0 8px 20px rgba(17,24,39,.05)}
-  .kv .apick select{font:inherit;font-size:15px;font-weight:800;border:0;background:transparent;color:var(--tx);outline:none}
+  .kv .apick{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--ln);border-radius:14px;padding:9px 12px;box-shadow:0 8px 20px rgba(17,24,39,.05)}
+  .kv .apick select{font:inherit;font-size:15px;font-weight:800;border:0;background:transparent;color:var(--tx);outline:none;max-width:60vw}
   .kv .envb{font-size:10px;font-weight:900;border:1px solid;border-radius:6px;padding:2px 7px}
   .kv .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px;margin-top:18px}
   @media(max-width:820px){.kv .grid{grid-template-columns:1fr}}
-  .kv .card{background:var(--card);border:1px solid var(--ln);border-radius:20px;box-shadow:0 18px 60px rgba(17,24,39,.06)}
+  .kv .card{background:var(--card);border:1px solid var(--ln);border-radius:20px;box-shadow:0 18px 60px rgba(17,24,39,.06);min-width:0}
   .kv .card .hd{padding:18px 22px 0}.kv .card .hd h2{font-size:16px;font-weight:800;letter-spacing:-.3px;margin:0}
   .kv .card .hd p{color:var(--mu);font-size:12.5px;margin:4px 0 0}
   .kv .card .bd{padding:18px 22px 22px}
   .kv .field{margin-top:18px}.kv .field:first-child{margin-top:0}
   .kv .field>label{display:block;font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--fa);margin-bottom:8px}
-  .kv .seg{display:flex;gap:6px;background:#f4f6f5;border:1px solid var(--ln);border-radius:13px;padding:5px}
+  .kv .seg{display:flex;gap:6px;background:#f4f6f5;border:1px solid var(--ln);border-radius:13px;padding:5px;flex-wrap:wrap}
   .kv .seg.four{display:grid;grid-template-columns:repeat(4,1fr)}
-  .kv .seg button{flex:1;border:0;background:transparent;color:var(--mu);font:inherit;font-size:13px;font-weight:700;
-      padding:9px 6px;border-radius:9px;cursor:pointer;transition:.12s}
+  .kv .seg button{flex:1;border:0;background:transparent;color:var(--mu);font:inherit;font-size:13px;font-weight:700;padding:9px 6px;border-radius:9px;cursor:pointer;transition:.12s;min-width:0}
   .kv .seg button[aria-pressed=true]{background:#fff;color:var(--gd);box-shadow:0 6px 16px rgba(17,24,39,.06);font-weight:800}
+  .kv .seg button:focus-visible,.kv .startbtn:focus-visible{outline:2px solid var(--g);outline-offset:2px}
   .kv .cashrow{display:flex;gap:14px;flex-wrap:wrap}.kv .cashrow .f{flex:1;min-width:130px}
   .kv .inl{display:flex;align-items:center;border:1px solid var(--ln);border-radius:12px;background:#fff;overflow:hidden}
   .kv .inl span{padding:0 11px;color:var(--fa);font-weight:800}
@@ -902,7 +1006,6 @@ _PAGE = r"""
   .kv input[type=range]{width:100%;accent-color:var(--g);margin-top:8px}
   .kv .rv{display:flex;justify-content:space-between;font-size:12px;color:var(--mu);font-weight:700}.kv .rv b{color:var(--gd);font-size:15px}
   .kv .pn{font-size:12.5px;color:var(--mu);margin-top:10px;min-height:16px;line-height:1.45}
-  .kv .proj .bd{padding:20px 22px 22px}
   .kv .hero{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
   .kv .big{font-size:52px;font-weight:900;letter-spacing:-2.5px;color:var(--gd);line-height:.9;font-variant-numeric:tabular-nums}
   .kv .cap{font-size:13px;color:var(--mu);max-width:30ch;line-height:1.4}.kv .cap b{color:var(--tx)}
@@ -910,49 +1013,48 @@ _PAGE = r"""
   .kv .meter i{display:block;height:100%;background:var(--btn);border-radius:7px;transition:width .4s}
   .kv .sz{margin-top:18px;background:var(--gs);border:1px solid var(--gl);border-radius:16px;padding:16px 18px}
   .kv .sz .t{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--gd)}
-  .kv .sz .legs{display:flex;gap:12px;margin-top:10px}
-  .kv .sz .leg{flex:1;background:#fff;border:1px solid var(--gl);border-radius:13px;padding:12px 14px}
-  .kv .sz .leg .m{font-size:11px;color:var(--mu);font-weight:700;display:flex;gap:7px;align-items:center}
-  .kv .sz .leg .m .tk{font-size:10px;font-weight:900;color:var(--gd);background:var(--gs);border:1px solid var(--gl);padding:1px 6px;border-radius:6px}
-  .kv .sz .leg.r .m .tk{color:#475569;background:#f1f5f9;border-color:#e2e8f0}
-  .kv .sz .leg .n{font-size:30px;font-weight:900;letter-spacing:-1px;margin-top:5px;font-variant-numeric:tabular-nums}
+  .kv .sz .row{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap}
+  .kv .sz .leg{flex:1;min-width:120px;background:#fff;border:1px solid var(--gl);border-radius:13px;padding:12px 14px}
+  .kv .sz .leg .m{font-size:11px;color:var(--mu);font-weight:700}
+  .kv .sz .leg .n{font-size:26px;font-weight:900;letter-spacing:-1px;margin-top:5px;font-variant-numeric:tabular-nums}
   .kv .sz .leg .n small{font-size:12px;color:var(--fa);font-weight:700}
   .kv .tiles{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--ln);border:1px solid var(--ln);border-radius:14px;overflow:hidden;margin-top:16px}
-  .kv .tiles .t{background:#fff;padding:13px 16px}.kv .tiles .t .k{font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
-  .kv .tiles .t .v{font-size:20px;font-weight:900;letter-spacing:-.6px;margin-top:3px;font-variant-numeric:tabular-nums}.kv .tiles .t .v small{font-size:11px;color:var(--mu);font-weight:700}
+  .kv .tiles .t{background:#fff;padding:13px 16px;min-width:0}.kv .tiles .t .k{font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
+  .kv .tiles .t .v{font-size:20px;font-weight:900;letter-spacing:-.6px;margin-top:3px;font-variant-numeric:tabular-nums}
+  .kv .tiles .t .s{font-size:11.5px;color:var(--mu);font-weight:600;margin-top:2px}
+  .kv .tiles .t.warn .v{color:var(--am)}
   .kv .run{margin-top:22px;background:var(--card);border:1px solid var(--ln);border-radius:20px;box-shadow:0 18px 60px rgba(17,24,39,.06);padding:20px 22px}
   .kv .runrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  .kv .startbtn{flex:1;min-width:220px;border:0;border-radius:14px;padding:17px 22px;font:inherit;font-size:16px;font-weight:900;color:#fff;
-      background:var(--btn);cursor:pointer;letter-spacing:-.2px;box-shadow:0 14px 30px rgba(15,143,69,.25)}
+  .kv .startbtn{flex:1;min-width:220px;border:0;border-radius:14px;padding:17px 22px;font:inherit;font-size:16px;font-weight:900;color:#fff;background:var(--btn);cursor:pointer;letter-spacing:-.2px;box-shadow:0 14px 30px rgba(15,143,69,.25)}
   .kv .startbtn.on{background:#fef2f2;color:var(--dg);box-shadow:none;border:1px solid #fecaca}
+  .kv .startbtn:disabled{opacity:.6;cursor:wait}
   .kv .rstat{flex:1;min-width:220px;font-size:13px;color:var(--mu);line-height:1.5}
   .kv .rstat .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#9ca3af;margin-right:7px;vertical-align:middle}
   .kv .rstat.live .dot{background:#16a34a;box-shadow:0 0 0 3px rgba(22,163,74,.18);animation:kvp 1.6s infinite}
   @keyframes kvp{0%,100%{opacity:1}50%{opacity:.45}}
+  @media (prefers-reduced-motion:reduce){.kv .rstat.live .dot{animation:none}}
   .kv .rstat b{color:var(--tx)}
-  .kv .acts{margin-top:14px;border-top:1px solid var(--ln);padding-top:12px;font-size:12px;color:var(--mu)}
+  .kv .today{margin-top:14px;border-top:1px solid var(--ln);padding-top:12px;font-size:12.5px;color:var(--mu);line-height:1.5}
+  .kv .today b{color:var(--tx)}
+  .kv .err{margin-top:10px;color:var(--dg);font-size:12.5px;font-weight:700}
+  .kv .acts{margin-top:10px;font-size:12px;color:var(--mu)}
   .kv .acts .row{display:flex;gap:10px;padding:3px 0;font-variant-numeric:tabular-nums}
   .kv .note{display:flex;gap:12px;background:var(--bg);border:1px solid var(--ln);border-left:4px solid var(--g);border-radius:14px;padding:14px 16px;margin-top:16px;font-size:12.5px;color:var(--mu);line-height:1.5}
   .kv .note b{color:var(--tx)}
   .kv .empty{background:var(--card);border:1px solid var(--ln);border-radius:18px;padding:26px;text-align:center;color:var(--mu)}
   .kv .eqwrap{display:block;margin-top:22px;background:var(--card);border:1px solid var(--ln);border-radius:20px;box-shadow:0 18px 60px rgba(17,24,39,.06);padding:20px 22px 22px}
-  .kv .eqhead{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
   .kv .eqhead h2{font-size:16px;font-weight:800;letter-spacing:-.3px;margin:0}.kv .eqhead p{color:var(--mu);font-size:12px;margin:4px 0 0}
-  .kv .eqtabs{display:flex;gap:6px;background:#f4f6f5;border:1px solid var(--ln);border-radius:12px;padding:4px}
-  .kv .eqtab{border:0;background:transparent;color:var(--mu);font:inherit;font-size:12.5px;font-weight:700;padding:7px 12px;border-radius:8px;cursor:pointer}
-  .kv .eqtab.on{background:#fff;color:var(--gd);box-shadow:0 6px 16px rgba(17,24,39,.06);font-weight:800}
   .kv .eqchart{margin-top:14px}.kv .eqchart svg{width:100%;height:auto;display:block}
   .kv .eqtiles{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--ln);border:1px solid var(--ln);border-radius:14px;overflow:hidden;margin-top:14px}
   @media(max-width:760px){.kv .eqtiles{grid-template-columns:repeat(3,1fr)}}
-  .kv .eqt{background:#fff;padding:12px 14px}.kv .eqt .k{font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
-  .kv .eqt .v{font-size:18px;font-weight:900;letter-spacing:-.5px;margin-top:3px;font-variant-numeric:tabular-nums}
+  .kv .eqt{background:#fff;padding:12px 14px;min-width:0}.kv .eqt .k{font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--fa)}
+  .kv .eqt .v{font-size:17px;font-weight:900;letter-spacing:-.5px;margin-top:3px;font-variant-numeric:tabular-nums}
+  .kv .yrs{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;margin-top:12px}
+  @media(max-width:760px){.kv .yrs{grid-template-columns:repeat(5,minmax(0,1fr))}}
+  .kv .yr{border:1px solid var(--ln);border-radius:10px;padding:8px;text-align:center;font-variant-numeric:tabular-nums}
+  .kv .yr .y{font-size:10.5px;font-weight:800;color:var(--fa)}.kv .yr .r{font-size:13px;font-weight:900;margin-top:2px}
+  .kv .pos{color:var(--gd)}.kv .neg{color:var(--dg)}
   .kv .eqnote{font-size:12.5px;color:var(--mu);line-height:1.5;margin-top:14px;background:var(--gs);border:1px solid var(--gl);border-radius:12px;padding:12px 14px}
-  .kv .truth{margin-top:22px}
-  .kv .odds{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
-  @media(max-width:620px){.kv .odds{grid-template-columns:1fr}}
-  .kv .odd{background:var(--gs);border:1px solid var(--gl);border-radius:16px;padding:16px 18px;text-align:center}
-  .kv .odd .ob{font-size:30px;font-weight:900;letter-spacing:-1.2px;color:var(--gd);font-variant-numeric:tabular-nums}
-  .kv .odd .ol{font-size:12px;color:var(--mu);margin-top:6px;line-height:1.35}
   .kv .howhd{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--fa);margin:22px 0 10px}
   .kv .steps{display:grid;gap:8px}
   .kv .step{display:flex;gap:12px;align-items:flex-start;background:#fff;border:1px solid var(--ln);border-radius:13px;padding:12px 14px;font-size:12.5px;color:var(--mu);line-height:1.45}
@@ -961,198 +1063,186 @@ _PAGE = r"""
   .kv .truths{list-style:none;padding:0;margin:20px 0 0;display:grid;gap:9px}
   .kv .truths li{display:flex;gap:10px;align-items:flex-start;font-size:12.5px;color:var(--tx);line-height:1.45}
   .kv .truths li::before{content:"";flex:none;width:6px;height:6px;border-radius:50%;background:var(--g);margin-top:7px}
-  .kv .truths b{font-weight:800}
 </style>
 <div class="kv" id="kv">
   <div class="top">
     <div>
-      <h1>KhomaVolume ORB</h1>
-      <div class="lead">Automated selective-breakout execution on NQ, run server-side by KhomaAPI.</div>
+      <h1>KhomaVolume NQ</h1>
+      <div class="lead">One decision a day at 10:30 ET on micro Nasdaq (MNQ), executed server-side by KhomaAPI.</div>
     </div>
     <div class="apick" id="apickWrap">
       <span class="ey">Account</span>
-      <select id="acctSel"></select>
+      <select id="acctSel" aria-label="Trading account"></select>
       <span class="envb" id="envBadge"></span>
     </div>
   </div>
   <div id="app"></div>
   <section id="eqSection" class="eqwrap"></section>
-  <section class="eqwrap truth">
-    <div class="eqhead"><div><h2>What to actually expect</h2><p>The real probabilities, and exactly how your account is traded. Honest numbers only &mdash; no inflated backtests.</p></div></div>
-    <div class="odds">
-      <div class="odd"><div class="ob">~1 in 3</div><div class="ol">chance to pass a single evaluation</div></div>
-      <div class="odd"><div class="ob">~1 in 6</div><div class="ol">chance one account reaches a payout</div></div>
-      <div class="odd"><div class="ob">~65%</div><div class="ol">chance of a payout across 5&ndash;6 accounts</div></div>
-    </div>
-    <div class="note" style="margin-top:16px"><div><b>The buffer comes first.</b> On a funded 50K you have to grow the account about <b>$2,600</b> &mdash; clear the ~$2,100 drawdown buffer plus the $500 minimum &mdash; before you can withdraw a single dollar, and the account can blow during that grind. <b>Getting funded is not the same as getting paid.</b></div></div>
-    <div class="howhd">How your account is traded</div>
-    <div class="steps">
-      <div class="step"><span class="sn">1</span><div><b>NQ only.</b> One market &mdash; micro Nasdaq (MNQ). RTY was retired for carrying no reliable edge.</div></div>
-      <div class="step"><span class="sn">2</span><div><b>One decision a day, at 10:30 ET.</b> The engine takes a trade only when three things agree: momentum, a breakout beyond the 9:30&ndash;9:45 opening range, and the 20-day trend. Most days it sits out and risks nothing.</div></div>
-      <div class="step"><span class="sn">3</span><div><b>Risk-sized, with a hard stop.</b> Every trade risks a fixed amount (one opening-range width = 1R). Winners are trailed so they can run; losers are capped at the stop.</div></div>
-      <div class="step"><span class="sn">4</span><div><b>Flat by 15:55 ET &mdash; never overnight.</b> High-impact news days (FOMC, CPI, NFP, PCE&hellip;) are skipped entirely.</div></div>
+  <section class="eqwrap">
+    <div class="eqhead"><h2>How your account is traded</h2><p>The exact rules the engine runs. Validated on 18 years of 1-minute NQ data with realistic fills.</p></div>
+    <div class="steps" style="margin-top:14px">
+      <div class="step"><span class="sn">1</span><div><b>One market, one decision.</b> At 10:30 ET the engine checks the move from the 9:30 open. It trades that direction only when it agrees with the 20-day trend. On the other days it sits out and risks nothing.</div></div>
+      <div class="step"><span class="sn">2</span><div><b>Risk-sized hard stop.</b> The stop is 0.2&times; the average daily range. Contracts are sized so a stop-out costs about your risk per trade. The stop rests at the exchange the moment the entry fills.</div></div>
+      <div class="step"><span class="sn">3</span><div><b>Evaluation take-profit.</b> In an evaluation the trade closes at whichever comes first: the dollars still needed to pass, or the daily cap that keeps you inside the 50% consistency rule. Funded accounts hold to the close.</div></div>
+      <div class="step"><span class="sn">4</span><div><b>Flat by 15:59 ET, never overnight.</b> News days are traded: CPI, jobs and PPI days have tested better than average.</div></div>
     </div>
     <ul class="truths">
-      <li><b>It&rsquo;s a numbers game, not a money printer.</b> A real but thin edge (profit factor ~1.1, ~35% win rate &mdash; winners run, losers are capped). It pays off played in volume with discipline, not on one lucky account.</li>
-      <li><b>Income is modest per account</b> &mdash; expect roughly ~$70&ndash;150/month on a funded 50K. Bigger income comes from running more accounts, not a bigger per-account dream.</li>
-      <li><b>Spread your accounts out &mdash; don&rsquo;t run them in lockstep.</b> Accounts firing the same signal on the same day all win, and all blow, together. Distributing across days, sizes and firms is what makes several accounts behave like several real shots.</li>
-      <li><b>No guarantees.</b> Some evaluations fail and some funded accounts blow &mdash; that is normal and planned for. The edge works over time and across accounts, not on any single one.</li>
+      <li><b>A real but thin edge.</b> Profit factor about 1.28 with a 36% win rate. A few strong trend days pay for many small losses.</li>
+      <li><b>Flat stretches happen.</b> From mid-2025 to today results have been close to breakeven, and the current-market figures above reflect that.</li>
+      <li><b>Stagger accounts.</b> Accounts that start on the same day take the same trades and win or lose together. Start them a week or more apart.</li>
+      <li><b>No guarantees.</b> Some evaluations fail and some funded accounts blow. The edge shows up across many accounts and months, not on any single one.</li>
     </ul>
   </section>
 </div>
 <script>
-const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, EQ=__EQUITY__;
-const EVAL={"25K":{cons:[4,47,55],norm:[6,37,21],aggr:[10,37,7]},"50K":{cons:[8,44,66],norm:[12,33,27],aggr:[20,32,9]},"100K":{cons:[12,36,96],norm:[18,28,44],aggr:[30,26,14]},"150K":{cons:[20,38,82],norm:[30,28,36],aggr:[50,27,12]}};
-const FUNDED={"25K":{cons:2,norm:4,aggr:6},"50K":{cons:4,norm:8,aggr:12},"100K":{cons:6,norm:12,aggr:18},"150K":{cons:10,norm:20,aggr:30}};
-const CAP={"25K":1000,"50K":2000,"100K":2500,"150K":3000},TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
-const DD_PER_MICRO=720,RISKFRAC={cons:.5,norm:.75,aggr:1},NQ_M=483,RTY_M=273;
-const $=s=>document.querySelector(s),money=n=>"$"+Math.round(n).toLocaleString("en-US"),fmt=n=>n.toLocaleString("en-US");
-const rnd=x=>Math.floor(x+0.5);
-let state=null;
+const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__;
+const SIZES=["25K","50K","100K","150K"],DDN={eod:"End-of-day trailing",intraday:"Intraday trailing",static:"Static"};
+const TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
+const EVALMAX={"25K":20,"50K":40,"100K":60,"150K":100},FUNDMAX={"25K":10,"50K":20,"100K":30,"150K":40},CASHF={cons:.25,norm:.35,aggr:.5};
+const $=s=>document.querySelector(s),money=n=>(n<0?"-":"")+"$"+Math.abs(Math.round(n)).toLocaleString("en-US");
+let state=null,CTX={ready:false},lastErr="";
 
-function splitMicros(t,asset){if(asset==="nq")return[t,0];if(asset==="rty")return[0,t];const q=rnd(t/2);return[q,t-q];}
-function assetAdj(p,asset){return p;}
-function totalMicros(){
-  if(state.mode==="funded")return FUNDED[state.acct_size][state.preset];
-  if(state.mode==="cash"){const mx=Math.max(0,Math.floor((state.bal*state.dd/100)/DD_PER_MICRO));
-    return mx===0?0:Math.max(state.asset==="both"?2:1,rnd(mx*RISKFRAC[state.preset]));}
-  return EVAL[state.acct_size][state.preset][0];
+function riskUsd(){
+  if(state.mode==="eval")return DATA.presets[state.acct_size][state.dd_type][state.preset].risk;
+  if(state.mode==="funded")return DATA.funded[state.acct_size][state.dd_type].risk;
+  return Math.round(state.cash_bal*state.cash_dd/100*CASHF[state.preset]);
 }
-
-function seg(id,opts,val){return `<div class="seg${opts.length===4?' four':''}" data-seg="${id}">`+
-  opts.map(o=>`<button data-v="${o.v}" aria-pressed="${o.v===val}">${o.t}</button>`).join("")+`</div>`;}
+function stopPts(){return CTX.ready&&CTX.stop_pts?CTX.stop_pts:null;}
+function micros(){const sp=stopPts()||60,per=sp*2,r=riskUsd(),cap=state.mode==="eval"?EVALMAX[state.acct_size]:state.mode==="funded"?FUNDMAX[state.acct_size]:40;
+  let q=Math.floor(r/per);if(q===0&&per<=1.5*r)q=1;return Math.max(0,Math.min(q,cap));}
+function seg(id,opts,val){return `<div class="seg${opts.length===4?' four':''}" data-seg="${id}" role="group">`+
+  opts.map(o=>`<button type="button" data-v="${o.v}" aria-pressed="${o.v===val}">${o.t}</button>`).join("")+`</div>`;}
 
 function configCard(){
   const cash=state.mode==="cash";
-  return `<div class="card"><div class="hd"><h2>Configure</h2><p>Sizing &amp; risk compute live from the validated results.</p></div>
+  return `<div class="card"><div class="hd"><h2>Configure</h2><p>Every number on this page comes from the validated backtest for these exact settings.</p></div>
    <div class="bd">
-    <div class="field"><label>Mode</label>${seg("mode",[{v:"eval",t:"Prop evaluation"},{v:"funded",t:"Funded"},{v:"cash",t:"Live cash"}],state.mode)}</div>
-    ${cash?"":`<div class="field"><label>Account size</label>${seg("acct_size",[{v:"25K",t:"$25K"},{v:"50K",t:"$50K"},{v:"100K",t:"$100K"},{v:"150K",t:"$150K"}],state.acct_size)}</div>`}
-    ${cash?`<div class="field"><label>Live account &amp; drawdown</label><div class="cashrow">
-        <div class="f"><div class="inl"><span>$</span><input id="balIn" value="${fmt(state.bal)}"></div></div>
-        <div class="f"><div class="rv"><span>Max drawdown</span><b id="ddOut">${state.dd}%</b></div>
-          <input id="ddIn" type="range" min="5" max="35" value="${state.dd}"></div></div>
-        <div class="pn">KhomaAPI keeps risk inside <b>${money(state.bal*state.dd/100)}</b> of drawdown.</div></div>`:""}
-    <div class="field"><label>Markets</label>${seg("asset",[{v:"nq",t:"NQ only"}],state.asset)}</div>
-    <div class="field"><label>Risk preset</label>${seg("preset",[{v:"cons",t:"Conservative"},{v:"norm",t:"Normal"},{v:"aggr",t:"Aggressive"}],state.preset)}
-      <div class="pn" id="presetNote"></div></div>
+    <div class="field"><label>Mode</label>${seg("mode",[{v:"eval",t:"Evaluation"},{v:"funded",t:"Funded"},{v:"cash",t:"Live cash"}],state.mode)}</div>
+    ${cash?`<div class="field"><label>Account balance &amp; max drawdown</label><div class="cashrow">
+        <div class="f"><div class="inl"><span>$</span><input id="balIn" inputmode="numeric" aria-label="Account balance" value="${Math.round(state.cash_bal).toLocaleString("en-US")}"></div></div>
+        <div class="f"><div class="rv"><span>Max drawdown</span><b id="ddOut">${state.cash_dd}%</b></div>
+          <input id="ddIn" type="range" min="5" max="35" value="${state.cash_dd}" aria-label="Max drawdown percent"></div></div></div>`:
+      `<div class="field"><label>Account size</label>${seg("acct_size",SIZES.map(s=>({v:s,t:"$"+s})),state.acct_size)}</div>
+       <div class="field"><label>Drawdown type</label>${seg("dd_type",[{v:"eod",t:"End-of-day trailing"},{v:"intraday",t:"Intraday trailing"},{v:"static",t:"Static"}],state.dd_type)}
+        <div class="pn">${state.dd_type==="eod"?"LucidFlex and most EOD plans: the floor trails your end-of-day balance and locks at start + $100.":state.dd_type==="intraday"?"The floor trails your highest open profit during the day. Harder: size is reduced to match.":"The floor never moves. Easiest drawdown: size is increased to match."}</div></div>`}
+    ${state.mode==="funded"?`<div class="field"><label>Risk</label><div class="pn" style="margin-top:0">Funded mode uses one validated setting: about 12% of the max loss per trade, held to the close. Request $1,000 payouts once profit passes ${money(MLL[state.acct_size]+300)}; skip the early $500 minimum.</div></div>`:
+      `<div class="field"><label>Risk preset</label>${seg("preset",[{v:"cons",t:"Conservative"},{v:"norm",t:"Normal"},{v:"aggr",t:"Aggressive"}],state.preset)}
+      <div class="pn">${{cons:"Best odds. Passes in about 3–5 weeks.",norm:"Balanced. Passes in about 2–3 weeks.",aggr:"Fastest, about 2 weeks, but fails more often."}[state.preset]}</div></div>`}
    </div></div>`;
 }
 
 function projCard(){
-  const total=totalMicros(),[nq,rty]=splitMicros(total,state.asset);
+  const r=riskUsd(),q=micros(),sp=stopPts();
   let hero,cap,meter=null,tiles=[];
-  if(state.mode==="eval"){const[m,pass,days]=EVAL[state.acct_size][state.preset],p=assetAdj(pass,state.asset);
-    hero=p+"%";cap="<b>chance to pass</b> the "+state.acct_size+" evaluation before the trailing limit";meter=p;
-    tiles=[["Time to pass","~"+days+" days","median, when it passes"],["Profit target",money(TARGET[state.acct_size]),"trailing max loss "+money(MLL[state.acct_size])]];
-  }else if(state.mode==="funded"){const gross=nq*NQ_M+rty*RTY_M,inc=Math.min(gross,CAP[state.acct_size]);
-    hero=money(inc);cap="<b>monthly withdrawable</b> — capped by the "+state.acct_size+" payout, not the strategy";
-    tiles=[["Payout cap / mo",money(CAP[state.acct_size]),"per account"],["Strategy output",money(gross)+"/mo",gross>CAP[state.acct_size]?"exceeds cap — steady":"building"]];
-  }else{const gross=nq*NQ_M+rty*RTY_M,budget=state.bal*state.dd/100;
-    hero=money(gross)+"/mo";cap="<b>estimated monthly</b> at this size, before variance";
-    tiles=[["Drawdown budget",money(budget),state.dd+"% of "+money(state.bal)],["Per-trade risk","~"+money(nq*60+rty*40),"stop distance × $/pt"]];}
-  const legs=`<div class="sz"><div class="t">Contracts the engine will trade</div><div class="legs">
-     <div class="leg"><div class="m"><span class="tk">MNQ</span> Micro Nasdaq</div><div class="n">${nq}<small> micro</small></div></div></div></div>`;
-  return `<div class="card proj"><div class="hd"><h2>Projection</h2><p>Honest, from the 2019–2026 validation.</p></div>
+  if(state.mode==="eval"){const p=DATA.presets[state.acct_size][state.dd_type][state.preset];
+    hero=p.pass_+"%";cap=`<b>chance to pass</b> the ${state.acct_size} evaluation (${DDN[state.dd_type].toLowerCase()})`;meter=p.pass_;
+    tiles=[["Time to pass",p.days.toFixed(0)+" trading days","median; 3 in 4 within "+p.p75.toFixed(0)],
+           ["Pass rate 2024–26",p.pass2426+"%","held-out recent years",""],
+           ["Current market",p.pass_now+"%","starts since Jul 2025","warn"],
+           ["Profit target",money(TARGET[state.acct_size]),"max loss "+money(MLL[state.acct_size])]];
+  }else if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
+    hero=f.p1+"%";cap="<b>reach at least one payout</b> within a year of being funded";meter=f.p1;
+    tiles=[["First payout",(f.first||0).toFixed(0)+" trading days","median, when paid"],
+           ["Blown before payout",f.bb+"%","within the first year"],
+           ["Year-1 payouts",money(f.cash),"average, after the 90/10 split"],
+           ["Current market",f.p1_now+"%","reach a payout since Oct 2025","warn"]];
+  }else{const eq=DATA.equity;
+    hero=money(r);cap="<b>risked per trade</b>: a stop-out costs about this much";
+    tiles=[["Drawdown budget",money(state.cash_bal*state.cash_dd/100),state.cash_dd+"% of "+money(state.cash_bal)],
+           ["10-year result",money(eq.totalR*r),"at this risk per trade"],
+           ["Worst drawdown",money(eq.maxddR*r),"10-year history"],
+           ["Profit factor",eq.pf,"win rate "+eq.win+"%"]];}
+  return `<div class="card"><div class="hd"><h2>${state.mode==="eval"?"Evaluation odds":state.mode==="funded"?"Funded outcome":"Live cash sizing"}</h2><p>Real 1-minute NQ data with Lucid commissions and slippage.</p></div>
    <div class="bd"><div class="hero"><div class="big">${hero}</div><div class="cap">${cap}</div></div>
    ${meter!=null?`<div class="meter"><i style="width:${meter}%"></i></div>`:""}
-   ${legs}
-   <div class="tiles">${tiles.map(t=>`<div class="t"><div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="k" style="text-transform:none;color:var(--mu);font-weight:600;margin-top:2px">${t[2]}</div></div>`).join("")}</div>
+   <div class="sz"><div class="t">What the engine will trade</div><div class="row">
+     <div class="leg"><div class="m">Risk per trade</div><div class="n">${money(r)}</div></div>
+     <div class="leg"><div class="m">MNQ contracts ${sp?"today":"(typical day)"}</div><div class="n">${q}<small> micro</small></div></div>
+     <div class="leg"><div class="m">Stop distance</div><div class="n">${sp?sp.toFixed(0):"~60"}<small> pts</small></div></div></div></div>
+   <div class="tiles">${tiles.map(t=>`<div class="t ${t[3]||""}"><div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="s">${t[2]}</div></div>`).join("")}</div>
    </div></div>`;
 }
 
+function todayLine(){
+  if(!CTX.ready)return "Today's market context (20-day trend and volatility) loads from the data feed before 10:30 ET.";
+  const dir=CTX.trend>0?"up":"down",side=CTX.trend>0?"long":"short",cmp=CTX.trend>0?"above":"below";
+  return `<b>Today:</b> the 20-day trend is <b>${dir}</b>. At 10:30 ET the engine takes a <b>${side}</b> only if NQ is ${cmp} its 9:30 open; otherwise it sits out. Stop ≈ <b>${CTX.stop_pts} pts</b>.`;
+}
 function runCard(){
   const on=state.enabled;
   return `<div class="run"><div class="runrow">
-     <button class="startbtn ${on?'on':''}" id="startBtn">${on?'Stop automation':'Start automation'}</button>
-     <div class="rstat ${on?'live':''}" id="rstat"><span class="dot"></span>${on?'<b>Scanning</b> — watching NQ for the opening-range breakout. Trades place automatically when your rules trigger.':'Idle. Press Start and the engine begins scanning at the 9:30 ET open and executes by the rules.'}</div>
-   </div><div class="acts" id="acts" hidden></div></div>
-   <div class="note"><div><b>Demo first.</b> Arm a demo account to watch real order placement with simulated money before any real capital. The strategy logic runs server-side inside KhomaAPI and never leaves it. What you see under “Contracts” is exactly what gets sent to Tradovate.</div></div>`;
+     <button type="button" class="startbtn ${on?'on':''}" id="startBtn">${on?'Stop automation':'Start automation'}</button>
+     <div class="rstat ${on?'live':''}"><span class="dot"></span>${on?'<b>Armed</b>: the engine will trade this account at 10:30 ET on qualifying days and flatten by 15:59 ET.':'Not armed. Press Start and the engine trades this account by the rules above from the next 10:30 ET decision.'}</div>
+   </div><div class="today" id="today">${todayLine()}</div>${lastErr?`<div class="err">${lastErr}</div>`:""}<div class="acts" id="acts" hidden></div></div>
+   <div class="note"><div><b>Start on a demo or a single evaluation first.</b> The strategy runs server-side inside KhomaAPI and never leaves it. Copy Trading boxes use this account's settings for every account in the box.</div></div>`;
 }
-
-const NOTES={cons:"Highest odds per account, but slow — each account grinds for months.",norm:"Balanced — about 1 in 3 per account; plan on ~3 accounts to funded.",aggr:"Fastest to a pass, but blows more often — expect more resets."};
 
 function render(){
   if(!ACCOUNTS.length){$("#apickWrap").style.display="none";
-    $("#app").innerHTML='<div class="empty">No connected Tradovate account yet. Connect one under <a href="/broker">Broker</a> — start with your <b>demo</b> account, then come back here.</div>';return;}
+    $("#app").innerHTML='<div class="empty">No connected Tradovate account yet. Connect one under <a href="/broker">Broker</a>, then come back here.</div>';renderEquity();return;}
   $("#app").innerHTML=`<div class="grid">${configCard()}${projCard()}</div>${runCard()}`;
   const acc=ACCOUNTS.find(a=>a.id===state.acct);
   $("#envBadge").textContent=(acc.env||"live").toUpperCase();
-  $("#envBadge").style.color=acc.env==="demo"?"#0f8f45":"#dc2626";
-  $("#envBadge").style.borderColor=acc.env==="demo"?"#0f8f45":"#dc2626";
-  const pn=$("#presetNote");if(pn)pn.textContent=NOTES[state.preset];
-  document.querySelectorAll("[data-seg]").forEach(sg=>{
-    sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{state[sg.dataset.seg]=b.dataset.v;render();});});
-  const bi=$("#balIn");if(bi)bi.oninput=e=>{state.bal=+e.target.value.replace(/[^0-9]/g,"")||0;e.target.value=state.bal?fmt(state.bal):"";render();};
-  const di=$("#ddIn");if(di)di.oninput=e=>{state.dd=+e.target.value;render();};
+  $("#envBadge").style.color=acc.env==="demo"?"#0f8f45":"#dc2626";$("#envBadge").style.borderColor=acc.env==="demo"?"#0f8f45":"#dc2626";
+  document.querySelectorAll("[data-seg]").forEach(sg=>sg.querySelectorAll("button").forEach(b=>b.onclick=()=>{state[sg.dataset.seg]=b.dataset.v;lastErr="";render();}));
+  const bi=$("#balIn");if(bi)bi.onchange=e=>{state.cash_bal=Math.max(1000,+e.target.value.replace(/[^0-9]/g,"")||25000);render();};
+  const di=$("#ddIn");if(di)di.oninput=e=>{state.cash_dd=+e.target.value;$("#ddOut").textContent=state.cash_dd+"%";};
+  if(di)di.onchange=()=>render();
   $("#startBtn").onclick=toggleRun;
+  renderEquity();
 }
 
 async function save(enabled){
-  const b=new URLSearchParams({account_id:state.acct,enabled:enabled?"1":"0",mode:state.mode,
-    acct_size:state.acct_size,preset:state.preset,asset:state.asset});
-  const r=await fetch("/prop-engine/save",{method:"POST",body:b});return r.ok?r.json():null;
+  const b=new URLSearchParams({account_id:state.acct,enabled:enabled?"1":"0",mode:state.mode,acct_size:state.acct_size,
+    preset:state.preset,asset:"nq",dd_type:state.dd_type,cash_bal:String(Math.round(state.cash_bal)),cash_dd:String(state.cash_dd)});
+  try{const r=await fetch("/prop-engine/save",{method:"POST",body:b});const j=await r.json().catch(()=>null);return j||{ok:false,error:"HTTP "+r.status};}
+  catch(e){return {ok:false,error:"network error"};}
 }
 async function toggleRun(){
-  const btn=$("#startBtn");btn.disabled=true;
-  const want=!state.enabled;const j=await save(want);btn.disabled=false;
-  if(j&&j.ok){state.enabled=want;CONFIGS[state.acct]=Object.assign(CONFIGS[state.acct]||{},{enabled:want,mode:state.mode,acct_size:state.acct_size,preset:state.preset,asset:state.asset});render();}
-  else alert("Could not update automation. Check the account is connected.");
+  const btn=$("#startBtn");btn.disabled=true;btn.textContent=state.enabled?"Stopping…":"Starting…";
+  const want=!state.enabled;const j=await save(want);
+  if(j&&j.ok){state.enabled=want;lastErr="";CONFIGS[state.acct]=Object.assign(CONFIGS[state.acct]||{},{enabled:want,mode:state.mode,acct_size:state.acct_size,preset:state.preset,dd_type:state.dd_type,cash_bal:state.cash_bal,cash_dd:state.cash_dd});}
+  else lastErr="Could not update automation: "+((j&&j.error)||"unknown error")+". Check the account is still connected under Broker.";
+  render();
 }
-
 function loadAcct(id){
-  state=Object.assign({acct:id,mode:"eval",acct_size:"50K",preset:"norm",asset:"nq",bal:25000,dd:15,enabled:false},CONFIGS[id]||{});state.asset="nq";
-  state.acct=id;render();
+  const c=CONFIGS[id]||{};
+  state={acct:id,mode:c.mode||"eval",acct_size:c.acct_size||"50K",preset:c.preset||"norm",dd_type:c.dd_type||"eod",
+    cash_bal:+c.cash_bal||25000,cash_dd:+c.cash_dd||15,enabled:!!c.enabled};
+  render();
 }
-
 function poll(){
   fetch("/prop-engine/status").then(r=>r.json()).then(s=>{
+    const before=JSON.stringify(CTX);CTX=s.context||CTX;
+    if(JSON.stringify(CTX)!==before&&state){render();return;}
     const acts=$("#acts");if(!acts)return;
-    const list=(s.engine&&s.engine.actions||[]).filter(a=>a.action&&a.action!=="tick");
-    if(state.enabled&&list.length){acts.hidden=false;
-      acts.innerHTML="<div class='k' style='color:var(--fa)'>Recent engine activity</div>"+list.slice(-6).reverse().map(a=>`<div class="row"><b>${a.root||a.account_id||''}</b> ${a.action}${a.side?' '+a.side:''}${a.qty?' ×'+a.qty:''}</div>`).join("");}
+    const list=((s.engine&&s.engine.actions)||[]).filter(a=>a.action&&a.action!=="tick");
+    if(state&&state.enabled&&list.length){acts.hidden=false;
+      acts.innerHTML="<div style='color:var(--fa);font-weight:800'>Recent engine activity</div>"+list.slice(-6).reverse().map(a=>`<div class="row"><b>${a.root||""}</b> ${a.action}${a.side?" "+a.side:""}${a.qty?" ×"+a.qty:""}${a.reason?" ("+a.reason+")":""}</div>`).join("");}
     else acts.hidden=true;
   }).catch(()=>{});
 }
-
+function renderEquity(){
+  const eq=DATA.equity,r=state?riskUsd():500,c=eq.cumR.map(x=>x*r),W=780,H=210,L=52,R=12,T=14,B=22,n=c.length;
+  const mx=Math.max(...c,0),mn=Math.min(...c,0),x=i=>L+i/(n-1)*(W-L-R),y=v=>T+(1-(v-mn)/((mx-mn)||1))*(H-T-B);
+  let ln="M"+x(0).toFixed(1)+" "+y(c[0]).toFixed(1);c.forEach((v,i)=>{if(i)ln+=" L"+x(i).toFixed(1)+" "+y(v).toFixed(1);});
+  const ar=ln+" L"+x(n-1).toFixed(1)+" "+y(0).toFixed(1)+" L"+x(0).toFixed(1)+" "+y(0).toFixed(1)+" Z";
+  const yt=eq.months.map((m,i)=>[i,m]).filter(([i,m])=>m.endsWith("-01")).map(([i,m])=>`<text x="${x(i).toFixed(1)}" y="${H-6}" text-anchor="middle" font-size="10" font-weight="700" fill="#9ca3af">${m.slice(0,4)}</text>`).join("");
+  const grid=`<line x1="${L}" x2="${W-R}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="#e5e7eb"/><text x="${L-6}" y="${(y(0)+3).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">$0</text><text x="${L-6}" y="${(y(mx)+9).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">${money(mx/1000)}k</text>`;
+  const tiles=[["Net, 10 years",money(eq.totalR*r)],["Profit factor",eq.pf],["Win rate",eq.win+"%"],["Worst drawdown",money(eq.maxddR*r)],["Trades",eq.n.toLocaleString("en-US")],["Risk per trade",money(r)]];
+  const yrs=Object.entries(eq.years).map(([y2,v])=>`<div class="yr"><div class="y">${y2}${y2==="2026"?" YTD":""}</div><div class="r ${v.r>=0?"pos":"neg"}">${money(v.r*r)}</div></div>`).join("");
+  $("#eqSection").innerHTML=`<div class="eqhead"><h2>10-year equity curve</h2><p>Oct 2016 to Oct 2026 · real 1-minute NQ data · Lucid commissions and slippage · scaled to your risk of ${money(r)} per trade</p></div>
+    <div class="eqchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Equity curve">
+      <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16a34a" stop-opacity=".16"/><stop offset="1" stop-color="#16a34a" stop-opacity="0"/></linearGradient></defs>
+      ${grid}<path d="${ar}" fill="url(#eqg)"/><path d="${ln}" fill="none" stroke="#0f8f45" stroke-width="2.2" stroke-linejoin="round"/>
+      <circle cx="${x(n-1).toFixed(1)}" cy="${y(c[n-1]).toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yt}</svg></div>
+    <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
+    <div class="yrs">${yrs}</div>
+    <div class="eqnote">This is the raw strategy at a constant ${money(r)} risk per trade for ten years, not an account balance. A prop account stops at its target, its drawdown limit or its payout cap long before this, so use the odds above for what an account can do. Past results do not guarantee future results; 2026 so far is close to breakeven.</div>`;
+}
 const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});
-sel.onchange=()=>loadAcct(sel.value);
-// ---- validated equity curves (NQ / RTY / Portfolio), from the 2019-2026 backtest ----
-let eqTab="NQ";
-function eqPath(cum,W,H,L,R,T,B){
-  const n=cum.length,mx=Math.max(...cum),mn=Math.min(...cum,0);
-  const x=i=>L+i/(n-1)*(W-L-R),y=v=>T+(1-(v-mn)/(mx-mn||1))*(H-T-B);
-  let ln="M"+x(0).toFixed(1)+" "+y(cum[0]).toFixed(1);
-  cum.forEach((v,i)=>{if(i)ln+=" L"+x(i).toFixed(1)+" "+y(v).toFixed(1);});
-  const ar=ln+" L"+x(n-1).toFixed(1)+" "+(H-B)+" L"+x(0).toFixed(1)+" "+(H-B)+" Z";
-  const zy=y(0),g=`<line x1="${L}" y1="${zy.toFixed(1)}" x2="${W-R}" y2="${zy.toFixed(1)}" stroke="#e5e7eb"/>`
-    +`<text x="${L-6}" y="${(y(mx)+9).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">$${(mx/1000).toFixed(0)}k</text>`
-    +`<text x="${L-6}" y="${(zy+3).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="#9ca3af">0</text>`;
-  return {ln,ar,g,x:x(n-1),y:y(cum[n-1])};
-}
-function renderEquity(){
-  const d=EQ[eqTab],c=d.cum,s=d.stats,W=780,H=210,L=40,R=12,T=14,B=20;
-  const p=eqPath(c,W,H,L,R,T,B);
-  const yr=EQ.months.map((m,i)=>[i,m]).filter(([i,m])=>m.endsWith("-01")).map(([i,m])=>
-    `<text x="${(L+i/(c.length-1)*(W-L-R)).toFixed(1)}" y="${H-5}" text-anchor="middle" font-size="10" font-weight="700" fill="#9ca3af">${m.slice(0,4)}</text>`).join("");
-  const tabs=[["NQ","NQ only"]].map(([k,t])=>
-    `<button class="eqtab ${k===eqTab?'on':''}" data-k="${k}">${t}</button>`).join("");
-  const tiles=[["Net / micro","$"+s.net.toLocaleString()],["Profit factor",s.pf],["Win rate",s.win+"%"],
-    ["Max drawdown","$"+s.maxdd.toLocaleString()],["Return / DD",s.ret_dd+"×"],["Trades",s.n.toLocaleString()]];
-  document.getElementById("eqSection").innerHTML=`
-    <div class="eqhead"><div><h2>Validated equity curve</h2><p>Real 1-minute data, 2019–2026 · honest fills (slippage + commissions) · per micro contract</p></div>
-      <div class="eqtabs">${tabs}</div></div>
-    <div class="eqchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${eqTab} equity curve">
-      <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#16a34a" stop-opacity=".16"/><stop offset="1" stop-color="#16a34a" stop-opacity="0"/></linearGradient></defs>
-      ${p.g}<path d="${p.ar}" fill="url(#eqg)"/><path d="${p.ln}" fill="none" stroke="#0f8f45" stroke-width="2.4" stroke-linejoin="round"/>
-      <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="#0f8f45" stroke="#fff" stroke-width="2"/>${yr}</svg></div>
-    <div class="eqtiles">${tiles.map(t=>`<div class="eqt"><div class="k">${t[0]}</div><div class="v">${t[1]}</div></div>`).join("")}</div>
-    <div class="eqnote">NQ only — PF ${EQ.NQ.stats.pf}, ${EQ.NQ.stats.ret_dd}× return-to-drawdown, net of realistic fills (slippage + commissions). This is the exact engine that trades your account. We retired RTY: it carried no reliable edge.</div>`;
-  document.querySelectorAll(".eqtab").forEach(b=>b.onclick=()=>{eqTab=b.dataset.k;renderEquity();});
-}
-renderEquity();
-
-if(ACCOUNTS.length){loadAcct(ACCOUNTS[0].id);setInterval(poll,4000);poll();}else render();
+sel.onchange=()=>{lastErr="";loadAcct(sel.value);};
+if(ACCOUNTS.length){loadAcct(ACCOUNTS[0].id);setInterval(poll,5000);poll();}else render();
 </script>
 """

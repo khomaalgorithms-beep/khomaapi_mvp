@@ -5,35 +5,33 @@ import app.orb_engine as eng
 from app.orb_live import AccountConfig
 
 
-def test_qty_matches_prop_engine():
-    # 50K Normal, both -> 12 total micros -> 6 MNQ + 6 M2K (the chosen first-run config)
-    assert eng.qty_for("eval", "50K", "norm", "both") == {"MNQ": 6, "M2K": 6}
-    assert eng.qty_for("eval", "25K", "norm", "both") == {"MNQ": 3, "M2K": 3}
-    assert eng.qty_for("eval", "50K", "norm", "nq") == {"MNQ": 12}
-    assert eng.qty_for("funded", "50K", "aggr", "rty") == {"M2K": 12}
+def test_qty_estimate_uses_validated_risk_and_todays_stop():
+    # 50K Normal EOD risks the validated $ per trade; at ATR 300 the stop is 60 pts = $120 per MNQ
+    risk = eng.risk_plan("eval", "50K", "norm", "eod")["risk_usd"]
+    assert eng.qty_for("eval", "50K", "norm", "both", atr=300.0) == {"MNQ": int(risk // 120)}
+    assert set(eng.qty_for("funded", "50K", "aggr", "rty", atr=300.0)) == {"MNQ"}     # RTY retired
 
 
 def test_build_account_config_resolves_contracts_and_sizes(monkeypatch):
-    monkeypatch.setattr(eng.tvo, "resolve_contract",
-                        lambda env, tok, sym: {"MNQ": "MNQZ5", "M2K": "M2KZ5"}[sym])
+    monkeypatch.setattr(eng.tvo, "resolve_contract", lambda env, tok, sym: {"MNQ": "MNQZ5"}[sym])
     monkeypatch.delenv("ORB_OBSERVE", raising=False)
     row = {"env": "demo", "account_name": "DEMO856420", "account_id": "856420",
            "mode": "eval", "acct_size": "50K", "preset": "norm", "asset": "both"}
     cfg = eng.build_account_config(row, token="t")
     assert isinstance(cfg, AccountConfig)
     assert cfg.env == "demo" and cfg.account_id == 856420
-    assert cfg.instruments == {"MNQ": "MNQZ5", "M2K": "M2KZ5"}
-    assert cfg.qty == {"MNQ": 6, "M2K": 6}
-    assert cfg.observe == {"MNQ": False, "M2K": False}       # both live (RTY validated)
+    assert cfg.instruments == {"MNQ": "MNQZ5"}                 # NQ only (RTY retired)
+    assert cfg.risk_usd == eng.risk_plan("eval", "50K", "norm", "eod")["risk_usd"]
+    assert cfg.observe == {"MNQ": False}
 
 
 def test_observe_env_forces_observe(monkeypatch):
     monkeypatch.setattr(eng.tvo, "resolve_contract", lambda e, t, s: s + "Z5")
-    monkeypatch.setenv("ORB_OBSERVE", "M2K")
+    monkeypatch.setenv("ORB_OBSERVE", "MNQ")
     row = {"env": "demo", "account_name": "D", "account_id": "1", "mode": "eval",
            "acct_size": "50K", "preset": "norm", "asset": "both"}
     cfg = eng.build_account_config(row, token="t")
-    assert cfg.observe == {"MNQ": False, "M2K": True}        # RTY observe-only via env
+    assert cfg.observe == {"MNQ": True}                        # observe-only via env
 
 
 def test_build_returns_none_on_unresolvable_contract(monkeypatch):
@@ -46,11 +44,12 @@ def test_build_returns_none_on_unresolvable_contract(monkeypatch):
 
 
 def test_config_signature_changes_on_setting_change():
-    row = {"env": "demo", "mode": "eval", "acct_size": "50K", "preset": "norm", "asset": "both"}
+    row = {"env": "demo", "mode": "eval", "acct_size": "50K", "preset": "norm", "asset": "both", "dd_type": "eod"}
     s1 = eng.config_signature(row, {"MNQ": "MNQZ5"}, {"MNQ": 6})
-    s2 = eng.config_signature(row, {"MNQ": "MNQZ5"}, {"MNQ": 8})   # size changed
-    s3 = eng.config_signature(row, {"MNQ": "MNQZ5"}, {"MNQ": 6})
-    assert s1 != s2 and s1 == s3
+    s2 = eng.config_signature(dict(row, preset="aggr"), {"MNQ": "MNQZ5"}, {"MNQ": 6})
+    s3 = eng.config_signature(dict(row, dd_type="intraday"), {"MNQ": "MNQZ5"}, {"MNQ": 6})
+    s4 = eng.config_signature(row, {"MNQ": "MNQZ5"}, {"MNQ": 9})      # daily qty estimate alone: no rebuild
+    assert s1 != s2 and s1 != s3 and s1 == s4
 
 
 # ---- EngineManager lifecycle: ONE shared feed dispatched to all accounts ----

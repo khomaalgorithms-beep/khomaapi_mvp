@@ -136,11 +136,11 @@ class FakeBroker:
 def cfg_for(qty_mnq=3, flatten_min=955):
     return AccountConfig(env="demo", account_spec="DEMO1", account_id=42,
                          account_name="DEMO1", instruments={"MNQ": "MNQZ5"},
-                         qty={"MNQ": qty_mnq}, flatten_min=flatten_min)
+                         qty={"MNQ": qty_mnq}, flatten_min=flatten_min, strategy="selective")
 
 
 def mk(hh, mm, o, h, l, c, v=100):
-    return Bar(datetime(2026, 1, 2, hh, mm), o, h, l, c, v)
+    return Bar(datetime(2026, 1, 6, hh, mm), o, h, l, c, v)
 
 
 def breakout_day():
@@ -241,7 +241,7 @@ def test_poll_detects_fill_then_close():
 
 def test_poll_eod_flattens_open_position():
     fb = FakeBroker()
-    clock = [datetime(2026, 1, 2, 15, 56)]         # past 15:55 flatten
+    clock = [datetime(2026, 1, 6, 15, 56)]         # past 15:55 flatten
     ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb, now_et=lambda: clock[0])
     feed(ap, breakout_day())
     fb.positions = [{"accountId": 42, "netPos": 3, "netPrice": 20025, "contractId": 901}]
@@ -269,9 +269,9 @@ def test_day_rollover_rolls_atr_and_resets():
     feed(ap, breakout_day())                       # day 2026-01-02, range 80 pts (19950..20030)
     assert ap.atr["MNQ"].value() is None           # today never counts
     # a bar on the NEXT day rolls 2026-01-02's true range into the ATR and resets state
-    ap.on_bar("MNQ", Bar(datetime(2026, 1, 3, 9, 30), 20000, 20000, 20000, 20000, 1))
+    ap.on_bar("MNQ", Bar(datetime(2026, 1, 7, 9, 30), 20000, 20000, 20000, 20000, 1))
     assert ap.atr["MNQ"].value() == 80.0
-    assert ap._state["MNQ"].trading_date == "2026-01-03" and ap._state["MNQ"].status == "IDLE"
+    assert ap._state["MNQ"].trading_date == "2026-01-07" and ap._state["MNQ"].status == "IDLE"
 
 
 # ---- restart-proof opening-range backfill ----

@@ -119,6 +119,68 @@ def fetch_daily_ranges(api_key: str, exec_root: str, now=None, days: int = 25) -
     return ranges
 
 
+def rth_range_of(bars: List[Bar], day: str) -> Optional[float]:
+    """High-low of one session's regular hours (09:30-15:59 ET bars of that date), or None."""
+    win = [b for b in bars if b.dt.strftime("%Y-%m-%d") == day and 570 <= b.dt.hour * 60 + b.dt.minute < 960]
+    if len(win) < 200:                    # a partial / holiday session is not a valid ATR sample
+        return None
+    return round(max(b.h for b in win) - min(b.l for b in win), 2)
+
+
+def fetch_daily_context(api_key: str, exec_root: str, now=None, atr_days: int = 14, trend_days: int = 20):
+    """Prior sessions' inputs for the validated momentum rule, from Massive REST:
+    (rth_ranges oldest-first [last atr_days RTH high-low], closes oldest-first [last trend_days session closes]).
+    Uses ONE contract (the current front month) so there is no roll gap inside the window. Never raises;
+    returns ([], []) on failure (the engine then sits the day out — fail-closed)."""
+    import requests
+    now = now or datetime.now(_ET)
+    today = now.strftime("%Y-%m-%d")
+    ticker = front_ticker(_DATA_ROOT.get(exec_root, exec_root), now.date())
+    closes: List[float] = []
+    try:
+        start = (now.date() - timedelta(days=trend_days * 2 + 12)).isoformat()
+        r = requests.get(f"{REST_BASE}/futures/v1/aggs/{ticker}",
+                         params={"resolution": "1day", "window_start.gte": start, "limit": 120, "apiKey": api_key}, timeout=20)
+        for a in sorted((r.json() or {}).get("results") or [], key=lambda x: x.get("window_start", 0)):
+            if str(a.get("session_end_date", "")) >= today:
+                continue
+            try:
+                closes.append(float(a["close"]))
+            except (KeyError, TypeError):
+                pass
+    except Exception as e:
+        print("ORB MASSIVE daily-close error:", e)
+    ranges: List[float] = []
+    d = now.date()
+    probes = 0
+    while len(ranges) < atr_days and probes < atr_days * 2 + 10:
+        d -= timedelta(days=1)
+        probes += 1
+        if d.weekday() >= 5:
+            continue
+        day = d.isoformat()
+        start = datetime(d.year, d.month, d.day, 9, 30, tzinfo=_ET)
+        try:
+            r = requests.get(f"{REST_BASE}/futures/v1/aggs/{ticker}",
+                             params={"resolution": "1min", "window_start.gte": int(start.timestamp() * 1e9),
+                                     "limit": 400, "sort": "window_start.asc",   # API default is newest-first
+                                     "apiKey": api_key}, timeout=20)
+            bars = []
+            for a in (r.json() or {}).get("results") or []:
+                ws = a.get("window_start")
+                if ws is None:
+                    continue
+                dt = datetime.fromtimestamp(int(ws) / 1e9, tz=timezone.utc).astimezone(_ET)
+                bars.append(Bar(dt, float(a["open"]), float(a["high"]), float(a["low"]), float(a["close"]), 0.0))
+            rg = rth_range_of(bars, day)
+            if rg:
+                ranges.append(rg)
+        except Exception as e:
+            print("ORB MASSIVE rth-range error:", day, e)
+    ranges.reverse()
+    return ranges, closes[-trend_days:]
+
+
 def am_to_bar(msg: dict) -> Optional[Bar]:
     """Convert one Massive AM (aggregate-per-minute) message into a completed ET Bar. Uses the
     window START timestamp `s` (Unix ms) as the bar's open time, converted to America/New_York

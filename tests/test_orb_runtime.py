@@ -18,7 +18,7 @@ def test_symbol_to_root():
 def cfg(observe=None, qty=None):
     return AccountConfig(env="demo", account_spec="D1", account_id=7, account_name="D1",
                          instruments={"MNQ": "MNQZ5"}, qty=qty or {"MNQ": 3},
-                         observe=observe or {})
+                         observe=observe or {}, strategy="selective")
 
 
 def test_router_translates_symbol_and_feeds_autopilot():

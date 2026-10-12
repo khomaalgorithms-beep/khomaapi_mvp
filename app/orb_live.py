@@ -24,6 +24,7 @@ from datetime import datetime, date as _date, timedelta
 from typing import Callable, Dict, List, Optional
 
 from app.orb_selective import Bar, Signal, find_signal, daily_true_range, opening_range
+from app import orb_momentum as MOM
 
 # ---------------------------------------------------------------------------
 # Instrument specs — MICRO futures only (what the Prop Engine sizes in).
@@ -209,9 +210,17 @@ class AccountConfig:
     qty: Dict[str, int]              # {"MNQ": 3, "M2K": 3} micros per instrument
     params: Dict[str, SignalParams] = field(default_factory=lambda: dict(DEFAULT_PARAMS))
     observe: Dict[str, bool] = field(default_factory=dict)  # {"M2K": True} = log, don't trade
-    flatten_min: int = 955           # 15:55 ET force-flat
-    cutoff_min: int = 660            # 11:00 ET no new entries
+    flatten_min: int = 959           # 15:59 ET force-flat (validated rule exits at the close)
+    cutoff_min: int = 660            # (legacy selective-ORB setting; unused by the momentum rule)
     slip_cap_ticks: float = 8.0      # entry limit slippage allowance
+    # ---- validated momentum rule (orb_momentum) -------------------------------------------
+    strategy: str = "momentum"       # "momentum" (validated, live) | "selective" (legacy)
+    mode: str = "eval"               # eval | funded | cash
+    risk_usd: float = 0.0            # $ risked per trade (stop-out cost) for this account/preset
+    max_micros: int = 40             # account max size (eval: 20/40/60/100; funded: tier-0)
+    acct_start: float = 0.0          # eval/funded starting balance (for the eval pass take-profit)
+    acct_target: float = 0.0         # eval profit target
+    day_tp_usd: Optional[float] = None   # eval daily take-profit cap (48% of target); None = hold to close
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +292,10 @@ class Autopilot:
 
     def __init__(self, cfg: AccountConfig, get_token: Callable[[], Optional[str]],
                  broker=None, atr: Optional[Dict[str, DailyATR]] = None,
-                 now_et: Callable[[], datetime] = None):
+                 now_et: Callable[[], datetime] = None,
+                 get_context: Optional[Callable[[str, str], Optional["MOM.DayContext"]]] = None):
         self.cfg = cfg
+        self._get_context = get_context          # (root, date) -> DayContext (prior-session ATR + trend)
         self._get_token = get_token
         self._broker = broker
         if self._broker is None:                      # default to the real REST layer
@@ -326,6 +337,9 @@ class Autopilot:
         if st.status != _IDLE:
             return None                          # already armed / in a trade / done today
 
+        if self.cfg.strategy == "momentum":
+            return self._momentum(root, st, bar)
+
         # MNQ sits out FOMC days + the 1st trading day of each month; lock it out for the day.
         # M2K (and any non-MNQ root) is unaffected and trades normally.
         if root == "MNQ" and mnq_skip_day(st.trading_date):
@@ -341,6 +355,88 @@ class Autopilot:
         if sig is None:
             return None
         return self._place_bracket(root, st, sig, bar)
+
+    # ---- validated momentum rule ----------------------------------------------------------
+    def _context(self, root: str, date: str):
+        if self._get_context is None:
+            return None
+        try:
+            return self._get_context(root, date)
+        except Exception:
+            return None
+
+    def _momentum(self, root: str, st: _DayState, bar: Bar) -> Optional[dict]:
+        """10:30 decision: direction of 09:30 open -> 10:29 close, only with the 20-day trend."""
+        if bar.minute_of_day < MOM.DECIDE_MIN:
+            return None                                    # cheap early exit before the decision bar
+        ctx = self._context(root, st.trading_date)
+        status, res = MOM.decision(st.bars, ctx)
+        if status == "wait":
+            return None
+        if status == "skip":
+            st.status = _DONE
+            return {"root": root, "action": "skip", "reason": res, "date": st.trading_date,
+                    "trend": (ctx.trend if ctx else None), "atr": (ctx.atr if ctx else None)}
+        return self._place_momentum(root, st, res, ctx)
+
+    def eval_take_profit_usd(self, token: Optional[str]) -> Optional[float]:
+        """Eval accounts: close the day's trade at the smaller of (a) the $ still needed to reach the
+        target and (b) the daily cap that keeps the best day under the 50% consistency limit.
+        Funded / cash accounts hold to the close (None). Balance read fail-safe -> cap only."""
+        if self.cfg.mode != "eval" or not self.cfg.day_tp_usd:
+            return None
+        tp = float(self.cfg.day_tp_usd)
+        if token and self.cfg.acct_start and self.cfg.acct_target:
+            try:
+                snap = self._broker.get_cash_snapshot(self.cfg.env, token, self.cfg.account_id) or {}
+                bal = snap.get("totalCashValue")
+                if bal is None:
+                    bal = snap.get("netLiq")
+                if bal is not None:
+                    need = self.cfg.acct_start + self.cfg.acct_target - float(bal)
+                    if need > 50:
+                        tp = min(tp, need)
+            except Exception:
+                pass
+        return tp
+
+    def _place_momentum(self, root: str, st: _DayState, sig, ctx) -> dict:
+        spec = INSTRUMENTS[root]
+        qty = MOM.micros_for_risk(self.cfg.risk_usd, sig.stop_points, spec.dollars_per_point, self.cfg.max_micros)
+        info = {"root": root, "side": sig.side, "qty": qty, "stop_pts": sig.stop_points,
+                "ref": sig.ref_price, "move": sig.move, "trend": ctx.trend, "atr": round(ctx.atr, 2)}
+        if self.cfg.observe.get(root):
+            st.status = _DONE
+            return {**info, "action": "observed"}
+        if qty <= 0:
+            st.status = _DONE
+            return {**info, "action": "skip", "reason": "qty<=0"}
+        token = self._get_token()
+        if not token:
+            st.status = _DONE
+            return {**info, "action": "error", "reason": "no token"}
+        long_ = sig.side == "long"
+        sl = round_tick(sig.ref_price - sig.stop_points if long_ else sig.ref_price + sig.stop_points, spec.tick)
+        tp_usd = self.eval_take_profit_usd(token)
+        tp = None
+        if tp_usd:
+            pts = tp_usd / (qty * spec.dollars_per_point)
+            tp = round_tick(sig.ref_price + pts if long_ else sig.ref_price - pts, spec.tick)
+        resp = self._broker.place_bracket_order(
+            self.cfg.env, token, self.cfg.account_spec, self.cfg.account_id,
+            "buy" if long_ else "sell", self.cfg.instruments[root], qty, stop_price=sl, limit_price=tp)
+        oid = resp.get("orderId") if isinstance(resp, dict) else None
+        if oid is None:
+            st.status = _DONE                              # one shot per day; never chase a rejected entry
+            return {**info, "action": "reject", "resp": resp, "sl": sl, "tp": tp}
+        st.status = _ARMED
+        st.entry_order_id = oid
+        st.plan = {"sl": sl, "tp": tp, "qty": qty, "side": sig.side}
+
+        class _S:  # minimal signal record for poll()'s "filled" event
+            side = sig.side
+        st.signal = _S()
+        return {**info, "action": "placed", "order_id": oid, "sl": sl, "tp": tp, "tp_usd": tp_usd}
 
     def _place_bracket(self, root: str, st: _DayState, sig: Signal, bar: Bar) -> dict:
         spec = INSTRUMENTS[root]
@@ -402,6 +498,12 @@ class Autopilot:
         if st.status != _IDLE or st.bars:
             return {"root": root, "action": "backfill_skip", "reason": "already active"}
         st.bars.extend(sorted(bars, key=lambda b: b.dt))    # elapsed bars -> reconstruct the OR
+        if self.cfg.strategy == "momentum":
+            # restart after the 10:29 decision bar already closed -> never enter late
+            if any(b.minute_of_day >= MOM.DECIDE_MIN for b in st.bars):
+                st.status = _DONE
+                return {"root": root, "action": "backfill_missed", "bars": len(st.bars)}
+            return {"root": root, "action": "backfill_ready", "bars": len(st.bars)}
         params = self.cfg.params.get(root, DEFAULT_PARAMS.get(root))
         sig = find_signal(st.bars, self.atr[root].value(),
                           stop_points=params.stop_points, target_points=params.target_points,
