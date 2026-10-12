@@ -178,6 +178,21 @@ def ensure_table() -> None:
                 c2.close()
             except Exception:
                 pass
+    print("ORB schema:", "new columns OK" if _has_new_columns() else "new columns MISSING (save falls back to legacy columns)")
+
+
+def _has_new_columns() -> bool:
+    try:
+        con = _db()
+        con.execute("SELECT dd_type, cash_bal, cash_dd FROM orb_autopilot WHERE 1=0").fetchall()
+        con.close()
+        return True
+    except Exception:
+        try:
+            con.close()
+        except Exception:
+            pass
+        return False
 
 
 def get_config(user_id: int, account_id: str) -> Optional[dict]:
@@ -200,6 +215,20 @@ def save_config(user_id: int, account_pk: int, account_id: str, *, enabled: bool
     assert dd_type in ("eod", "intraday", "static")
     cash_bal = float(cash_bal); cash_dd = float(cash_dd)
     assert 1000 <= cash_bal <= 10_000_000 and 1 <= cash_dd <= 50
+    if not _has_new_columns():                # schema fallback: never let Start/Stop fail on a missing column
+        con = _db()
+        con.execute("""
+            INSERT INTO orb_autopilot(user_id,account_pk,account_id,enabled,mode,acct_size,preset,asset,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,account_id) DO UPDATE SET
+              account_pk=excluded.account_pk, enabled=excluded.enabled, mode=excluded.mode,
+              acct_size=excluded.acct_size, preset=excluded.preset, asset=excluded.asset,
+              updated_at=excluded.updated_at
+        """, (user_id, account_pk, str(account_id), 1 if enabled else 0, mode, acct_size, preset,
+              asset, datetime.now(timezone.utc).isoformat()))
+        con.commit()
+        con.close()
+        return
     con = _db()
     con.execute("""
         INSERT INTO orb_autopilot(user_id,account_pk,account_id,enabled,mode,acct_size,preset,asset,dd_type,cash_bal,cash_dd,updated_at)
@@ -555,7 +584,9 @@ async def engine_loop() -> None:
                 _MANAGER.sync(configs)
                 # today's prior-session context (ATR14 + 20d trend) for the 10:30 decision — fetched off-loop,
                 # once per day (retried every 10 min on failure). Without it the engine sits the day out.
-                if _MANAGER.active_ids():
+                # always prefetched from 06:00 ET (cheap, once/day) so a Start pressed just before 10:30 still
+                # trades and every dashboard can show today's plan
+                if _MANAGER.active_ids() or _now_et().hour >= 6:
                     ctx_out = await asyncio.get_event_loop().run_in_executor(None, refresh_context, ["MNQ"])
                     for c in ctx_out:
                         print("ORB context:", c)

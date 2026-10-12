@@ -257,3 +257,35 @@ def test_save_config_rejects_bad_values():
     from app import orb_engine as E
     with pytest.raises(AssertionError):
         E.save_config(1, 1, "1", enabled=True, mode="eval", acct_size="50K", preset="norm", asset="nq", dd_type="weekly")
+
+
+def test_save_config_roundtrip_sqlite(tmp_path, monkeypatch):
+    """Real DB path: ensure_table adds the new columns, save + read back dd_type/cash, and the legacy fallback
+    keeps Start working on a table without the new columns."""
+    import sqlite3
+    from app import orb_engine as E
+    dbf = tmp_path / "t.db"
+
+    def mkcon():
+        c = sqlite3.connect(dbf)
+        c.row_factory = sqlite3.Row
+        return c
+    monkeypatch.setattr(E, "_db", mkcon)
+    E.ensure_table()
+    E.save_config(1, 5, "77", enabled=True, mode="funded", acct_size="100K", preset="cons", asset="nq",
+                  dd_type="intraday", cash_bal=30000, cash_dd=12)
+    row = E.get_config(1, "77")
+    assert row["dd_type"] == "intraday" and row["mode"] == "funded" and row["enabled"] == 1
+    # legacy table (no new columns) -> fallback path still saves
+    dbf2 = tmp_path / "legacy.db"
+    c = sqlite3.connect(dbf2)
+    c.execute("""CREATE TABLE orb_autopilot(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                 account_pk INTEGER NOT NULL, account_id TEXT NOT NULL, enabled INTEGER DEFAULT 0, mode TEXT,
+                 acct_size TEXT, preset TEXT, asset TEXT, updated_at TEXT, UNIQUE(user_id, account_id))""")
+    c.commit(); c.close()
+
+    def mk2():
+        c2 = sqlite3.connect(dbf2); c2.row_factory = sqlite3.Row; return c2
+    monkeypatch.setattr(E, "_db", mk2)
+    E.save_config(1, 5, "88", enabled=True, mode="eval", acct_size="50K", preset="norm", asset="nq", dd_type="eod")
+    assert E.get_config(1, "88")["enabled"] == 1
