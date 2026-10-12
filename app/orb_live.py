@@ -504,6 +504,22 @@ class Autopilot:
         if root not in self.cfg.instruments or not bars:
             return {"root": root, "action": "backfill_skip", "reason": "no bars"}
         st = self._day(root, bars[-1])
+        if self.cfg.strategy == "momentum":
+            # MERGE history with any live bars that already arrived (a live bar can beat the backfill after a
+            # restart); dedupe by minute so the 09:30 open is always present for the 10:30 decision.
+            if st.status != _IDLE:
+                return {"root": root, "action": "backfill_skip", "reason": "already active"}
+            have = {b.dt.replace(second=0, microsecond=0, tzinfo=None) for b in st.bars}
+            for b in bars:
+                if b.dt.strftime("%Y-%m-%d") == st.trading_date and b.dt.replace(second=0, microsecond=0, tzinfo=None) not in have:
+                    st.bars.append(b)
+            st.bars.sort(key=lambda b: b.dt)
+            last_hist = max((b.minute_of_day for b in bars), default=0)
+            if last_hist >= MOM.DECIDE_MIN:          # the 10:29 decision bar already closed -> never enter late
+                st.status = _DONE
+                return {"root": root, "action": "backfill_missed", "bars": len(st.bars)}
+            return {"root": root, "action": "backfill_ready", "bars": len(st.bars),
+                    "has_open": any(MOM.OPEN_MIN <= b.minute_of_day < MOM.OPEN_MIN + 10 for b in st.bars)}
         if st.status != _IDLE or st.bars:
             return {"root": root, "action": "backfill_skip", "reason": "already active"}
         st.bars.extend(sorted(bars, key=lambda b: b.dt))    # elapsed bars -> reconstruct the OR

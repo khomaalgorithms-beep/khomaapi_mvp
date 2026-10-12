@@ -327,3 +327,15 @@ def test_risk_check_ok_trades():
     ap = Autopilot(c, get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
     run_day(ap, session(20000, 20040))
     assert len(fb.place_calls) == 1
+
+
+def test_backfill_merges_when_a_live_bar_arrived_first():
+    """Restart at 10:03: a live 10:03 bar reaches the autopilot before the REST backfill. The backfill must still
+    load the 09:30 open so the 10:30 decision can trade."""
+    fb = Broker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    ap.on_bar("MNQ", bar(10, 3, 20010, 20011, 20009, 20010))            # live bar first
+    res = ap.backfill("MNQ", session(20000, 20040, upto=(10, 2)))        # history 09:30..10:02
+    assert res["action"] == "backfill_ready" and res["has_open"] is True
+    run_day(ap, [b for b in session(20000, 20040) if b.minute_of_day >= 10 * 60 + 4])
+    assert len(fb.place_calls) == 1 and fb.place_calls[0]["action"] == "buy"
