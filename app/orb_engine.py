@@ -429,12 +429,12 @@ def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) 
 
 # ---------------------------------------------------------------------------
 # ONE-NIGHT LIVE EXECUTION TEST (2026-10-12 evening): proves the order path on the OWNER's DEMO account only.
-# The test account's clock is shifted so tonight's 18:30 ET plays the role of the 09:30 open (ORB entries from
-# 18:35, the momentum leg at 19:29), filters are relaxed so orders are actually placed, size is 1 micro, the stop
-# is 10 points (so breakeven / target paths are exercised) and everything is flattened at 19:45 ET. It switches
+# The test account's clock is shifted so tonight's 18:05 ET plays the role of the 09:30 open (ORB entries from
+# 18:10, the momentum leg at 19:04), filters are relaxed so orders are actually placed, size is 1 micro, the stop
+# is 10 points (so breakeven / target paths are exercised) and everything is flattened at 19:20 ET. It switches
 # itself off after 20:00 ET tonight and never applies to a live account or another user.
 # ---------------------------------------------------------------------------
-_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(18, 30), flat_hhmm=(19, 45), until_hhmm=(20, 0),
+_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(18, 5), flat_hhmm=(19, 20), until_hhmm=(20, 0),
              stop_pts=10.0, tp_r=2.0)
 
 

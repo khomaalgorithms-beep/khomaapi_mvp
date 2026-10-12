@@ -272,7 +272,7 @@ def test_live_test_mode_only_for_owner_demo_tonight(monkeypatch):
     from app import orb_engine as E
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 18, 0))
     own = {"env": "demo", "owner_email": "khomadima89@gmail.com"}
-    assert E.test_offset_min(own) == 540
+    assert E.test_offset_min(own) == 515
     assert E.test_offset_min({**own, "env": "live"}) is None
     assert E.test_offset_min({**own, "owner_email": "client@x.com"}) is None
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 20, 1))
@@ -284,12 +284,12 @@ def test_live_test_mode_only_for_owner_demo_tonight(monkeypatch):
 def test_live_test_runs_the_orb_path_on_a_shifted_clock(monkeypatch):
     from datetime import datetime as _dt
     from app import orb_engine as E
-    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 18, 36))
+    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 18, 11))
     monkeypatch.setattr(E, "get_context", lambda r, d: MOM.DayContext(d, 300.0, 1, 99999.0, 1.0))
-    c = cfg("both"); c.test_offset_min = 540; c.test_stop_pts = 10.0; c.max_micros = 1; c.risk_usd = 1.0; c.tp_r = 2.0
+    c = cfg("both"); c.test_offset_min = 515; c.test_stop_pts = 10.0; c.max_micros = 1; c.risk_usd = 1.0; c.tp_r = 2.0
     fb = MB()
     ap = E._make_autopilot(c, lambda: "tok"); ap._broker = fb
-    bars = [Bar(datetime(2026, 10, 12, 18, m), 20000, 20004 if m == 30 else 20002, 19996 if m == 31 else 19998, 20000, 1) for m in range(30, 35)]
+    bars = [Bar(datetime(2026, 10, 12, 18, m), 20000, 20004 if m == 5 else 20002, 19996 if m == 6 else 19998, 20000, 1) for m in range(5, 10)]
     for b in bars:
         ap.on_bar("MNQ", b)
     assert [e["action"] for e in fb.stop_entries] == ["buy", "sell"]                 # filters relaxed: both sides
