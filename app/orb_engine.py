@@ -1127,6 +1127,7 @@ _PAGE = r"""
     </div>
     <ul class="truths">
       <li><b>A real but thin edge.</b> Profit factor about 1.28 with a 36% win rate. A few strong trend days pay for many small losses.</li>
+      <li><b>Most evaluations fail.</b> Over the long run about 1 in 3 evaluations pass, and about 1 in 4 to 1 in 6 evaluations ends in a payout. Budget for several evaluations, not one.</li>
       <li><b>Flat stretches happen.</b> From mid-2025 to today results have been close to breakeven, and the current-market figures above reflect that.</li>
       <li><b>Stagger accounts.</b> Accounts that start on the same day take the same trades and win or lose together. Start them a week or more apart.</li>
       <li><b>No guarantees.</b> Some evaluations fail and some funded accounts blow. The edge shows up across many accounts and months, not on any single one.</li>
@@ -1174,13 +1175,16 @@ function projCard(){
   const r=riskUsd(),q=micros(),sp=stopPts();
   let hero,cap,meter=null,tiles=[];
   if(state.mode==="eval"){const p=DATA.presets[state.acct_size][state.dd_type][state.preset];
-    hero=p.pass_+"%";cap=`<b>chance to pass</b> the ${state.acct_size} evaluation (${DDN[state.dd_type].toLowerCase()})`;meter=p.pass_;
+    const full=(p.pass_full!=null?p.pass_full:p.pass_),fd=DATA.funded[state.acct_size][state.dd_type];
+    const epp=x=>Math.max(1,Math.round(100*100/Math.max(1,full*x)));
+    const lo=epp(fd.p1),hi=epp(fd.p1_now||fd.p1);
+    hero=full+"%";cap=`<b>chance to pass</b> the ${state.acct_size} evaluation (${DDN[state.dd_type].toLowerCase()}): long-run average, 2008–26, including the weak years. About ${Math.max(1,Math.round(100/Math.max(1,full)))} tries per pass.`;meter=full;
     tiles=[["Time to pass",p.days.toFixed(0)+" trading days","median; 3 in 4 within "+p.p75.toFixed(0)],
-           ["Pass rate 2024–26",p.pass2426+"%","held-out recent years",""],
+           ["Good markets",p.pass_+"%","2020–26 starts; not a promise",""],
            ["Current market",p.pass_now+"%","starts since Jul 2025","warn"],
-           ["Profit target",money(TARGET[state.acct_size]),"max loss "+money(MLL[state.acct_size])]];
+           ["Evaluations per payout",(lo===hi?lo:lo+"–"+hi),"from first evaluation to first cash","warn"]];
   }else if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
-    hero=f.p1+"%";cap="<b>reach at least one payout</b> within a year of being funded";meter=f.p1;
+    hero=f.p1+"%";cap="<b>reach at least one payout</b> within a year of being funded (2020–25 starts; the current market is lower, see below)";meter=f.p1;
     tiles=[["First payout",(f.first||0).toFixed(0)+" trading days","median, when paid"],
            ["Blown before payout",f.bb+"%","within the first year"],
            ["Year-1 payouts",money(f.cash),"average, after the 90/10 split"],
