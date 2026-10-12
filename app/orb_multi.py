@@ -402,7 +402,7 @@ class MultiAutopilot(Autopilot):
             if b.dt.strftime("%Y-%m-%d") == st.trading_date and b.dt.replace(second=0, microsecond=0, tzinfo=None) not in have:
                 st.bars.append(b)
         st.bars.sort(key=lambda b: b.dt)
-        last = max((b.minute_of_day for b in bars), default=0)
+        last = max((b.minute_of_day for b in bars if b.dt.strftime("%Y-%m-%d") == st.trading_date), default=0)
         res = {"root": root, "action": "backfill_ready", "bars": len(st.bars)}
         if last >= MOM.ORB_END_MIN - 1:
             self._orb_done[root] = st.trading_date
