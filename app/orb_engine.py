@@ -324,7 +324,15 @@ ACCT = {"25K": dict(start=25000, target=1250, mll=1000, eval_micros=20, funded_m
         "50K": dict(start=50000, target=3000, mll=2000, eval_micros=40, funded_micros=20),
         "100K": dict(start=100000, target=6000, mll=3000, eval_micros=60, funded_micros=30),
         "150K": dict(start=150000, target=9000, mll=4500, eval_micros=100, funded_micros=40)}
-_CASH_FRAC = {"cons": 0.25, "norm": 0.35, "aggr": 0.5}
+def cash_basis(preset: str) -> str:
+    """Live cash plans against the FULL history (2008-26) on 'cons', otherwise the last 10 years."""
+    return "full" if preset == "cons" else "ten"
+
+
+def cash_risk_usd(cash_bal: float, cash_dd: float, preset: str) -> float:
+    """$ risk per trade so that the strategy's worst historical drawdown (in R) equals the client's drawdown budget."""
+    dd_r = float(VALIDATED["cash"][cash_basis(preset)]["ddR"])
+    return round(float(cash_bal) * float(cash_dd) / 100.0 / dd_r, 2)
 
 
 def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
@@ -332,7 +340,8 @@ def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
     """Validated sizing for a configuration: $ risked per trade, max micros, eval take-profit cap.
     eval   -> the preset's validated risk for this account size AND drawdown type (orb_validated)
     funded -> 12% of the max-loss limit, hold to close (validated funded mode)
-    cash   -> preset fraction of the user's drawdown budget (balance x dd%)."""
+    cash   -> drawdown budget (balance x dd%) / the strategy's worst historical drawdown in R
+              (full 2008-26 history on 'cons', last 10 years otherwise); 0 micros if one micro is too big."""
     a = ACCT[acct_size]
     dd = dd_type if dd_type in ("eod", "intraday", "static") else "eod"
     if mode == "eval":
@@ -348,7 +357,7 @@ def risk_plan(mode: str, acct_size: str, preset: str, dd_type: str = "eod",
                         day_tp_usd=None, start=a["start"], target=0, tp_r=float(sf["tp_r"]), min_micros=1)
         return dict(risk_usd=float(f["risk"]), max_micros=a["funded_micros"],
                     day_tp_usd=None, start=a["start"], target=0, tp_r=None, min_micros=1)
-    return dict(risk_usd=round(float(cash_bal) * float(cash_dd) / 100.0 * _CASH_FRAC.get(preset, 0.25)),
+    return dict(risk_usd=cash_risk_usd(cash_bal, cash_dd, preset),
                 max_micros=40, day_tp_usd=None, start=0, target=0, tp_r=None, min_micros=0)
 
 
@@ -1172,7 +1181,7 @@ const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__;
 const SIZES=["25K","50K","100K","150K"],DDN={eod:"End-of-day trailing",intraday:"Intraday trailing",static:"Static"};
 const TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
 const QUAL={"25K":100,"50K":150,"100K":200,"150K":250};
-const EVALMAX={"25K":20,"50K":40,"100K":60,"150K":100},FUNDMAX={"25K":10,"50K":20,"100K":30,"150K":40},CASHF={cons:.25,norm:.35,aggr:.5};
+const EVALMAX={"25K":20,"50K":40,"100K":60,"150K":100},FUNDMAX={"25K":10,"50K":20,"100K":30,"150K":40};
 const $=s=>document.querySelector(s),money=n=>(n<0?"-":"")+"$"+Math.abs(Math.round(n)).toLocaleString("en-US");
 let state=null,CTX={ready:false},lastErr="";
 
@@ -1180,8 +1189,9 @@ function riskUsd(){
   if(state.mode==="eval")return DATA.presets[state.acct_size][state.dd_type][state.preset].risk;
   if(state.mode==="funded"){const f=DATA.funded[state.acct_size][state.dd_type];
     if(isSafe()&&f.safe)return state.preset==="safe2"?f.safe.risk_after:f.safe.risk;return f.risk;}
-  return Math.round(state.cash_bal*state.cash_dd/100*CASHF[state.preset]);
+  return state.cash_bal*state.cash_dd/100/DATA.cash[cashBasis()].ddR;
 }
+function cashBasis(){return state.preset==="cons"?"full":"ten";}
 function isSafe(){return state.mode==="funded"&&(state.preset==="safe"||state.preset==="safe2");}
 function stopPts(){return CTX.ready&&CTX.stop_pts?CTX.stop_pts:null;}
 function micros(){const sp=stopPts()||60,per=sp*2,r=riskUsd(),cap=state.mode==="eval"?EVALMAX[state.acct_size]:state.mode==="funded"?FUNDMAX[state.acct_size]:40;
@@ -1204,7 +1214,9 @@ function configCard(){
       `<div class="field"><label>Account size</label>${seg("acct_size",SIZES.map(s=>({v:s,t:"$"+s})),state.acct_size)}</div>
        <div class="field"><label>Drawdown type</label>${seg("dd_type",[{v:"eod",t:"End-of-day trailing"},{v:"intraday",t:"Intraday trailing"},{v:"static",t:"Static"}],state.dd_type)}
         <div class="pn">${state.dd_type==="eod"?"LucidFlex and most EOD plans: the floor trails your end-of-day balance and locks at start + $100.":state.dd_type==="intraday"?"The floor trails your highest open profit during the day. Harder: size is reduced to match.":"The floor never moves. Easiest drawdown: size is increased to match."}</div></div>`}
-    ${state.mode==="funded"?`<div class="field"><label>Funded mode</label>${seg("fmode",[{v:"std",t:"Standard"},{v:"safe",t:"Safe (recommended)"}],isSafe()?"safe":"std")}
+    ${cash?`<div class="field"><label>Plan your drawdown against</label>${seg("preset",[{v:"cons",t:"Full history (2008–26)"},{v:"norm",t:"Last 10 years"}],state.preset==="cons"?"cons":"norm")}
+      <div class="pn">${state.preset==="cons"?"Sized so the worst drawdown since 2008 (about "+Math.round(DATA.cash.full.ddR)+" times the risk per trade, 2009–2011) fits inside your max drawdown. Much smaller size; survives a repeat of the worst years.":"Sized so the worst drawdown of the last 10 years (about "+Math.round(DATA.cash.ten.ddR)+" times the risk per trade) fits inside your max drawdown. A repeat of 2009–2011 would take you about "+Math.round(DATA.cash.full.ddR/DATA.cash.ten.ddR*state.cash_dd)+"% down."}</div></div>`:
+    state.mode==="funded"?`<div class="field"><label>Funded mode</label>${seg("fmode",[{v:"std",t:"Standard"},{v:"safe",t:"Safe (recommended)"}],isSafe()?"safe":"std")}
       <div class="pn" style="margin-top:6px">${isSafe()?`<b>Safe</b> is built to get you paid and keep the account: the same 10:30 trade, but each winner is closed at <b>2&times; the stop</b> instead of held to the close, and you take a <b>small first payout early</b>.`:`<b>Standard</b> risks about 12% of the max loss per trade and holds every trade to the close. Bigger potential payouts, but about half of funded accounts blow before their first payout over the long run.`}</div></div>
       ${isSafe()?`<div class="field"><label>First payout</label>${seg("preset",[{v:"safe",t:"Not yet taken"},{v:"safe2",t:"Taken"}],state.preset)}
       <div class="pn">${safePlan()}</div></div>`:""}`:
@@ -1240,13 +1252,16 @@ function projCard(){
            ["First payout",((full?f.first_full:f.first)||0).toFixed(0)+" trading days","median, when paid"],
            ["Year-1 payouts",money(full?f.cash_full:f.cash),"average per funded account, after the 90/10 split"],
            ["Good / current market",f.p1+"% / "+f.p1_now+"%","reach a payout: 2020–25 starts / since Oct 2025",""]];
-  }else{const eq=DATA.equity;
-    hero=money(r);cap="<b>risked per trade</b>: a stop-out costs about this much";
-    tiles=[["Drawdown budget",money(state.cash_bal*state.cash_dd/100),state.cash_dd+"% of "+money(state.cash_bal)],
-           ["18-year result",money(eq.totalR*r),"at this risk per trade, since 2008"],
-           ["Worst drawdown",money(eq.maxddR*r),"since 2008 (2009–2019 made no new high)"],
-           ["Profit factor",eq.pf,"win rate "+eq.win+"%"]];}
-  return `<div class="card"><div class="hd"><h2>${state.mode==="eval"?"Evaluation odds":state.mode==="funded"?"Funded outcome":"Live cash sizing"}</h2><p>Real 1-minute NQ data with Lucid commissions and slippage.</p></div>
+  }else{const c=DATA.cash[cashBasis()],cf=DATA.cash.full,sp_=(stopPts()||61)*2,ar=q>0?q*sp_:0;
+    const need=Math.ceil((sp_/1.5)*c.ddR/(state.cash_dd/100)/1000)*1000;
+    if(q<=0){hero="Too small";cap=`<b>one MNQ micro risks about ${money(sp_)}</b>, more than this drawdown plan allows. The engine will not trade. You need about <b>${money(need)}</b> at ${state.cash_dd}% max drawdown, or a larger max drawdown.`;
+      tiles=[["Drawdown budget",money(state.cash_bal*state.cash_dd/100),state.cash_dd+"% of "+money(state.cash_bal)],["Minimum balance",money(need),"for 1 micro on this plan","warn"]];}
+    else{hero=money(c.perMonthR*ar);cap=`<b>average per month</b> at ${q} micro (about ${money(ar)} risk per trade), based on ${cashBasis()==="full"?"2008–2026, including the flat decade":"the last 10 years"}. It is an average, not a monthly income: about ${c.loseM}% of months lose money.`;
+      tiles=[["Typical month",money(c.p50*ar),"range "+money(c.p10*ar)+" to "+money(c.p90*ar)+" (8 in 10 months)"],
+             ["Worst drawdown",money(-c.ddR*ar),Math.round(c.ddR*ar/state.cash_bal*100)+"% of the account, "+(cashBasis()==="full"?"since 2008":"last 10 years"),"warn"],
+             ["Worst 12 months",money(c.worst12R*ar),"last 12 months: "+money(c.last12R*ar),"warn"],
+             ["If 2009–2011 repeats",money(-cf.ddR*ar),Math.round(cf.ddR*ar/state.cash_bal*100)+"% of the account; almost 10 years with no new high","warn"]];}}
+  return `<div class="card"><div class="hd"><h2>${state.mode==="eval"?"Evaluation odds":state.mode==="funded"?"Funded outcome":"Live cash: what to expect"}</h2><p>Real 1-minute NQ data with Lucid commissions and slippage.</p></div>
    <div class="bd"><div class="hero"><div class="big">${hero}</div><div class="cap">${cap}</div></div>
    ${meter!=null?`<div class="meter"><i style="width:${meter}%"></i></div>`:""}
    <div class="sz"><div class="t">What the engine will trade</div><div class="row">

@@ -217,7 +217,10 @@ def test_risk_plan_matches_validated_tables():
                 assert p["day_tp_usd"] == round(0.48 * E.ACCT[size]["target"])
             f = E.risk_plan("funded", size, "norm", dd)
             assert f["day_tp_usd"] is None and f["risk_usd"] == DATA["funded"][size][dd]["risk"]
-    assert E.risk_plan("cash", "50K", "norm", "eod", 40000, 10)["risk_usd"] == 1400
+    # live cash: drawdown budget / worst historical drawdown in R (last 10 years on norm/aggr, full history on cons)
+    from app.orb_validated import DATA
+    assert E.risk_plan("cash", "50K", "norm", "eod", 40000, 10)["risk_usd"] == round(4000 / DATA["cash"]["ten"]["ddR"], 2)
+    assert E.risk_plan("cash", "50K", "cons", "eod", 40000, 10)["risk_usd"] == round(4000 / DATA["cash"]["full"]["ddR"], 2)
 
 
 def test_every_asset_value_trades_mnq_only():
@@ -405,3 +408,12 @@ def test_manager_logs_every_decision(capsys):
     m.on_bar("MNQ", type("B", (), {"dt": __import__("datetime").datetime(2026, 10, 13, 10, 29), "c": 1.0})())
     assert m.decisions and m.decisions[-1]["reason"] == "against_trend" and m.decisions[-1]["account_id"] == 7
     assert "ORB DECISION:" in capsys.readouterr().out
+
+
+def test_live_cash_never_sizes_beyond_the_drawdown_budget():
+    from app import orb_engine as E
+    # $10k, 25% max drawdown, last-10-years plan -> ~$105 risk -> 1 micro on a typical 60-pt stop; full-history plan -> 0
+    assert E.qty_for("cash", "50K", "norm", "nq", "eod", 10000, 25, atr=300.0)["MNQ"] == 1
+    assert E.qty_for("cash", "50K", "cons", "nq", "eod", 10000, 25, atr=300.0)["MNQ"] == 0
+    r = E.risk_plan("cash", "50K", "aggr", "eod", 10000, 25)["risk_usd"]
+    assert r < 0.0125 * 10000                                   # never the old 8.75%-of-account sizing
