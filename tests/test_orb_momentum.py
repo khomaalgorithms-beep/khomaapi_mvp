@@ -417,3 +417,197 @@ def test_live_cash_never_sizes_beyond_the_drawdown_budget():
     assert E.qty_for("cash", "50K", "cons", "nq", "eod", 10000, 25, atr=300.0)["MNQ"] == 0
     r = E.risk_plan("cash", "50K", "aggr", "eod", 10000, 25)["risk_usd"]
     assert r < 0.0125 * 10000                                   # never the old 8.75%-of-account sizing
+
+
+# ---- execution reliability ----------------------------------------------------------------------
+from datetime import timedelta
+import app.orb_live as LIVE
+
+
+class TimeoutBroker(Broker):
+    """The entry request reaches the broker but the response times out (outcome unknown)."""
+    def place_bracket_order(self, *a, **k):
+        super().place_bracket_order(*a, **k)
+        return {"error": "timeout after send"}
+
+
+def test_unknown_entry_outcome_is_verified_and_adopted_when_it_filled():
+    fb = TimeoutBroker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    acts = run_day(ap, session(20000, 20040))
+    assert acts[-1]["action"] == "unconfirmed" and ap._state["MNQ"].status == "ARMED"
+    assert len(fb.place_calls) == 1                                   # never re-sent (duplicate risk)
+    fb.positions = [{"accountId": 42, "netPos": 5, "contractId": 901, "netPrice": 20040.0}]
+    fb.contracts = {901: {"name": "MNQZ6"}}
+    assert any(a["action"] == "filled" for a in ap.poll()) and ap._state["MNQ"].status == "LIVE"
+
+
+def test_unknown_entry_outcome_that_never_filled_is_closed_out_after_the_window():
+    fb = TimeoutBroker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    assert ap.poll() == []                                            # still verifying
+    ap._state["MNQ"].verify_until = datetime.utcnow() - timedelta(seconds=1)
+    out = ap.poll()
+    assert out[-1]["action"] == "reject" and ap._state["MNQ"].status == "DONE"
+
+
+def test_explicit_broker_rejection_is_final():
+    class Rej(Broker):
+        def place_bracket_order(self, *a, **k):
+            super().place_bracket_order(*a, **k)
+            return {"failureReason": "InsufficientMargin", "failureText": "not enough margin"}
+    fb = Rej(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    acts = run_day(ap, session(20000, 20040))
+    assert acts[-1]["action"] == "reject" and ap._state["MNQ"].status == "DONE"
+
+
+def test_token_failure_at_1030_is_retried_on_the_next_bar():
+    tokens = [None, "tok"]
+    fb = Broker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: tokens.pop(0) if tokens else "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    acts = run_day(ap, session(20000, 20040))
+    assert acts[-1]["action"] == "error" and ap._state["MNQ"].status == "IDLE"
+    r = ap.on_bar("MNQ", bar(10, 30, 20040, 20041, 20039, 20040))
+    assert r["action"] == "placed" and len(fb.place_calls) == 1
+
+
+def test_eod_flatten_retries_until_verified_flat():
+    fb = Broker(balance=50000)
+    tok = {"v": "tok"}
+    clock = [datetime(2026, 10, 13, 10, 31)]
+    ap = Autopilot(cfg(), get_token=lambda: tok["v"], broker=fb, now_et=lambda: clock[0], get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    fb.positions = [{"accountId": 42, "netPos": 5, "contractId": 901, "netPrice": 20040.0}]
+    fb.contracts = {901: {"name": "MNQZ6"}}
+    ap.poll()
+    clock[0] = datetime(2026, 10, 13, 15, 59)
+    tok["v"] = None
+    out = ap.poll()
+    assert out[-1]["action"] == "eod_error" and not ap._state["MNQ"].eod_done   # not silently given up
+    tok["v"] = "tok"
+    out = ap.poll()
+    assert fb.liquidations == [901] and ap._state["MNQ"].eod_done and out[-1]["action"] == "eod"
+
+
+def test_eod_flatten_reports_a_position_that_will_not_close():
+    class Stuck(Broker):
+        def liquidate_position(self, env, token, account_id, cid):
+            self.liquidations.append(cid); return {"ok": True}           # broker never closes it
+    fb = Stuck(balance=50000)
+    clock = [datetime(2026, 10, 13, 15, 59)]
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, now_et=lambda: clock[0], get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    fb.positions = [{"accountId": 42, "netPos": 5, "contractId": 901, "netPrice": 20040.0}]
+    fb.contracts = {901: {"name": "MNQZ6"}}
+    out = ap.poll()
+    assert out[-1]["action"] == "eod_error" and out[-1]["reason"] == "still open after liquidate"
+    ap.poll()
+    assert len(fb.liquidations) == 2                                   # retried every poll
+
+
+def test_eod_flattens_a_position_even_after_a_restart_marked_the_day_done():
+    fb = Broker(balance=50000)
+    clock = [datetime(2026, 10, 13, 15, 59)]
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, now_et=lambda: clock[0], get_context=lambda r, d: CTX_UP)
+    ap.backfill("MNQ", session(20000, 20040, upto=(11, 0)))           # restart after 10:29 -> DONE
+    assert ap._state["MNQ"].status == "DONE"
+    fb.positions = [{"accountId": 42, "netPos": -3, "contractId": 901, "netPrice": 20040.0}]
+    fb.contracts = {901: {"name": "MNQZ6"}}
+    ap.poll()
+    assert fb.liquidations == [901]
+
+
+def test_unknown_contract_name_is_never_treated_as_ours():
+    fb = Broker(balance=50000)
+    clock = [datetime(2026, 10, 13, 15, 59)]
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, now_et=lambda: clock[0], get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    fb.positions = [{"accountId": 42, "netPos": 2, "contractId": 555, "netPrice": 5000.0}]   # lookup fails
+    fb.contracts = {}
+    fb.orders = [{"id": 31, "contractId": 555}]
+    ap.poll()
+    assert fb.liquidations == [] and fb.cancels == []                  # another instrument is left alone
+
+
+def test_post_resends_after_a_rate_limit_penalty(monkeypatch):
+    import app.tradovate_oauth as tvo
+
+    class R:
+        def __init__(self, d): self.d = d; self.status_code = 200
+        def json(self): return self.d
+    sent = []
+    replies = [R({"p-ticket": "T1", "p-time": 0}), R({"orderId": 99})]
+    monkeypatch.setattr(tvo.requests, "post", lambda url, headers, json, timeout: (sent.append(json), replies.pop(0))[1])
+    monkeypatch.setattr(tvo.time, "sleep", lambda s: None)
+    out = tvo._post("demo", "tok", "/order/placeOSO", {"orderQty": 1})
+    assert out == {"orderId": 99} and sent[1]["p-ticket"] == "T1" and len(sent) == 2
+
+
+def test_rest_catch_up_feeds_a_missing_decision_bar_once():
+    from app import orb_engine as E
+
+    class AP:
+        def __init__(self): self.seen = []; self.cfg = type("C", (), {"instruments": {"MNQ": "MNQZ6"}})()
+        def on_bar(self, root, b): self.seen.append(b.minute_of_day); return None
+    m = E.EngineManager(start_feed=False)
+    ap = AP(); m._active = {1: {"autopilot": ap}}; m._feed_roots = ("MNQ",)
+    m.on_bar("MNQ", bar(10, 27, 1, 1, 1, 1))                         # live feed stalls after 10:27
+    rest = [bar(10, mm, 1, 1, 1, 1) for mm in range(25, 31)]          # REST has 10:25..10:30
+    now = datetime(2026, 10, 13, 10, 31, 20)
+    m.catch_up(lambda r: rest, now)
+    assert ap.seen == [627, 628, 629, 630]                            # only newer bars, in order, no dupes
+    assert m.catch_up(lambda r: rest, now) == []                      # throttled / nothing missing
+    m.on_bar("MNQ", bar(10, 29, 1, 1, 1, 1))                          # late WS duplicate is ignored
+    assert ap.seen == [627, 628, 629, 630]
+
+
+def test_parallel_dispatch_reaches_every_account():
+    from app import orb_engine as E
+    calls = []
+
+    class AP:
+        def __init__(self, i): self.i = i
+        def on_bar(self, root, b): calls.append(self.i); return {"action": "placed", "root": root}
+    m = E.EngineManager(start_feed=False)
+    m._active = {i: {"autopilot": AP(i)} for i in range(25)}
+    out = m.on_bar("MNQ", bar(10, 29, 1, 1, 1, 1))
+    assert sorted(calls) == list(range(25)) and len(out) == 25
+
+
+def test_alerts_are_sent_once_per_problem(monkeypatch):
+    from app import orb_engine as E
+    sent = []
+    monkeypatch.setattr(E, "_send_alert", lambda subj, html, to=None: sent.append(subj))
+    E._ALERTED.clear()
+    d = {"account_id": 7, "root": "MNQ", "action": "reject", "reason": "InsufficientMargin"}
+    E._alert_if_needed(d); E._alert_if_needed(d)
+    E._alert_if_needed({"account_id": 7, "action": "error", "reason": "no token (will retry next minute)"})
+    E._alert_if_needed({"account_id": 7, "action": "eod_error", "reason": "no token", "tries": 1})
+    assert sent == ["KhomaVolume execution problem"]
+    E._alert_if_needed({"account_id": 7, "action": "eod_error", "reason": "no token", "tries": 3})
+    assert sent[-1].startswith("URGENT")
+
+
+def test_accepted_entry_rejected_later_is_reported():
+    fb = Broker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    st = ap._state["MNQ"]; oid = st.entry_order_id
+    fb.orders = [{"id": oid, "ordStatus": "Rejected", "contractId": 901}]
+    assert ap.poll() == []                                             # within the first minute: wait
+    st.verify_until = datetime.utcnow() - timedelta(seconds=1)
+    out = ap.poll()
+    assert out[-1]["action"] == "reject" and "rejected" in out[-1]["reason"] and st.status == "DONE"
+
+
+def test_fill_and_close_between_polls_is_still_reported():
+    fb = Broker(balance=50000)
+    ap = Autopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: CTX_UP)
+    run_day(ap, session(20000, 20040))
+    st = ap._state["MNQ"]
+    fb.orders = [{"id": st.entry_order_id, "ordStatus": "Filled", "contractId": 901}]
+    st.verify_until = datetime.utcnow() - timedelta(seconds=1)
+    acts = [a["action"] for a in ap.poll()]
+    assert acts == ["filled", "closed"] and st.status == "DONE"

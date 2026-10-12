@@ -177,6 +177,8 @@ def _rest_base(env: str) -> str:
 # create a duplicate order.
 _RETRY_ATTEMPTS = max(1, int(os.getenv("TVO_RETRY_ATTEMPTS", "3")))   # total tries
 _RETRY_BACKOFF = float(os.getenv("TVO_RETRY_BACKOFF", "0.4"))         # seconds, linear
+_PENALTY_RETRIES = 2              # Tradovate p-ticket (rate-limit) resends per request
+_PENALTY_MAX_WAIT = 20.0          # seconds; longer penalties are returned to the caller
 
 
 def _get(env: str, token: str, path: str, params: dict | None = None):
@@ -213,14 +215,17 @@ def _post(env: str, token: str, path: str, body: dict):
     url = f"{_rest_base(env)}{path}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     last_err = None
-    for attempt in range(_RETRY_ATTEMPTS):
+    penalties = 0
+    attempt = 0
+    while attempt < _RETRY_ATTEMPTS:
+        attempt += 1
         try:
             r = requests.post(url, headers=headers, json=body, timeout=15)
         except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as e:
             # Connection never established -> body never sent -> SAFE to retry.
             last_err = {"error": "connect failed", "detail": str(e)[:300]}
-            if attempt + 1 < _RETRY_ATTEMPTS:
-                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+            if attempt < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF * attempt)
                 continue
             return last_err
         except requests.exceptions.ReadTimeout:
@@ -233,10 +238,21 @@ def _post(env: str, token: str, path: str, body: dict):
             return {"error": "request failed", "detail": str(e)[:300]}
         # Got an HTTP response.
         try:
-            return r.json()
+            data = r.json()
         except Exception:
             return {"error": f"http {getattr(r, 'status_code', '?')}",
                     "detail": (getattr(r, "text", "") or "")[:300]}
+        # Tradovate rate-limit penalty: the request was NOT processed; wait p-time and resend with the
+        # p-ticket (safe: no order exists yet). A captcha penalty cannot be solved automatically.
+        if isinstance(data, dict) and data.get("p-ticket") and not data.get("p-captcha") and penalties < _PENALTY_RETRIES:
+            wait = float(data.get("p-time") or 1)
+            if wait <= _PENALTY_MAX_WAIT:
+                penalties += 1
+                attempt -= 1                      # a penalty retry does not use up a transport retry
+                time.sleep(wait)
+                body = {**body, "p-ticket": data["p-ticket"]}
+                continue
+        return data
     return last_err if last_err is not None else {"error": "request failed"}
 
 

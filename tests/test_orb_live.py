@@ -121,7 +121,7 @@ class FakeBroker:
         return self.versions
 
     def working_orders_for(self, orders, versions, account_id, **kw):
-        return [{"id": o.get("id")} for o in orders]
+        return [{"id": o.get("id"), "contractId": o.get("contractId", 901)} for o in orders]
 
     def cancel_order(self, env, token, oid):
         self.cancels.append(oid); return {"ok": True}
@@ -130,7 +130,9 @@ class FakeBroker:
         return self.contracts.get(cid, {"name": ""})
 
     def liquidate_position(self, env, token, account_id, cid):
-        self.liquidations.append(cid); return {"ok": True}
+        self.liquidations.append(cid)
+        self.positions = [p for p in self.positions if p.get("contractId") != cid]   # broker closes it
+        return {"ok": True}
 
 
 def cfg_for(qty_mnq=3, flatten_min=955):

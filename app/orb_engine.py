@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -429,6 +432,9 @@ class EngineManager:
         self._feed = None
         self._feed_task = None
         self._feed_roots: tuple = ()             # exec roots the feed is currently subscribed to
+        self._lock = threading.Lock()            # WS feed + REST catch-up never dispatch concurrently
+        self._last_key: Dict[str, tuple] = {}    # root -> (date, minute) of the last dispatched bar (dedupe)
+        self._pool = ThreadPoolExecutor(max_workers=16)   # place every account's 10:30 order in parallel
 
     # ---- accounts + shared feed ----
     def sync(self, configs: List[dict]) -> None:
@@ -497,19 +503,36 @@ class EngineManager:
     def on_bar(self, root: str, bar: Bar) -> List[dict]:
         """Dispatch ONE completed bar to every armed account. (Broker order I/O inside on_bar is
         brief and per-minute; for very large fleets this should move to a thread pool.)"""
+        with self._lock:
+            return self._dispatch(root, bar)
+
+    def _dispatch(self, root: str, bar: Bar) -> List[dict]:
+        try:
+            key = (bar.dt.strftime("%Y-%m-%d"), bar.minute_of_day)
+            if root in self._last_key and key <= self._last_key[root]:
+                return []                               # duplicate / older bar (WS + REST catch-up overlap)
+            self._last_key[root] = key
+        except Exception:
+            pass
         self.bars_seen += 1
         try:
             self.last_bar = f"{root} {bar.dt:%H:%M} c={bar.c}"
         except Exception:
             self.last_bar = root
         out = []
-        for acct_id, st in list(self._active.items()):
+        items = list(self._active.items())
+
+        def one(item):
+            acct_id, st = item
             try:
                 r = st["autopilot"].on_bar(root, bar)
-                if r:
-                    out.append({"account_id": acct_id, **r})
+                return {"account_id": acct_id, **r} if r else None
             except Exception as e:
-                out.append({"account_id": acct_id, "action": "error", "error": str(e)})
+                return {"account_id": acct_id, "action": "error", "error": str(e)}
+        # every account decides on the same bar; broker I/O runs in parallel so the last account is not
+        # entered tens of seconds after the first
+        results = list(self._pool.map(one, items)) if len(items) > 1 else [one(i) for i in items]
+        out = [r for r in results if r]
         for d in out:                                   # audit trail: every decision is logged (trade / skip / reject / error)
             if d.get("action") in (None, "wait", "backfill_ready"):
                 continue
@@ -517,6 +540,33 @@ class EngineManager:
             self.decisions.append({"ts": datetime.now(timezone.utc).isoformat(), **d})
             del self.decisions[:-200]
             print("ORB DECISION:", d)
+        return out
+
+    def catch_up(self, fetch_bars, now_et: datetime) -> List[dict]:
+        """Backup data path: between 10:30:15 and 10:39 ET, if the live feed has not delivered the 10:29
+        decision bar, pull today's bars from REST and dispatch the missing ones (deduped)."""
+        m = now_et.hour * 60 + now_et.minute
+        if not (MOM.DECIDE_MIN + 1 <= m < MOM.LAST_DECIDE_MIN) or (m == MOM.DECIDE_MIN + 1 and now_et.second < 15):
+            return []
+        today = now_et.strftime("%Y-%m-%d")
+        ts = now_et.timestamp()
+        if ts - getattr(self, "_last_catchup", 0.0) < 20:     # REST at most every 20 s
+            return []
+        self._last_catchup = ts
+        out = []
+        for root in self.feed_roots():
+            last = self._last_key.get(root)
+            if last and last[0] == today and last[1] >= MOM.DECIDE_MIN:
+                continue                                # the feed already delivered the decision bar
+            try:
+                bars = [b for b in (fetch_bars(root) or []) if b.dt.strftime("%Y-%m-%d") == today and b.minute_of_day < m]
+            except Exception as e:
+                print("ORB catch-up fetch error:", root, e); continue
+            for b in sorted(bars, key=lambda b: b.dt):
+                res = self.on_bar(root, b)
+                out.extend(res)
+            if bars:
+                print(f"ORB CATCH-UP: {root} fed {len(bars)} REST bars (live feed missed the decision bar)")
         return out
 
     def poll(self) -> List[dict]:
@@ -600,6 +650,83 @@ def _ctx_status() -> dict:
 
 
 _LOGGED: set = set()
+_ALERTED: set = set()
+_PREFLIGHT_DONE: set = set()
+_ALERT_TO = os.getenv("ORB_ALERT_EMAIL", "khomadima89@gmail.com")
+_ALERT_ACTIONS = ("reject", "error", "unconfirmed", "eod_error")
+
+
+def _owner_email(account_id) -> Optional[str]:
+    try:
+        con = _db()
+        row = con.execute("SELECT u.email FROM broker_accounts ba JOIN users u ON u.id = ba.user_id "
+                          "WHERE ba.account_id = ? LIMIT 1", (str(account_id),)).fetchone()
+        con.close()
+        return dict(row).get("email") if row else None
+    except Exception:
+        return None
+
+
+def _send_alert(subject: str, html: str, to: Optional[str] = None) -> None:
+    try:
+        _main().send_branded_email(to or _ALERT_TO, subject, subject, html,
+                                   button_label="Open KhomaVolume", button_url="https://app.khomaapi.com/prop-engine")
+    except Exception as e:
+        print("ORB alert email error:", e)
+
+
+def _alert_if_needed(d: dict) -> None:
+    """Operator alert (once per account/kind/day) for anything that can cost a client a trade or leave a
+    position open: rejects, errors, unconfirmed entries, and 15:59 flatten failures (after 3 tries)."""
+    act = d.get("action")
+    if act not in _ALERT_ACTIONS and not d.get("error"):
+        return
+    if "will retry" in str(d.get("reason") or ""):
+        return                                          # transient; alert only if the retry window runs out
+    if act == "eod_error" and int(d.get("tries") or 0) < 3:
+        return
+    key = (_now_et().date().isoformat(), d.get("account_id"), act, d.get("reason"))
+    if key in _ALERTED:
+        return
+    _ALERTED.add(key)
+    detail = {k: v for k, v in d.items() if k in ("account_id", "root", "action", "reason", "error", "side", "qty", "sl", "tp", "net", "detail")}
+    rows = "".join(f"<tr><td style='padding:2px 10px 2px 0'><b>{k}</b></td><td>{v}</td></tr>" for k, v in detail.items())
+    subject = {"eod_error": "URGENT: KhomaVolume position may still be open after 15:59",
+               "unconfirmed": "KhomaVolume: entry sent, broker did not confirm (verifying)"}.get(act, "KhomaVolume execution problem")
+    print("ORB ALERT:", subject, detail)
+    _send_alert(subject, f"<p>The engine reported a problem on account <b>{d.get('account_id')}</b>.</p><table>{rows}</table>"
+                         "<p>Check the account in Tradovate now.</p>")
+
+
+def preflight(now: datetime) -> List[dict]:
+    """10:15 ET, once a day: every armed account must have a working broker token and today's context
+    must be loaded, so a problem is fixed BEFORE the 10:30 decision instead of discovered after it."""
+    day = now.date().isoformat()
+    if day in _PREFLIGHT_DONE or _MANAGER is None:
+        return []
+    _PREFLIGHT_DONE.add(day)
+    issues = []
+    ctx = get_context("MNQ", day)
+    if ctx is None or not ctx.ok:
+        issues.append({"account_id": "ALL", "reason": "market context (ATR/trend) not loaded"})
+    for aid, st in list(_MANAGER._active.items()):
+        try:
+            tok = st["autopilot"]._get_token()
+        except Exception:
+            tok = None
+        if not tok:
+            issues.append({"account_id": aid, "reason": "broker not connected (no valid token)"})
+            em = _owner_email(aid)
+            if em:
+                _send_alert("Action needed before 10:30 ET: reconnect your broker",
+                            f"<p>Your Tradovate account <b>{aid}</b> is armed on KhomaVolume, but its broker connection "
+                            "is not working. Open KhomaAPI &rarr; Broker Connect and reconnect it before 10:30 ET, or "
+                            "today's trade will be missed.</p>", to=em)
+    print(f"ORB PREFLIGHT {day}: {len(_MANAGER._active)} armed accounts, {len(issues)} issue(s)", issues)
+    if issues:
+        rows = "".join(f"<li>{i['account_id']}: {i['reason']}</li>" for i in issues)
+        _send_alert("KhomaVolume 10:15 pre-flight: problems found", f"<ul>{rows}</ul>")
+    return issues
 
 
 async def engine_loop() -> None:
@@ -630,7 +757,17 @@ async def engine_loop() -> None:
                 for a in bf:
                     if a.get("action") in ("backfill_ready", "backfill_missed"):
                         print("ORB backfill:", a)
+                now = _now_et()
+                cu = await asyncio.get_event_loop().run_in_executor(None, _MANAGER.catch_up, _fetch_today_bars, now)
+                for d in cu:
+                    _alert_if_needed(d)
+                for d in _MANAGER.decisions[-50:]:
+                    _alert_if_needed(d)
+                if now.hour == 10 and 15 <= now.minute < 25:
+                    await asyncio.get_event_loop().run_in_executor(None, preflight, now)
                 actions = _MANAGER.poll()
+                for a in actions:
+                    _alert_if_needed(a)
                 for a in actions:                           # fills, exits, flattens, errors -> log (once per kind/day)
                     if a.get("action") not in (None, "wait") or a.get("error"):
                         key = (_now_et().date().isoformat(), a.get("account_id"), a.get("root"), a.get("action"), a.get("reason"))
@@ -686,6 +823,8 @@ def notify_trade(ev: dict) -> None:
 
 
 def _fmt(x) -> str:
+    if x is None:
+        return "market (see your broker for the exact fill)"
     try:
         return f"{float(x):,.2f}".rstrip("0").rstrip(".")
     except Exception:

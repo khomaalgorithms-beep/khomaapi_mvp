@@ -276,6 +276,19 @@ def mnq_skip_day(date_str: str) -> bool:
 
 # per-instrument day state
 _IDLE, _ARMED, _LIVE, _DONE = "IDLE", "ARMED", "LIVE", "DONE"
+VERIFY_SEC = 120          # an entry with an unknown outcome is checked against broker positions this long
+ACCEPTED_CHECK_SEC = 60   # an accepted entry that is still flat after this long is settled from its order status
+TOKEN_RETRY_MIN = 3       # a failed token at 10:30 is retried on each new bar for this many minutes
+
+
+def _ambiguous(resp) -> bool:
+    """True when an order request may have reached the broker without a usable answer (never re-send)."""
+    if not isinstance(resp, dict):
+        return True
+    if resp.get("failureReason") or resp.get("failureText"):
+        return False                                   # explicit broker rejection
+    err = str(resp.get("error") or "")
+    return err in ("timeout after send", "request failed") or err.startswith("http 5")
 
 
 @dataclass
@@ -288,6 +301,9 @@ class _DayState:
     entry_order_id: Optional[object] = None
     oso_ids: List[object] = field(default_factory=list)
     was_filled: bool = False
+    verify_until: Optional[datetime] = None   # entry sent but outcome unknown -> check broker truth until then
+    eod_done: bool = False                    # 15:59 flatten verified (flat) for this day
+    eod_tries: int = 0
 
 
 class Autopilot:
@@ -426,6 +442,9 @@ class Autopilot:
                 return {**info, "action": "skip", "reason": "risk_locked", "detail": lock}
         token = self._get_token()
         if not token:
+            # transient token failure: stay IDLE so the next bar (up to TOKEN_RETRY_MIN) retries the entry
+            if self._bar_minute(st) < MOM.DECIDE_MIN + TOKEN_RETRY_MIN:
+                return {**info, "action": "error", "reason": "no token (will retry next minute)"}
             st.status = _DONE
             return {**info, "action": "error", "reason": "no token"}
         long_ = sig.side == "long"
@@ -443,10 +462,23 @@ class Autopilot:
             "buy" if long_ else "sell", self.cfg.instruments[root], qty, stop_price=sl, limit_price=tp)
         oid = resp.get("orderId") if isinstance(resp, dict) else None
         if oid is None:
-            st.status = _DONE                              # one shot per day; never chase a rejected entry
+            if _ambiguous(resp):
+                # the request may have reached the broker (timeout after send / transport error): never
+                # re-send (duplicate risk) and never write it off -> verify against broker positions
+                st.status = _ARMED
+                st.entry_order_id = None
+                st.verify_until = self._utcnow() + timedelta(seconds=VERIFY_SEC)
+                st.plan = {"sl": sl, "tp": tp, "qty": qty, "side": sig.side}
+
+                class _U:
+                    side = sig.side
+                st.signal = _U()
+                return {**info, "action": "unconfirmed", "resp": resp, "sl": sl, "tp": tp}
+            st.status = _DONE                              # broker explicitly rejected: one shot per day
             return {**info, "action": "reject", "resp": resp, "sl": sl, "tp": tp}
         st.status = _ARMED
         st.entry_order_id = oid
+        st.verify_until = self._utcnow() + timedelta(seconds=ACCEPTED_CHECK_SEC)
         st.plan = {"sl": sl, "tp": tp, "qty": qty, "side": sig.side}
 
         class _S:  # minimal signal record for poll()'s "filled" event
@@ -554,21 +586,23 @@ class Autopilot:
         detect the SL/TP close, and force-flatten at EOD. Safe to call repeatedly."""
         out = []
         for root, st in self._state.items():
+            if self._past_flatten():
+                # 15:59 sweep for EVERY state (incl. DONE / restarted / unconfirmed) until the account is
+                # verified flat in this instrument; retried every poll, never silently given up
+                if not st.eod_done:
+                    res = self._eod_flatten(root, st)
+                    if res:
+                        out.append({"root": root, **res})
+                continue
             if st.status in (_IDLE, _DONE):
-                # EOD sweep even for IDLE (cancels any stray same-symbol working order we own)
-                if self._past_flatten() and st.status != _DONE:
-                    self._eod_flatten(root, st)
-                    out.append({"root": root, "action": "eod", "from": _IDLE})
                 continue
             token = self._get_token()
             if not token:
                 out.append({"root": root, "action": "error", "reason": "no token"})
                 continue
-            if self._past_flatten():
-                self._eod_flatten(root, st)
-                out.append({"root": root, "action": "eod"})
-                continue
             net, price, _ = self._net_position(root, token)
+            if net is None:                              # broker read failed -> try again next poll
+                continue
             if net != 0:
                 st.was_filled = True
                 if st.status == _ARMED:
@@ -582,6 +616,30 @@ class Autopilot:
                     self._cancel_working(root, token)     # sweep the other OSO leg if it lingers
                     st.status = _DONE
                     out.append({"root": root, "action": "closed"})
+                elif st.status == _ARMED and st.entry_order_id is None and st.verify_until is not None \
+                        and self._utcnow() >= st.verify_until:
+                    # unconfirmed entry never produced a position -> it did not execute
+                    self._cancel_working(root, token)
+                    st.status = _DONE
+                    out.append({"root": root, "action": "reject", "reason": "entry not confirmed by broker"})
+                elif st.status == _ARMED and st.entry_order_id is not None and st.verify_until is not None \
+                        and self._utcnow() >= st.verify_until:
+                    # accepted entry, still flat a minute later: rejected after acceptance, or filled AND
+                    # already closed between two polls -> settle it from the order's final status
+                    stat = self._order_status(token, st.entry_order_id)
+                    if stat in ("rejected", "canceled", "cancelled", "expired"):
+                        self._cancel_working(root, token)
+                        st.status = _DONE
+                        out.append({"root": root, "action": "reject", "reason": f"entry order {stat} by broker"})
+                    elif stat == "filled":
+                        self._cancel_working(root, token)
+                        st.status = _DONE; st.was_filled = True
+                        out.append({"root": root, "action": "filled", "net": 0, "side": (st.signal.side if st.signal else ""),
+                                    "qty": (st.plan or {}).get("qty") if isinstance(st.plan, dict) else None,
+                                    "entry": None, "plan": st.plan, "note": "filled and closed between checks"})
+                        out.append({"root": root, "action": "closed"})
+                    else:
+                        st.verify_until = self._utcnow() + timedelta(seconds=ACCEPTED_CHECK_SEC)   # still working
         return out
 
     # ---- broker-truth helpers (thin) ---------------------------------------
@@ -598,7 +656,8 @@ class Autopilot:
                 name = str(c.get("name") or "")
         except Exception:
             name = ""
-        self._name_cache[cid] = name
+        if name:                                # don't cache a failed lookup; retry it next time
+            self._name_cache[cid] = name
         return name
 
     def _net_position(self, root: str, token: str):
@@ -606,7 +665,13 @@ class Autopilot:
         Positions carry only a contractId, so we resolve it to a name to match the root."""
         spec = INSTRUMENTS[root]
         net, price, matched_cid = 0, None, None
-        for p in (self._broker.get_positions(self.cfg.env, token) or []):
+        try:
+            positions = self._broker.get_positions(self.cfg.env, token)
+        except Exception:
+            positions = None
+        if positions is None:
+            return None, None, None
+        for p in positions:
             if str(p.get("accountId")) != str(self.cfg.account_id):
                 continue
             n = int(p.get("netPos") or 0)
@@ -614,13 +679,22 @@ class Autopilot:
                 continue
             cid = p.get("contractId")
             cname = self._contract_name(token, cid)
-            if cname and not cname.upper().startswith(spec.root):
-                continue
+            if not cname or not cname.upper().startswith(spec.root):
+                continue                        # unknown or other instrument: never ours to manage
             net += n
             matched_cid = cid
             if p.get("netPrice") is not None:
                 price = float(p["netPrice"])
         return net, price, matched_cid
+
+    def _order_status(self, token: str, order_id) -> str:
+        try:
+            for o in (self._broker.get_orders(self.cfg.env, token) or []):
+                if str(o.get("id")) == str(order_id):
+                    return str(o.get("ordStatus") or o.get("status") or "").lower()
+        except Exception:
+            pass
+        return ""
 
     def _working_ids(self, root: str, token: str) -> List[object]:
         spec = INSTRUMENTS[root]
@@ -632,7 +706,9 @@ class Autopilot:
             working = []
         ids = []
         for w in working:
-            ids.append(w.get("id"))
+            cname = self._contract_name(token, w.get("contractId")) if w.get("contractId") is not None else ""
+            if cname and cname.upper().startswith(spec.root):      # only this instrument's orders
+                ids.append(w.get("id"))
         return [i for i in ids if i is not None]
 
     def _cancel_working(self, root: str, token: str) -> int:
@@ -645,19 +721,35 @@ class Autopilot:
                 pass
         return n
 
-    def _eod_flatten(self, root: str, st: _DayState) -> None:
+    def _eod_flatten(self, root: str, st: _DayState) -> Optional[dict]:
+        """Cancel this instrument's working orders and liquidate any position; done only once a fresh
+        broker read confirms flat. Returns an event dict (or None when there was nothing to do)."""
+        st.eod_tries += 1
         token = self._get_token()
         if not token:
-            st.status = _DONE
-            return
+            return {"action": "eod_error", "reason": "no token", "tries": st.eod_tries}
         self._cancel_working(root, token)
         net, _, cid = self._net_position(root, token)
+        if net is None:
+            return {"action": "eod_error", "reason": "positions unavailable", "tries": st.eod_tries}
         if net != 0 and cid is not None:
             try:   # liquidatePosition cancels resting orders AND closes the position atomically
                 self._broker.liquidate_position(self.cfg.env, token, self.cfg.account_id, cid)
             except Exception:
                 pass
-        st.status = _DONE
+            net2, _, _ = self._net_position(root, token)
+            if net2 != 0:
+                return {"action": "eod_error", "reason": "still open after liquidate", "net": net2, "tries": st.eod_tries}
+            st.status = _DONE; st.eod_done = True
+            return {"action": "eod", "flattened": net}
+        st.status = _DONE; st.eod_done = True
+        return None
+
+    def _utcnow(self) -> datetime:
+        return datetime.utcnow()
+
+    def _bar_minute(self, st: _DayState) -> int:
+        return st.bars[-1].minute_of_day if st.bars else 0
 
     def _past_flatten(self) -> bool:
         if self._now_et is None:
