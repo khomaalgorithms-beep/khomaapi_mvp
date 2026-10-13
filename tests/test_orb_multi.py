@@ -274,10 +274,10 @@ def test_live_test_mode_only_for_owner_demo_tonight(monkeypatch):
     from app import orb_engine as E
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 18, 0))
     own = {"env": "demo", "owner_email": "khomadima89@gmail.com"}
-    assert E.test_offset_min(own) == 799
+    assert E.test_offset_min(own) == 822
     assert E.test_offset_min({**own, "env": "live"}) is None
     assert E.test_offset_min({**own, "owner_email": "client@x.com"}) is None
-    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 23, 26))
+    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 23, 46))
     assert E.test_offset_min(own) is None
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 13, 18, 0))
     assert E.test_offset_min(own) is None
@@ -297,3 +297,27 @@ def test_live_test_runs_the_orb_path_on_a_shifted_clock(monkeypatch):
     assert [e["action"] for e in fb.stop_entries] == ["buy", "sell"]                 # filters relaxed: both sides
     e = fb.stop_entries[0]
     assert e["qty"] == 1 and e["entry"] == 20004.25 and e["sl"] == 19994.25 and e["tp"] == 20024.25
+
+
+def test_live_test_probe_moves_and_cancels_a_far_stop(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+    fb = MB()
+    fb.versions = []
+    fb.cancels = []
+    def place_stop_order(env, token, spec, acct, action, symbol, qty, px):
+        fb.versions.append({"orderId": 7001, "stopPrice": px}); return {"orderId": 7001}
+    def modify(env, token, oid, new_stop, qty=None):
+        if not qty:
+            return {"failureReason": "orderQty required"}
+        fb.versions.append({"orderId": oid, "stopPrice": new_stop}); return {"commandId": 1}
+    fb.place_stop_order = place_stop_order
+    fb.modify_stop_price = modify
+    fb.get_order_versions = lambda env, token: fb.versions
+    fb.cancel_order = lambda env, token, oid: fb.cancels.append(oid) or {"commandId": 2}
+    ap = MultiAutopilot(cfg(), get_token=lambda: "tok", broker=fb, get_context=lambda r, d: ctx())
+    ap.test_offset_min = 600
+    ap.on_bar("MNQ", bar(9, 31, 20000, 20001, 19999, 20000))
+    r = [a for a in ap.poll() if a.get("action") == "probe"][0]
+    assert r["ok"] and r["placed"] == 19700.0 and r["broker_stop_now"] == 19699.0 and fb.cancels == [7001]
+    assert not [a for a in ap.poll() if a.get("action") == "probe"]           # once only

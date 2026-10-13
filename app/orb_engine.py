@@ -435,8 +435,8 @@ def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) 
 # is 10 points (so breakeven / target paths are exercised) and everything is flattened at 19:20 ET. It switches
 # itself off after 20:00 ET tonight and never applies to a live account or another user.
 # ---------------------------------------------------------------------------
-_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(22, 49), flat_hhmm=(23, 20), until_hhmm=(23, 25),
-             stop_pts=3.0, tp_r=4.0, be_pts=1.0)   # cycle 6: breakeven move fires at +1 pt so the fix is exercised for sure
+_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(23, 12), flat_hhmm=(23, 40), until_hhmm=(23, 45),
+             stop_pts=3.0, tp_r=4.0, be_pts=1.0)   # cycle 7: + a direct stop-move probe at startup (far stop, moved, cancelled)
 
 
 def test_offset_min(row: dict) -> Optional[int]:

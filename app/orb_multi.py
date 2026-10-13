@@ -315,8 +315,42 @@ class MultiAutopilot(Autopilot):
             l.status = DONE
 
     # ---- periodic reconcile ------------------------------------------------------------------------
+    def _probe_modify(self, root, st) -> dict:
+        """LIVE TEST ONLY (owner demo): prove the breakeven stop-move call deterministically. Place a 1-micro sell
+        stop 300 pts below the market (cannot fill), move it 1 pt with modify_stop_price, read the broker's order
+        version back, cancel it."""
+        import time as _t
+        self._probed = True
+        token = self._get_token()
+        if not token:
+            return {"root": root, "action": "probe", "ok": False, "step": "token"}
+        tick = INSTRUMENTS[root].tick
+        far = round_tick(st.bars[-1].c - 300, tick); new = round_tick(far - 1, tick)
+        r = self._broker.place_stop_order(self.cfg.env, token, self.cfg.account_spec, self.cfg.account_id, "sell",
+                                          self.cfg.instruments[root], 1, far)
+        oid = r.get("orderId") if isinstance(r, dict) else None
+        if not oid:
+            return {"root": root, "action": "probe", "ok": False, "step": "place", "place_resp": r}
+        m = self._broker.modify_stop_price(self.cfg.env, token, oid, new, qty=1)
+        _t.sleep(1.5)
+        seen = None
+        try:
+            for v in self._broker.get_order_versions(self.cfg.env, token) or []:
+                if v.get("orderId") == oid:
+                    seen = v.get("stopPrice")
+        except Exception:
+            pass
+        c = self._broker.cancel_order(self.cfg.env, token, oid)
+        ok = isinstance(m, dict) and not (m.get("failureReason") or m.get("error"))
+        return {"root": root, "action": "probe", "ok": ok, "order_id": oid, "placed": far, "moved_to": new,
+                "broker_stop_now": seen, "modify_resp": m, "cancel_resp": c}
+
     def poll(self) -> List[dict]:
         out: List[dict] = []
+        if getattr(self, "test_offset_min", None) and not getattr(self, "_probed", False):
+            for root, st in list(self._state.items()):
+                if st.bars:
+                    out.append(self._probe_modify(root, st))
         for root, st in list(self._state.items()):
             if self._past_flatten():
                 if not st.eod_done:
