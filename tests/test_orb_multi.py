@@ -289,3 +289,17 @@ def test_keepalive_renews_every_armed_token_and_alerts_a_dead_one(monkeypatch):
     E._KEEPALIVE_LAST[0] = 0.0
     E.keepalive(_dt(2026, 10, 13, 2, 6))
     assert len(alerts) == 2                                                  # same day: no repeat email
+
+
+def test_keepalive_also_alerts_armed_accounts_that_could_not_start(monkeypatch):
+    from datetime import datetime as _dt
+    from app import orb_engine as E
+    alerts = []
+    m = E.EngineManager.__new__(E.EngineManager); m._active = {}
+    monkeypatch.setattr(E, "_MANAGER", m)
+    monkeypatch.setattr(E, "_owner_email", lambda aid: None)
+    monkeypatch.setattr(E, "_send_alert", lambda subj, html, to=None: alerts.append(subj))
+    E._KEEPALIVE_LAST[0] = 0.0; E._TOKEN_ALERTED.clear(); E._UNBUILT.clear(); E._UNBUILT["48440214"] = "broker connection not working"
+    res = E.keepalive(_dt(2026, 10, 13, 12, 0))
+    assert res == [{"account_id": "48440214", "ok": False}] and len(alerts) == 1
+    E._UNBUILT.clear()

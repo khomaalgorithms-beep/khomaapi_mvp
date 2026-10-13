@@ -670,6 +670,7 @@ def _plan_configs() -> List[dict]:
     conditions (copy_rows). Deduped by account — an armed account also in a box counts once."""
     out = []
     seen = set()
+    unbuilt = {}
     for row in list(enabled_rows()) + copy_rows():
         pk = row["account_pk"]
         if pk in seen:
@@ -677,9 +678,11 @@ def _plan_configs() -> List[dict]:
         seen.add(pk)
         token = _fresh_token_for(pk)
         if not token:
+            unbuilt[row["account_id"]] = "no broker token"
             continue
         cfg = build_account_config(row, token)
-        if cfg is None:
+        if cfg is None:                       # almost always an expired token (contract lookup refused)
+            unbuilt[row["account_id"]] = "broker connection not working"
             continue
         # KhomaAPI Risk Engine: a locked account (daily loss / drawdown breach) must never get a new entry
         cfg.risk_check = (lambda pk=pk, uid=row.get("user_id"):
@@ -689,6 +692,7 @@ def _plan_configs() -> List[dict]:
         qty = {r: cfg.qty.get(r, 0) for r in roots}
         out.append({"row": row, "cfg": cfg, "sig": config_signature(row, contracts, qty),
                     "token_provider": (lambda pk=pk: _fresh_token_for(pk))})
+    _UNBUILT.clear(); _UNBUILT.update(unbuilt)
     return out
 
 
@@ -706,6 +710,7 @@ _PREFLIGHT_DONE: set = set()
 _KEEPALIVE_EVERY_SEC = 300                  # Tradovate tokens last ~90 min; renewal fires inside the last 20 min
 _KEEPALIVE_LAST = [0.0]
 _TOKEN_ALERTED: set = set()
+_UNBUILT: Dict[str, str] = {}              # armed accounts the engine could NOT start (account_id -> reason)
 
 
 def token_works(env: str, token: str) -> bool:
@@ -737,7 +742,7 @@ def keepalive(now: datetime) -> List[dict]:
     if _MANAGER is None or _t.time() - _KEEPALIVE_LAST[0] < _KEEPALIVE_EVERY_SEC:
         return []
     _KEEPALIVE_LAST[0] = _t.time()
-    res = _MANAGER.keepalive()
+    res = _MANAGER.keepalive() + [{"account_id": a, "ok": False} for a in list(_UNBUILT)]
     for r in res:
         if not r["ok"]:
             _token_alert(r["account_id"], now.date().isoformat())
@@ -799,6 +804,8 @@ def preflight(now: datetime) -> List[dict]:
     ctx = get_context("MNQ", day)
     if ctx is None or not ctx.ok:
         issues.append({"account_id": "ALL", "reason": "market context (ATR/trend) not loaded"})
+    for aid, why in list(_UNBUILT.items()):                     # armed but never started (dead connection)
+        issues.append({"account_id": aid, "reason": why})
     for aid, st in list(_MANAGER._active.items()):
         try:
             tok = st["autopilot"]._get_token()
