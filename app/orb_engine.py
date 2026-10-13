@@ -60,21 +60,6 @@ def _massive_key() -> Optional[str]:
 def _make_autopilot(cfg: AccountConfig, token_provider) -> Autopilot:
     """One Autopilot per account, executing to that account's Tradovate connection. ORB / both use the
     multi-leg autopilot (each strategy tracked by its own order ids); the 10:30 rule alone keeps the original one."""
-    off = getattr(cfg, "test_offset_min", None)
-    if off is not None:                      # live execution test: shifted clock, relaxed filters, fixed test stop
-        from datetime import timedelta as _td
-        from app.orb_multi import MultiAutopilot
-        stop = float(getattr(cfg, "test_stop_pts", 10.0))
-
-        def test_ctx(root, date, _g=get_context):
-            c = _g(root, date)
-            if c is None:
-                return None
-            return MOM.DayContext(c.date, stop / MOM.STOP_ATR, c.trend, -1e12, 1e12)    # both ORB sides valid
-        ap = MultiAutopilot(cfg, get_token=token_provider, now_et=lambda: _now_et() - _td(minutes=off), get_context=test_ctx)
-        ap.test_offset_min = off
-        ap.test_be_pts = _TEST.get("be_pts")
-        return ap
     if cfg.strategy in ("orb", "both"):
         from app.orb_multi import MultiAutopilot
         return MultiAutopilot(cfg, get_token=token_provider, now_et=_now_et, get_context=get_context)
@@ -425,28 +410,7 @@ def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) 
     return json.dumps({"env": row.get("env"), "mode": row["mode"], "size": row["acct_size"],
                        "preset": row["preset"], "asset": row["asset"], "dd": row.get("dd_type") or "eod",
                        "cash": [row.get("cash_bal"), row.get("cash_dd")],
-                       "contracts": contracts, "strategy": "momentum-v1", "test": test_offset_min(row)}, sort_keys=True)
-
-
-# ---------------------------------------------------------------------------
-# ONE-NIGHT LIVE EXECUTION TEST (2026-10-12 evening): proves the order path on the OWNER's DEMO account only.
-# The test account's clock is shifted so tonight's 18:05 ET plays the role of the 09:30 open (ORB entries from
-# 18:10, the momentum leg at 19:04), filters are relaxed so orders are actually placed, size is 1 micro, the stop
-# is 10 points (so breakeven / target paths are exercised) and everything is flattened at 19:20 ET. It switches
-# itself off after 20:00 ET tonight and never applies to a live account or another user.
-# ---------------------------------------------------------------------------
-_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(23, 12), flat_hhmm=(23, 40), until_hhmm=(23, 45),
-             stop_pts=3.0, tp_r=4.0, be_pts=1.0)   # cycle 7: + a direct stop-move probe at startup (far stop, moved, cancelled)
-
-
-def test_offset_min(row: dict) -> Optional[int]:
-    """Minutes to shift this account's clock back for the live test, or None (normal trading)."""
-    now = _now_et()
-    if (row.get("env") != "demo" or str(row.get("owner_email") or "").lower() != _TEST["owner"]
-            or now.strftime("%Y-%m-%d") != _TEST["date"] or (now.hour, now.minute) >= _TEST["until_hhmm"]):
-        return None
-    oh, om = _TEST["open_hhmm"]
-    return (oh * 60 + om) - (9 * 60 + 30)
+                       "contracts": contracts, "strategy": "momentum-v1"}, sort_keys=True)
 
 
 def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
@@ -474,16 +438,6 @@ def build_account_config(row: dict, token: str) -> Optional[AccountConfig]:
                         mode=row["mode"], risk_usd=plan["risk_usd"], max_micros=plan["max_micros"],
                         acct_start=plan["start"], acct_target=plan["target"], day_tp_usd=plan["day_tp_usd"],
                         tp_r=plan.get("tp_r"), min_micros=int(plan.get("min_micros") or 0))
-    off = test_offset_min(row)
-    if off is not None:                      # live execution test (owner's demo account, tonight only)
-        fh, fm = _TEST["flat_hhmm"]
-        cfg = AccountConfig(env=env, account_spec=row["account_name"], account_id=int(row["account_id"]),
-                            account_name=row["account_name"], instruments=contracts, qty={"MNQ": 1},
-                            params=dict(DEFAULT_PARAMS), observe={r: False for r in roots}, strategy="both",
-                            mode="funded", risk_usd=1.0, max_micros=1, acct_start=0, acct_target=0, day_tp_usd=None,
-                            tp_r=_TEST["tp_r"], min_micros=1, flatten_min=(fh * 60 + fm) - off)
-        cfg.test_offset_min = off
-        cfg.test_stop_pts = _TEST["stop_pts"]
     return cfg
 
 

@@ -81,17 +81,9 @@ class MultiAutopilot(Autopilot):
             return "Risk state unavailable - entry blocked (fail-closed)."
 
     # ---- feed callback -----------------------------------------------------------------------------
-    def _shift(self, bar):
-        off = getattr(self, "test_offset_min", None)
-        if not off:
-            return bar
-        from app.orb_selective import Bar
-        return Bar(bar.dt - timedelta(minutes=off), bar.o, bar.h, bar.l, bar.c, bar.v)
-
     def on_bar(self, root, bar):
         if root not in self.cfg.instruments:
             return None
-        bar = self._shift(bar)
         st = self._day(root, bar)
         st.bars.append(bar)
         legs = self._today_legs(root, st)
@@ -197,11 +189,6 @@ class MultiAutopilot(Autopilot):
         if self._mom_done.get(root) == td or bar.minute_of_day < MOM.DECIDE_MIN:
             return None
         ctx = self._context(root, td)
-        if getattr(self, "test_offset_min", None) and ctx is not None:      # live test: always agree with the move
-            op = next((b for b in st.bars if MOM.OPEN_MIN <= b.minute_of_day < MOM.OPEN_MIN + 10), None)
-            dc = next((b for b in st.bars if MOM.DECIDE_MIN <= b.minute_of_day < MOM.LAST_DECIDE_MIN), None)
-            if op and dc and dc.c != op.o:
-                ctx = MOM.DayContext(ctx.date, ctx.atr, 1 if dc.c > op.o else -1, ctx.pdh, ctx.pdl)
         status, res = MOM.decision(st.bars, ctx)
         if status == "wait":
             return None
@@ -249,7 +236,7 @@ class MultiAutopilot(Autopilot):
             if l.name != "orb" or l.status != LIVE or l.be_done or l.fill is None:
                 continue
             fav = (bar.h - l.fill) if l.sgn > 0 else (l.fill - bar.l)
-            if fav < (getattr(self, "test_be_pts", None) or MOM.ORB_BE_R * l.stop_pts):   # test_be_pts: live test only
+            if fav < MOM.ORB_BE_R * l.stop_pts:
                 continue
             token = self._get_token()
             if not token:
@@ -315,42 +302,8 @@ class MultiAutopilot(Autopilot):
             l.status = DONE
 
     # ---- periodic reconcile ------------------------------------------------------------------------
-    def _probe_modify(self, root, st) -> dict:
-        """LIVE TEST ONLY (owner demo): prove the breakeven stop-move call deterministically. Place a 1-micro sell
-        stop 300 pts below the market (cannot fill), move it 1 pt with modify_stop_price, read the broker's order
-        version back, cancel it."""
-        import time as _t
-        self._probed = True
-        token = self._get_token()
-        if not token:
-            return {"root": root, "action": "probe", "ok": False, "step": "token"}
-        tick = INSTRUMENTS[root].tick
-        far = round_tick(st.bars[-1].c - 300, tick); new = round_tick(far - 1, tick)
-        r = self._broker.place_stop_order(self.cfg.env, token, self.cfg.account_spec, self.cfg.account_id, "sell",
-                                          self.cfg.instruments[root], 1, far)
-        oid = r.get("orderId") if isinstance(r, dict) else None
-        if not oid:
-            return {"root": root, "action": "probe", "ok": False, "step": "place", "place_resp": r}
-        m = self._broker.modify_stop_price(self.cfg.env, token, oid, new, qty=1)
-        _t.sleep(1.5)
-        seen = None
-        try:
-            for v in self._broker.get_order_versions(self.cfg.env, token) or []:
-                if v.get("orderId") == oid:
-                    seen = v.get("stopPrice")
-        except Exception:
-            pass
-        c = self._broker.cancel_order(self.cfg.env, token, oid)
-        ok = isinstance(m, dict) and not (m.get("failureReason") or m.get("error"))
-        return {"root": root, "action": "probe", "ok": ok, "order_id": oid, "placed": far, "moved_to": new,
-                "broker_stop_now": seen, "modify_resp": m, "cancel_resp": c}
-
     def poll(self) -> List[dict]:
         out: List[dict] = []
-        if getattr(self, "test_offset_min", None) and not getattr(self, "_probed", False):
-            for root, st in list(self._state.items()):
-                if st.bars:
-                    out.append(self._probe_modify(root, st))
         for root, st in list(self._state.items()):
             if self._past_flatten():
                 if not st.eod_done:
@@ -421,7 +374,7 @@ class MultiAutopilot(Autopilot):
 
     # ---- restart safety ----------------------------------------------------------------------------
     def backfill(self, root, bars):
-        bars = [self._shift(b) for b in (bars or [])]
+        bars = list(bars or [])
         return self._backfill(root, bars)
 
     def _backfill(self, root, bars):
