@@ -267,3 +267,25 @@ def test_strategy_mapping_and_autopilot_class():
     c.strategy = "momentum"
     ap = E._make_autopilot(c, lambda: "tok")
     assert type(ap) is Autopilot
+
+
+def test_keepalive_renews_every_armed_token_and_alerts_a_dead_one(monkeypatch):
+    from datetime import datetime as _dt
+    from app import orb_engine as E
+    calls, alerts = [], []
+    good = MultiAutopilot(cfg(), get_token=lambda: calls.append("a") or "good", broker=MB(), get_context=lambda r, d: ctx())
+    dead = MultiAutopilot(cfg(), get_token=lambda: calls.append("b") or "expired", broker=MB(), get_context=lambda r, d: ctx())
+    m = E.EngineManager.__new__(E.EngineManager)
+    m._active = {1: {"autopilot": good}, 2: {"autopilot": dead}}
+    monkeypatch.setattr(E, "_MANAGER", m)
+    monkeypatch.setattr(E.tvo, "_get", lambda env, tok, path: [{"id": 1}] if tok == "good" else {"errorText": "Expired Access Token"})
+    monkeypatch.setattr(E, "_owner_email", lambda aid: "c@x.com")
+    monkeypatch.setattr(E, "_send_alert", lambda subj, html, to=None: alerts.append((subj, to)))
+    E._KEEPALIVE_LAST[0] = 0.0; E._TOKEN_ALERTED.clear()
+    res = E.keepalive(_dt(2026, 10, 13, 2, 0))
+    assert calls == ["a", "b"] and [r["ok"] for r in res] == [True, False]
+    assert [a[1] for a in alerts] == ["c@x.com", None]                       # client + operator, once
+    assert E.keepalive(_dt(2026, 10, 13, 2, 1)) == []                        # throttled to every 5 min
+    E._KEEPALIVE_LAST[0] = 0.0
+    E.keepalive(_dt(2026, 10, 13, 2, 6))
+    assert len(alerts) == 2                                                  # same day: no repeat email

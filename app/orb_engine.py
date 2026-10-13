@@ -635,6 +635,19 @@ class EngineManager:
     def active_ids(self) -> List[int]:
         return list(self._active)
 
+    def keepalive(self) -> List[dict]:
+        """Touch every armed account's broker token so it is renewed BEFORE it expires (Tradovate cannot renew an
+        already-expired token - the client then has to reconnect), and check it actually works with a real call."""
+        out = []
+        for aid, st in list(self._active.items()):
+            ap = st["autopilot"]
+            try:
+                tok = ap._get_token()
+            except Exception:
+                tok = None
+            out.append({"account_id": aid, "ok": bool(tok) and token_works(ap.cfg.env, tok)})
+        return out
+
     def feed_roots(self) -> tuple:
         return self._feed_roots
 
@@ -690,6 +703,45 @@ def _ctx_status() -> dict:
 _LOGGED: set = set()
 _ALERTED: set = set()
 _PREFLIGHT_DONE: set = set()
+_KEEPALIVE_EVERY_SEC = 300                  # Tradovate tokens last ~90 min; renewal fires inside the last 20 min
+_KEEPALIVE_LAST = [0.0]
+_TOKEN_ALERTED: set = set()
+
+
+def token_works(env: str, token: str) -> bool:
+    """True only if the broker accepts this token right now (an expired token returns 401 / no account list)."""
+    try:
+        r = tvo._get(env, token, "/account/list")
+    except Exception:
+        return False
+    return isinstance(r, list)
+
+
+def _token_alert(aid, day: str) -> None:
+    """Once per account per day: the client (and the operator) are told to reconnect."""
+    if (day, aid) in _TOKEN_ALERTED:
+        return
+    _TOKEN_ALERTED.add((day, aid))
+    print("ORB ALERT: broker connection expired", {"account_id": aid})
+    html = (f"<p>Your Tradovate account <b>{aid}</b> is armed on KhomaVolume, but its broker connection has expired. "
+            "Open KhomaAPI &rarr; Broker Connect and reconnect it, otherwise the algorithm cannot place trades.</p>")
+    em = _owner_email(aid)
+    if em:
+        _send_alert("Action needed: reconnect your broker on KhomaAPI", html, to=em)
+    _send_alert(f"KhomaVolume: broker connection expired on {aid}", html)
+
+
+def keepalive(now: datetime) -> List[dict]:
+    """Every 5 minutes, all day: renew + verify every armed account's token; alert on a dead one."""
+    import time as _t
+    if _MANAGER is None or _t.time() - _KEEPALIVE_LAST[0] < _KEEPALIVE_EVERY_SEC:
+        return []
+    _KEEPALIVE_LAST[0] = _t.time()
+    res = _MANAGER.keepalive()
+    for r in res:
+        if not r["ok"]:
+            _token_alert(r["account_id"], now.date().isoformat())
+    return res
 _ALERT_TO = os.getenv("ORB_ALERT_EMAIL", "khomadima89@gmail.com")
 _ALERT_ACTIONS = ("reject", "error", "unconfirmed", "eod_error")
 
@@ -752,8 +804,9 @@ def preflight(now: datetime) -> List[dict]:
             tok = st["autopilot"]._get_token()
         except Exception:
             tok = None
-        if not tok:
+        if not tok or not token_works(st["autopilot"].cfg.env, tok):       # a stored-but-expired token is NOT ok
             issues.append({"account_id": aid, "reason": "broker not connected (no valid token)"})
+            _TOKEN_ALERTED.add((day, aid))                                  # client already emailed below
             em = _owner_email(aid)
             if em:
                 _send_alert("Action needed before 9:35 ET: reconnect your broker",
@@ -803,6 +856,7 @@ async def engine_loop() -> None:
                     _alert_if_needed(d)
                 if now.hour == 9 and 15 <= now.minute < 25:         # before the 9:35 ORB entry and the 10:30 decision
                     await asyncio.get_event_loop().run_in_executor(None, preflight, now)
+                await asyncio.get_event_loop().run_in_executor(None, keepalive, now)
                 actions = _MANAGER.poll()
                 for a in actions:
                     _alert_if_needed(a)
