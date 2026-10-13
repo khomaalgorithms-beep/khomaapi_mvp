@@ -249,7 +249,7 @@ class MultiAutopilot(Autopilot):
             if l.name != "orb" or l.status != LIVE or l.be_done or l.fill is None:
                 continue
             fav = (bar.h - l.fill) if l.sgn > 0 else (l.fill - bar.l)
-            if fav < MOM.ORB_BE_R * l.stop_pts:
+            if fav < (getattr(self, "test_be_pts", None) or MOM.ORB_BE_R * l.stop_pts):   # test_be_pts: live test only
                 continue
             token = self._get_token()
             if not token:

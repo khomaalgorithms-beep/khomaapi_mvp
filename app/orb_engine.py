@@ -73,6 +73,7 @@ def _make_autopilot(cfg: AccountConfig, token_provider) -> Autopilot:
             return MOM.DayContext(c.date, stop / MOM.STOP_ATR, c.trend, -1e12, 1e12)    # both ORB sides valid
         ap = MultiAutopilot(cfg, get_token=token_provider, now_et=lambda: _now_et() - _td(minutes=off), get_context=test_ctx)
         ap.test_offset_min = off
+        ap.test_be_pts = _TEST.get("be_pts")
         return ap
     if cfg.strategy in ("orb", "both"):
         from app.orb_multi import MultiAutopilot
@@ -434,8 +435,8 @@ def config_signature(row: dict, contracts: Dict[str, str], qty: Dict[str, int]) 
 # is 10 points (so breakeven / target paths are exercised) and everything is flattened at 19:20 ET. It switches
 # itself off after 20:00 ET tonight and never applies to a live account or another user.
 # ---------------------------------------------------------------------------
-_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(22, 33), flat_hhmm=(23, 5), until_hhmm=(23, 10),
-             stop_pts=3.0, tp_r=4.0)          # cycle 5: verify the breakeven fix (3-pt stop, range 22:33-22:37, flat 23:05)
+_TEST = dict(date="2026-10-12", owner="khomadima89@gmail.com", open_hhmm=(22, 49), flat_hhmm=(23, 20), until_hhmm=(23, 25),
+             stop_pts=3.0, tp_r=4.0, be_pts=1.0)   # cycle 6: breakeven move fires at +1 pt so the fix is exercised for sure
 
 
 def test_offset_min(row: dict) -> Optional[int]:

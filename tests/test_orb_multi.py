@@ -274,10 +274,10 @@ def test_live_test_mode_only_for_owner_demo_tonight(monkeypatch):
     from app import orb_engine as E
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 18, 0))
     own = {"env": "demo", "owner_email": "khomadima89@gmail.com"}
-    assert E.test_offset_min(own) == 783
+    assert E.test_offset_min(own) == 799
     assert E.test_offset_min({**own, "env": "live"}) is None
     assert E.test_offset_min({**own, "owner_email": "client@x.com"}) is None
-    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 23, 11))
+    monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 12, 23, 26))
     assert E.test_offset_min(own) is None
     monkeypatch.setattr(E, "_now_et", lambda: _dt(2026, 10, 13, 18, 0))
     assert E.test_offset_min(own) is None
