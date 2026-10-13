@@ -613,7 +613,7 @@ class EngineManager:
         for d in out:                                   # audit trail: every decision is logged (trade / skip / reject / error)
             if d.get("action") in (None, "wait", "backfill_ready"):
                 continue
-            d = {k: v for k, v in d.items() if k != "resp" or d.get("action") == "reject"}
+            d = {k: v for k, v in d.items() if k != "resp" or d.get("action") in ("reject", "error")}
             self.decisions.append({"ts": datetime.now(timezone.utc).isoformat(), **d})
             del self.decisions[:-200]
             print("ORB DECISION:", d)

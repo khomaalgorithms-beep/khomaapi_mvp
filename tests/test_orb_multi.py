@@ -57,6 +57,8 @@ class MB(FakeBroker):
         return self.fills
 
     def modify_stop_price(self, env, token, oid, new_stop, qty=None):
+        if not qty:                     # real Tradovate rejects a modify without orderQty
+            return {"failureReason": "orderQty required"}
         self.mods.append((oid, new_stop)); return {"ok": True}
 
 

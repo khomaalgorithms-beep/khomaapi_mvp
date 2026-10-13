@@ -3305,7 +3305,7 @@ def move_stops_to_accounts(accounts: list, symbol: str, new_stop) -> dict:
                 cname = _contract_name(env, token, o.get("contractId"))
                 if root and (not cname or symbol_root(cname) != root):   # fail closed: never move an unidentifiable stop
                     continue
-                tvo.modify_stop_price(env, token, o.get("id"), ns)
+                tvo.modify_stop_price(env, token, o.get("id"), ns, qty=o.get("orderQty"))
                 moved += 1
             results.append({"account": a.get("account_name"), "ok": True, "moved": moved, "stop": ns})
         except Exception as e:

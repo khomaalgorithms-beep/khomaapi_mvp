@@ -258,8 +258,8 @@ class MultiAutopilot(Autopilot):
             if sid is None:
                 return {"root": root, "action": "error", "strategy": "orb", "reason": "breakeven: stop order not found"}
             new = round_tick(l.fill, INSTRUMENTS[root].tick)
-            resp = self._broker.modify_stop_price(self.cfg.env, token, sid, new)
-            if isinstance(resp, dict) and (resp.get("failureReason") or resp.get("error")):
+            resp = self._broker.modify_stop_price(self.cfg.env, token, sid, new, qty=l.qty)   # Tradovate requires orderQty
+            if not isinstance(resp, dict) or resp.get("failureReason") or resp.get("error"):
                 return {"root": root, "action": "error", "strategy": "orb", "reason": "breakeven modify failed", "resp": resp}
             l.stop_oid = sid; l.sl = new; l.be_done = True
             return {"root": root, "action": "breakeven", "strategy": "orb", "stop": new}
