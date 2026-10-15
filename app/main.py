@@ -972,6 +972,7 @@ def _ucol(user, key):
 # COMP_ACCESS_EMAILS env var can ADD emails the same way.
 _COMP_ACCESS_EMAILS = {
     "amar.sgnm@gmail.com",
+    "oliverlemare47@gmail.com",      # sales closer (team) - full view incl. KhomaVolume numbers, 2026-10-14
 }
 
 
