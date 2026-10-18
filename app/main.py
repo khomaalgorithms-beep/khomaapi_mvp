@@ -2800,7 +2800,7 @@ def _parse_iso(s: str):
         return None
 
 
-def ensure_fresh_token(account: dict) -> str:
+def ensure_fresh_token(account: dict, min_runway_min: int = 20) -> str:
     """Return a valid decrypted access token for the account, renewing it with
     Tradovate when it is near expiry and persisting the new token. Returns "" if
     there is no token. A renewal failure (e.g. already expired) returns the
@@ -2816,7 +2816,7 @@ def ensure_fresh_token(account: dict) -> str:
             exp_dt = exp_dt.replace(tzinfo=timezone.utc)
         # Not near expiry yet -> reuse as-is. 20-min buffer (was 10) so renewal fires
         # with runway to spare — a token must never lapse mid-session and fail an order.
-        if exp_dt - datetime.now(timezone.utc) > timedelta(minutes=20):
+        if exp_dt - datetime.now(timezone.utc) > timedelta(minutes=min_runway_min):
             return token
 
     res = tvo.renew_access_token(env, token)

@@ -303,3 +303,18 @@ def test_keepalive_also_alerts_armed_accounts_that_could_not_start(monkeypatch):
     res = E.keepalive(_dt(2026, 10, 13, 12, 0))
     assert res == [{"account_id": "48440214", "ok": False}] and len(alerts) == 1
     E._UNBUILT.clear()
+
+
+def test_keepalive_uses_the_long_runway_renewal_and_preflight_skips_weekends(monkeypatch):
+    from datetime import datetime as _dt
+    from app import orb_engine as E
+    used = []
+    ap = MultiAutopilot(cfg(), get_token=lambda: used.append("normal") or "good", broker=MB(), get_context=lambda r, d: ctx())
+    m = E.EngineManager.__new__(E.EngineManager)
+    m._active = {1: {"autopilot": ap, "keep": lambda: used.append("keep") or "good"}}
+    monkeypatch.setattr(E, "_MANAGER", m)
+    monkeypatch.setattr(E.tvo, "_get", lambda env, tok, path: [{"id": 1}])
+    E._KEEPALIVE_LAST[0] = 0.0; E._UNBUILT.clear()
+    assert E.keepalive(_dt(2026, 10, 16, 18, 0)) == [{"account_id": 1, "ok": True}] and used == ["keep"]
+    E._PREFLIGHT_DONE.discard("2026-10-17")
+    assert E.preflight(_dt(2026, 10, 17, 9, 15)) == []                         # Saturday: no pre-flight, no emails

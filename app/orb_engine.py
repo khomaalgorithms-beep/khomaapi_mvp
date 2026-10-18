@@ -143,7 +143,7 @@ def _db():
     return _main().db()
 
 
-def _fresh_token_for(account_pk: int) -> Optional[str]:
+def _fresh_token_for(account_pk: int, min_runway_min: int = 20) -> Optional[str]:
     """Re-read the broker_accounts row by primary key and return a valid (renewed) token, or
     None. Re-reading each call means a reconnect / token refresh is always picked up live."""
     con = _db()
@@ -155,7 +155,7 @@ def _fresh_token_for(account_pk: int) -> Optional[str]:
     if acct.get("status") != "connected":
         return None
     try:
-        return _main().ensure_fresh_token(acct) or None
+        return _main().ensure_fresh_token(acct, min_runway_min) or None
     except Exception:
         return None
 
@@ -479,7 +479,8 @@ class EngineManager:
             if acct_id not in self._active:
                 ap = self._autopilot_factory(c["cfg"], c["token_provider"])
                 # needs_backfill: on (re)start mid-session, rebuild today's opening range from REST
-                self._active[acct_id] = {"sig": c["sig"], "autopilot": ap, "needs_backfill": True}
+                self._active[acct_id] = {"sig": c["sig"], "autopilot": ap, "needs_backfill": True,
+                                         "keep": c.get("keep_token")}
         self._ensure_feed()
 
     def run_backfills(self, fetch_bars, fetch_ranges=None) -> List[dict]:
@@ -642,10 +643,13 @@ class EngineManager:
         for aid, st in list(self._active.items()):
             ap = st["autopilot"]
             try:
-                tok = ap._get_token()
+                tok = (st.get("keep") or ap._get_token)()
             except Exception:
                 tok = None
-            out.append({"account_id": aid, "ok": bool(tok) and token_works(ap.cfg.env, tok)})
+            ok, why = token_check(ap.cfg.env, tok) if tok else (False, "no token")
+            if not ok:
+                print("ORB KEEPALIVE failed", {"account_id": aid, "env": ap.cfg.env, "why": why})
+            out.append({"account_id": aid, "ok": ok})
         return out
 
     def feed_roots(self) -> tuple:
@@ -691,7 +695,10 @@ def _plan_configs() -> List[dict]:
         contracts = dict(cfg.instruments)
         qty = {r: cfg.qty.get(r, 0) for r in roots}
         out.append({"row": row, "cfg": cfg, "sig": config_signature(row, contracts, qty),
-                    "token_provider": (lambda pk=pk: _fresh_token_for(pk))})
+                    "token_provider": (lambda pk=pk: _fresh_token_for(pk)),
+                    # keep-alive renews whenever < 80 min of the ~90 min token life is left, i.e. on every 5-min
+                    # tick, so a token always carries ~85 min of runway through a broker outage (weekend close)
+                    "keep_token": (lambda pk=pk: _fresh_token_for(pk, 80))})
     _UNBUILT.clear(); _UNBUILT.update(unbuilt)
     return out
 
@@ -713,13 +720,17 @@ _TOKEN_ALERTED: set = set()
 _UNBUILT: Dict[str, str] = {}              # armed accounts the engine could NOT start (account_id -> reason)
 
 
-def token_works(env: str, token: str) -> bool:
-    """True only if the broker accepts this token right now (an expired token returns 401 / no account list)."""
+def token_check(env: str, token: str):
+    """(ok, detail): ok only if the broker accepts this token right now (an expired token -> no account list)."""
     try:
         r = tvo._get(env, token, "/account/list")
-    except Exception:
-        return False
-    return isinstance(r, list)
+    except Exception as e:
+        return False, f"error {str(e)[:120]}"
+    return (True, "") if isinstance(r, list) else (False, str(r)[:160])
+
+
+def token_works(env: str, token: str) -> bool:
+    return token_check(env, token)[0]
 
 
 def _token_alert(aid, day: str) -> None:
@@ -798,6 +809,9 @@ def preflight(now: datetime) -> List[dict]:
     must be loaded, so a problem is fixed BEFORE the 9:35 / 10:30 entries instead of discovered after them."""
     day = now.date().isoformat()
     if day in _PREFLIGHT_DONE or _MANAGER is None:
+        return []
+    if now.weekday() >= 5 or MOM.short_session(day):         # no session today -> nothing to pre-check
+        _PREFLIGHT_DONE.add(day)
         return []
     _PREFLIGHT_DONE.add(day)
     issues = []
