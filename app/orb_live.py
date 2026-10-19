@@ -349,7 +349,7 @@ class Autopilot:
     def on_bar(self, root: str, bar: Bar) -> Optional[dict]:
         """Accumulate the day's bars and, on the first confirmed breakout, place the bracket.
         Returns a dict describing the action taken (or None if nothing happened)."""
-        if root not in self.cfg.instruments:
+        if root not in self.cfg.instruments or bar.dt.weekday() >= 5:     # Sunday-evening Globex bars are not a session
             return None
         st = self._day(root, bar)
         st.bars.append(bar)
@@ -540,6 +540,7 @@ class Autopilot:
         after a restart — WITHOUT entering on a breakout that already fired (no stale/late entry).
         If a qualifying signal already fired in the backfill, mark the day DONE; otherwise stay
         IDLE so a LIVE breakout going forward is still taken. Idempotent (skips if bars already)."""
+        bars = [b for b in (bars or []) if b.dt.weekday() < 5]
         if root not in self.cfg.instruments or not bars:
             return {"root": root, "action": "backfill_skip", "reason": "no bars"}
         st = self._day(root, bars[-1])

@@ -318,3 +318,10 @@ def test_keepalive_uses_the_long_runway_renewal_and_preflight_skips_weekends(mon
     assert E.keepalive(_dt(2026, 10, 16, 18, 0)) == [{"account_id": 1, "ok": True}] and used == ["keep"]
     E._PREFLIGHT_DONE.discard("2026-10-17")
     assert E.preflight(_dt(2026, 10, 17, 9, 15)) == []                         # Saturday: no pre-flight, no emails
+
+
+def test_sunday_evening_bars_are_ignored():
+    ap, fb = mk()
+    sunday = Bar(datetime(2026, 10, 18, 18, 1), 20000, 20001, 19999, 20000, 1)
+    assert ap.on_bar("MNQ", sunday) is None and "MNQ" not in ap._state
+    assert ap.backfill("MNQ", [sunday])["action"] == "backfill_skip"

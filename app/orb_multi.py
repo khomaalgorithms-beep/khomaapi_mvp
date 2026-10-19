@@ -82,7 +82,7 @@ class MultiAutopilot(Autopilot):
 
     # ---- feed callback -----------------------------------------------------------------------------
     def on_bar(self, root, bar):
-        if root not in self.cfg.instruments:
+        if root not in self.cfg.instruments or bar.dt.weekday() >= 5:     # Sunday-evening Globex bars are not a session
             return None
         st = self._day(root, bar)
         st.bars.append(bar)
@@ -374,7 +374,7 @@ class MultiAutopilot(Autopilot):
 
     # ---- restart safety ----------------------------------------------------------------------------
     def backfill(self, root, bars):
-        bars = list(bars or [])
+        bars = [b for b in (bars or []) if b.dt.weekday() < 5]
         return self._backfill(root, bars)
 
     def _backfill(self, root, bars):
