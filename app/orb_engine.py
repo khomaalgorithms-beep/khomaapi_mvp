@@ -1221,12 +1221,19 @@ def install(app) -> None:
             return RedirectResponse("/dashboard", status_code=302)
         accounts = _connected_accounts(user["id"])
         cfgs = {a["account_id"]: get_config(user["id"], a["account_id"]) for a in accounts}
+        preview = not accounts
+        if preview:
+            # Entitled (comp / ORB-plan) viewer with no broker connected -> show the FULL strategy,
+            # odds, sizing and equity curve in a read-only PREVIEW so they can see everything
+            # (all probabilities and numbers) without connecting an account. Arming is disabled.
+            accounts = [{"account_id": "__preview__", "account_name": "Preview — no account connected", "env": "demo"}]
+            cfgs = {"__preview__": None}
         try:
             _email = str((user.get("email") if hasattr(user, "get") else user["email"]) or "")
         except Exception:
             _email = ""
         _legacy = False  # honest numbers shown to everyone (owner inflated view disabled)
-        body = _render_dashboard(accounts, cfgs, legacy=_legacy)
+        body = _render_dashboard(accounts, cfgs, legacy=_legacy, preview=preview)
         try:
             # layout(content, user=None, active="dashboard") — wrap in KhomaAPI chrome + sidebar
             return HTMLResponse(main.layout(body, user=user, active="prop"))
@@ -1282,7 +1289,7 @@ def install(app) -> None:
                             "master_running": master_running(user["id"])})
 
 
-def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], legacy: bool = False) -> str:
+def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], legacy: bool = False, preview: bool = False) -> str:
     """KhomaVolume NQ control room: pick a connected account, configure mode / account size / drawdown
     type / preset, see the validated odds + live sizing + full-history (2008-26) equity curve, and Start/Stop automation.
     All numbers come from app.orb_validated (generated from the research harness); arming persists via
@@ -1298,6 +1305,7 @@ def _render_dashboard(accounts: List[dict], cfgs: Dict[str, Optional[dict]], leg
                                  "cash_dd": c.get("cash_dd") or 15, "asset": c.get("asset") or "nq"}
     return (_PAGE.replace("__ACCOUNTS__", json.dumps(accts))
                  .replace("__CONFIGS__", json.dumps(conf))
+                 .replace("__PREVIEW__", json.dumps(bool(preview)))
                  .replace("__DATA__", json.dumps(VALIDATED)))
 
 
@@ -1422,7 +1430,7 @@ _PAGE = r"""
   <section class="eqwrap" id="rulesSection"></section>
 </div>
 <script>
-const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__;
+const ACCOUNTS=__ACCOUNTS__, CONFIGS=__CONFIGS__, DATA=__DATA__, PREVIEW=__PREVIEW__;
 const SIZES=["25K","50K","100K","150K"],DDN={eod:"End-of-day trailing",intraday:"Intraday trailing",static:"Static"};
 const TARGET={"25K":1250,"50K":3000,"100K":6000,"150K":9000},MLL={"25K":1000,"50K":2000,"100K":3000,"150K":4500};
 const QUAL={"25K":100,"50K":150,"100K":200,"150K":250};
@@ -1557,6 +1565,10 @@ function todayLine(){
   return `<b>Today:</b> ${state.asset==="nq"?mom:state.asset==="orb"?orb:orb+" "+mom} Stop ≈ <b>${CTX.stop_pts} pts</b>.`;
 }
 function runCard(){
+  if(PREVIEW)return `<div class="run"><div class="runrow">
+     <div class="rstat"><span class="dot"></span><b>Preview mode.</b> You're seeing the full strategy, pass odds, sizing and 18-year equity curve with <b>no account connected</b>. Connect a broker under <a href="/broker">Broker</a> to arm and trade.</div>
+   </div><div class="today" id="today">${todayLine()}</div></div>
+   <div class="note"><div>Change the <b>mode</b>, <b>account size</b>, <b>drawdown type</b> and <b>preset</b> above and every number — pass %, days, sizing — updates live. Nothing here needs an account connected.</div></div>`;
   const on=state.enabled;
   return `<div class="run"><div class="runrow">
      <button type="button" class="startbtn ${on?'on':''}" id="startBtn">${on?'Stop automation':'Start automation'}</button>
@@ -1582,7 +1594,7 @@ function render(){
   const bi=$("#balIn");if(bi)bi.onchange=e=>{state.cash_bal=Math.max(1000,+e.target.value.replace(/[^0-9]/g,"")||25000);render();};
   const di=$("#ddIn");if(di)di.oninput=e=>{state.cash_dd=+e.target.value;$("#ddOut").textContent=state.cash_dd+"%";};
   if(di)di.onchange=()=>render();
-  $("#startBtn").onclick=toggleRun;
+  const _sb=$("#startBtn");if(_sb)_sb.onclick=toggleRun;   // no Start button in preview mode
   renderEquity();rulesHTML();
 }
 
@@ -1662,6 +1674,6 @@ function renderEquity(){
 const sel=$("#acctSel");
 ACCOUNTS.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=a.name+"  ("+(a.env||"live")+")";sel.appendChild(o);});
 sel.onchange=()=>{lastErr="";loadAcct(sel.value);};
-if(ACCOUNTS.length){loadAcct(ACCOUNTS[0].id);setInterval(poll,5000);poll();}else render();
+if(ACCOUNTS.length){loadAcct(ACCOUNTS[0].id);if(PREVIEW){poll();}else{setInterval(poll,5000);poll();}}else render();
 </script>
 """
