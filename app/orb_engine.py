@@ -1038,7 +1038,7 @@ def _algo_accounts(user_id: int) -> List[dict]:
     """The user's accounts the algo is meant to run (armed OR in the Copy box), with status."""
     con = _db()
     rows = con.execute(
-        "SELECT ba.id AS pk, ba.account_id, ba.account_name, ba.status, "
+        "SELECT ba.id AS pk, ba.account_id, ba.account_name, ba.status, ba.env, "
         "       COALESCE(ba.group_type,'independent') AS grp, "
         "       COALESCE(ap.enabled,0) AS armed, ap.acct_size, ap.preset "
         "FROM broker_accounts ba "
@@ -1063,7 +1063,10 @@ def _health_rows(user) -> tuple:
         token_ok = True
         if connected:
             try:
-                token_ok = bool(_fresh_token_for(a["pk"]))
+                tok = _fresh_token_for(a["pk"])
+                # a stored token is not enough: an EXPIRED one is still stored -> ask the broker (2026-10-19:
+                # the daily email said "Armed & Connected" while the token was dead and trades would fail)
+                token_ok = bool(tok) and token_works(a.get("env") or "live", tok)
             except Exception:
                 token_ok = True  # never raise a false alarm on a transient check error
         if not connected:
