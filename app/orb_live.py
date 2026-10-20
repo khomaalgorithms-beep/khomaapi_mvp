@@ -19,6 +19,7 @@ is exactly what the engine trades. Everything except the thin broker calls is pu
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, date as _date, timedelta
 from typing import Callable, Dict, List, Optional
@@ -279,6 +280,8 @@ _IDLE, _ARMED, _LIVE, _DONE = "IDLE", "ARMED", "LIVE", "DONE"
 VERIFY_SEC = 120          # an entry with an unknown outcome is checked against broker positions this long
 ACCEPTED_CHECK_SEC = 60   # an accepted entry that is still flat after this long is settled from its order status
 TOKEN_RETRY_MIN = 3       # a failed token at 10:30 is retried on each new bar for this many minutes
+STOP_CONFIRM_TRIES = 3    # after a fill, read for a resting protective stop this many times before flattening
+STOP_CONFIRM_DELAY = 0.4  # seconds between those reads (placeOSO is non-atomic — the stop leg can be rejected)
 
 
 def _ambiguous(resp) -> bool:
@@ -301,6 +304,7 @@ class _DayState:
     entry_order_id: Optional[object] = None
     oso_ids: List[object] = field(default_factory=list)
     was_filled: bool = False
+    protect_ok: bool = False                  # a resting protective stop has been confirmed for this fill
     verify_until: Optional[datetime] = None   # entry sent but outcome unknown -> check broker truth until then
     eod_done: bool = False                    # 15:59 flatten verified (flat) for this day
     eod_tries: int = 0
@@ -611,6 +615,18 @@ class Autopilot:
                     out.append({"root": root, "action": "filled", "net": net,
                                 "side": (st.signal.side if st.signal else ""),
                                 "qty": abs(net), "entry": price, "plan": st.plan})
+                # CRITICAL prop-safety: placeOSO is non-atomic — the entry can fill while the stop
+                # leg is rejected, leaving a NAKED position. Confirm a resting protective stop; if
+                # none, FLATTEN rather than hold it unprotected. Re-checked each poll until confirmed
+                # once, so a transient broker read failure never leaves the guard silently skipped.
+                if st.status == _LIVE and not st.protect_ok:
+                    kind, pev = self._ensure_protected(root, token)
+                    if kind == "ok":
+                        st.protect_ok = True
+                    elif kind == "flattened":
+                        st.protect_ok = True
+                        st.status = _DONE
+                        out.append({"root": root, "action": "unprotected_flattened", **(pev or {})})
             else:
                 if st.status == _LIVE and st.was_filled:
                     # we were in a position and now we're flat -> SL or TP closed it
@@ -721,6 +737,68 @@ class Autopilot:
             except Exception:
                 pass
         return n
+
+    def _resting_stop_count(self, root: str, token: str) -> int:
+        """Count WORKING protective STOP orders resting for this instrument. Returns -1 when the
+        broker read fails (unknown — caller must not treat that as 'unprotected')."""
+        spec = INSTRUMENTS[root]
+        try:
+            orders = self._broker.get_orders(self.cfg.env, token) or []
+            versions = self._broker.get_order_versions(self.cfg.env, token) or []
+            working = self._broker.working_orders_for(orders, versions, self.cfg.account_id, order_type="Stop")
+        except Exception:
+            return -1
+        if working is None:
+            return -1
+        n = 0
+        for w in working:
+            ot = str(w.get("orderType") or "").lower()
+            if ot and not ot.startswith("stop"):
+                continue                                  # defensive: only count stop orders
+            cid = w.get("contractId")
+            cname = self._contract_name(token, cid) if cid is not None else ""
+            if cname and cname.upper().startswith(spec.root):
+                n += 1
+        return n
+
+    def _ensure_protected(self, root: str, token: str):
+        """CRITICAL prop-safety guard (mirrors main.py's _ensure_protected_or_flatten). placeOSO is
+        NON-ATOMIC: the market entry can fill while the protective stop leg is rejected, leaving a
+        NAKED position while the order response still looked ok. Confirm a resting stop exists; if
+        none after brief retries, FLATTEN (cancel working + liquidate) so the account is never held
+        unprotected. Returns ("ok", None) when protected/flat, ("flattened", event) when it closed a
+        naked position, or ("retry", None) when a broker read failed (re-check on the next poll)."""
+        confirmed_naked = False
+        for i in range(STOP_CONFIRM_TRIES):
+            net, _, _ = self._net_position(root, token)
+            if net is None:
+                return ("retry", None)                    # position read failed
+            if net == 0:
+                return ("ok", None)                       # already flat
+            c = self._resting_stop_count(root, token)
+            if c > 0:
+                return ("ok", None)                       # protected
+            if c < 0:
+                return ("retry", None)                    # stop read failed -> don't flatten on a bad read
+            if i < STOP_CONFIRM_TRIES - 1:
+                time.sleep(STOP_CONFIRM_DELAY)             # the stop can rest a moment after the fill
+            else:
+                confirmed_naked = True
+        if not confirmed_naked:
+            return ("retry", None)
+        # confirmed: an open position with NO resting stop -> never hold it naked
+        self._cancel_working(root, token)
+        net, _, cid = self._net_position(root, token)
+        if net == 0:
+            return ("ok", None)
+        if cid is not None:
+            try:
+                self._broker.liquidate_position(self.cfg.env, token, self.cfg.account_id, cid)
+            except Exception:
+                pass
+        return ("flattened", {"unprotected_flattened": True,
+                              "error": "protective stop did not rest at the exchange (placeOSO partial "
+                                       "reject) - position flattened for safety"})
 
     def _eod_flatten(self, root: str, st: _DayState) -> Optional[dict]:
         """Cancel this instrument's working orders and liquidate any position; done only once a fresh

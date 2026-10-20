@@ -196,6 +196,7 @@ def test_eod_flatten_at_1559():
     run_day(ap, session(20000, 20040))
     fb.positions = [{"accountId": 42, "netPos": 5, "contractId": 901, "netPrice": 20040.0}]
     fb.contracts = {901: {"name": "MNQZ6"}}
+    fb.orders = [{"id": 701, "contractId": 901, "orderType": "Stop"}]   # OSO protective stop rests (protected)
     assert any(a["action"] == "filled" for a in ap.poll())
     clock[0] = datetime(2026, 10, 13, 15, 58)
     ap.poll()
@@ -439,6 +440,7 @@ def test_unknown_entry_outcome_is_verified_and_adopted_when_it_filled():
     assert len(fb.place_calls) == 1                                   # never re-sent (duplicate risk)
     fb.positions = [{"accountId": 42, "netPos": 5, "contractId": 901, "netPrice": 20040.0}]
     fb.contracts = {901: {"name": "MNQZ6"}}
+    fb.orders = [{"id": 701, "contractId": 901, "orderType": "Stop"}]   # OSO protective stop rests (protected)
     assert any(a["action"] == "filled" for a in ap.poll()) and ap._state["MNQ"].status == "LIVE"
 
 

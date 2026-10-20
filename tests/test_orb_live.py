@@ -120,8 +120,14 @@ class FakeBroker:
     def get_order_versions(self, env, token):
         return self.versions
 
-    def working_orders_for(self, orders, versions, account_id, **kw):
-        return [{"id": o.get("id"), "contractId": o.get("contractId", 901)} for o in orders]
+    def working_orders_for(self, orders, versions, account_id, contract_id=None, order_type=None):
+        out = []
+        for o in orders:
+            if order_type and str(o.get("orderType", "")).lower() != str(order_type).lower():
+                continue
+            out.append({"id": o.get("id"), "contractId": o.get("contractId", 901),
+                        "orderType": o.get("orderType")})
+        return out
 
     def cancel_order(self, env, token, oid):
         self.cancels.append(oid); return {"ok": True}
@@ -229,16 +235,46 @@ def test_poll_detects_fill_then_close():
     fb = FakeBroker()
     ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
     feed(ap, breakout_day())
-    # broker now shows a long position on MNQ (contractId 901 -> name MNQZ5)
+    # broker now shows a long position on MNQ (contractId 901 -> name MNQZ5) WITH its OSO stop resting
     fb.positions = [{"accountId": 42, "netPos": 3, "netPrice": 20025, "contractId": 901}]
+    fb.orders = [{"id": 701, "contractId": 901, "orderType": "Stop"}]   # protective stop rests (OSO ok)
     out = ap.poll()
     assert any(a["action"] == "filled" for a in out) and ap._state["MNQ"].status == "LIVE"
+    assert ap._state["MNQ"].protect_ok is True and fb.liquidations == []
     # TP hits -> flat again
     fb.positions = []
     fb.orders = [{"id": 777}]                      # a lingering OSO leg to sweep
     out = ap.poll()
     assert any(a["action"] == "closed" for a in out)
     assert ap._state["MNQ"].status == "DONE" and 777 in fb.cancels
+
+
+def test_guard_keeps_position_when_stop_is_resting():
+    """placeOSO worked: the protective stop rests -> the guard must NOT touch the position."""
+    fb = FakeBroker()
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
+    feed(ap, breakout_day())
+    fb.positions = [{"accountId": 42, "netPos": 3, "netPrice": 20025, "contractId": 901}]
+    fb.orders = [{"id": 701, "contractId": 901, "orderType": "Stop"}]
+    out = ap.poll()
+    assert any(a["action"] == "filled" for a in out)
+    assert ap._state["MNQ"].status == "LIVE" and ap._state["MNQ"].protect_ok is True
+    assert fb.liquidations == [] and not any(a.get("unprotected_flattened") for a in out)
+
+
+def test_guard_flattens_naked_position_when_stop_leg_rejected():
+    """CRITICAL: entry filled but the placeOSO stop leg was rejected -> NO resting stop ->
+    the guard must flatten the naked position rather than hold it unprotected."""
+    from app import orb_live as _ol
+    _ol.STOP_CONFIRM_DELAY = 0            # don't sleep in the test
+    fb = FakeBroker()
+    ap = Autopilot(cfg_for(), get_token=lambda: "tok", broker=fb)
+    feed(ap, breakout_day())
+    fb.positions = [{"accountId": 42, "netPos": 3, "netPrice": 20025, "contractId": 901}]
+    fb.orders = []                        # naked: the protective stop never rested
+    out = ap.poll()
+    assert any(a.get("action") == "unprotected_flattened" for a in out)
+    assert 901 in fb.liquidations and ap._state["MNQ"].status == "DONE"
 
 
 def test_poll_eod_flattens_open_position():
