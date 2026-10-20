@@ -1221,11 +1221,12 @@ def install(app) -> None:
             return RedirectResponse("/dashboard", status_code=302)
         accounts = _connected_accounts(user["id"])
         cfgs = {a["account_id"]: get_config(user["id"], a["account_id"]) for a in accounts}
-        preview = not accounts
+        preview = (not accounts) and main.is_numbers_preview(user)
         if preview:
-            # Entitled (comp / ORB-plan) viewer with no broker connected -> show the FULL strategy,
-            # odds, sizing and equity curve in a read-only PREVIEW so they can see everything
-            # (all probabilities and numbers) without connecting an account. Arming is disabled.
+            # Sales-demo email only (main.is_numbers_preview) with no broker connected -> show the FULL
+            # strategy, odds, sizing and equity curve in a read-only PREVIEW so they can see everything
+            # (all probabilities and numbers) without connecting an account. Arming is disabled. Every
+            # other viewer still sees the normal 'connect an account' state.
             accounts = [{"account_id": "__preview__", "account_name": "Preview — no account connected", "env": "demo"}]
             cfgs = {"__preview__": None}
         try:

@@ -1009,6 +1009,38 @@ def has_orb_access(user) -> bool:
     return str(_ucol(user, "whop_plan_id") or "").strip() in _ORB_PLAN_IDS
 
 
+# Sales-demo accounts that may see the FULL numbers/probabilities and Risk Engine with NO broker
+# connected (so a closer can walk a prospect through everything). Everyone else must connect first.
+_NUMBERS_PREVIEW_EMAILS = {"ro.dunnn@gmail.com"}
+
+
+def is_numbers_preview(user) -> bool:
+    """True ONLY for the specific demo email(s) above — scopes the no-broker preview to them."""
+    return str(_ucol(user, "email") or "").strip().lower() in _NUMBERS_PREVIEW_EMAILS
+
+
+def _risk_preview_card() -> str:
+    """Static Risk Engine preview (no account connected) for the sales-demo email — shows the
+    per-account protections so a prospect can see them without connecting a broker."""
+    return (
+        "<div class='card span12' style='border-color:#cdebd8;background:#f6fcf8;'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;'>"
+        "<h3 style='margin:0;'>Per-account protection &mdash; preview</h3><span class='pill'>● PREVIEW</span></div>"
+        "<p class='muted' style='margin:8px 0 14px;'>This is how KhomaAPI protects each account. Connect a broker on the "
+        "<a href='/broker'>Broker</a> page to set and enforce these on your own live account. Example below: a 50K evaluation.</p>"
+        "<div class='formgrid'>"
+        "<div><label>Account phase</label><input value='Evaluation' disabled></div>"
+        "<div><label>Daily loss limit</label><input value='$1,100' disabled></div>"
+        "<div><label>Trailing drawdown</label><input value='$2,000' disabled></div>"
+        "<div><label>Profit goal</label><input value='$3,000' disabled></div></div>"
+        "<ul style='margin:14px 0 0;padding-left:18px;color:#6b7280;font-size:13px;line-height:1.7;'>"
+        "<li><b>Real-time enforcement</b> &mdash; your live Tradovate balance is checked on every order and after every fill.</li>"
+        "<li><b>Auto-flatten &amp; lock</b> &mdash; the instant a hard limit is breached, every position is closed and the account is locked.</li>"
+        "<li><b>Phase-aware</b> &mdash; switch Evaluation &harr; Funded and the funded limits plus a safety buffer apply automatically.</li>"
+        "<li><b>News / manual lockouts</b> &mdash; block new entries during the windows set below.</li></ul></div>"
+    )
+
+
 def user_entitlements(user) -> Entitlement:
     """Resolve a user's entitlement. An owner-granted comp email always gets full (Elite)
     access. Otherwise Whop is authoritative: if the account is linked to a membership, only
@@ -6595,7 +6627,10 @@ def risk_page(request: Request):
             state = {"ok": False}
         cards += risk_account_card(user, a, cfg, state, pf=pf_by_name.get(a["account_name"]))
     if not accounts:
-        cards = "<div class='card span12'><p class='muted'>Connect a Tradovate account on the Broker page to configure per-account risk rules.</p></div>"
+        if is_numbers_preview(user):
+            cards = _risk_preview_card()   # sales-demo email: show the full Risk Engine with no broker connected
+        else:
+            cards = "<div class='card span12'><p class='muted'>Connect a Tradovate account on the Broker page to configure per-account risk rules.</p></div>"
 
     # News / lockout windows
     con = db()
