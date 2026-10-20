@@ -973,6 +973,7 @@ def _ucol(user, key):
 _COMP_ACCESS_EMAILS = {
     "amar.sgnm@gmail.com",
     "oliverlemare47@gmail.com",      # sales closer (team) - full view incl. KhomaVolume numbers, 2026-10-14
+    "ro.dunnn@gmail.com",            # Romeo, sales closer (team) - full view incl. KhomaVolume numbers, 2026-10-19
 }
 
 
